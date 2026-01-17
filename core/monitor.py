@@ -77,6 +77,7 @@ class ArbitrageDetector:
         profit_threshold: float = 0.008,
         trade_size: float = 100.0,
         max_slippage: float = 0.002,
+        cooldown_seconds: float = 60.0,
     ):
         """
         Initialize the arbitrage detector.
@@ -85,10 +86,13 @@ class ArbitrageDetector:
             profit_threshold: Minimum profit threshold (e.g., 0.008 = 0.8%)
             trade_size: Trade size in USDC
             max_slippage: Maximum allowed slippage
+            cooldown_seconds: Seconds to wait before re-detecting same market
         """
         self.profit_threshold = profit_threshold
         self.trade_size = trade_size
         self.max_slippage = max_slippage
+        self.cooldown_seconds = cooldown_seconds
+        self._last_opportunity: dict[str, float] = {}  # market_id -> timestamp
 
     def detect(
         self,
@@ -107,6 +111,14 @@ class ArbitrageDetector:
         Returns:
             ArbitrageOpportunity if profitable, None otherwise
         """
+        # Check cooldown period
+        market_id = market.condition_id or market.question_id or market.slug
+        now = time.time()
+        if market_id in self._last_opportunity:
+            elapsed = now - self._last_opportunity[market_id]
+            if elapsed < self.cooldown_seconds:
+                return None  # Still in cooldown period
+
         # Calculate average buy prices using depth penetration
         avg_price_yes = book_yes.calculate_average_buy_price(self.trade_size / 2)
         avg_price_no = book_no.calculate_average_buy_price(self.trade_size / 2)
@@ -162,6 +174,8 @@ class ArbitrageDetector:
             )
 
         if opportunity.is_profitable(self.profit_threshold):
+            # Record opportunity time for cooldown
+            self._last_opportunity[market_id] = now
             logger.info(
                 "Arbitrage opportunity detected!",
                 market=market.slug,
@@ -188,6 +202,7 @@ class NegativeRiskArbitrageDetector:
         profit_threshold: float = 0.008,
         trade_size: float = 100.0,
         max_slippage: float = 0.002,
+        cooldown_seconds: float = 60.0,
     ):
         """
         Initialize the Negative Risk arbitrage detector.
@@ -196,11 +211,14 @@ class NegativeRiskArbitrageDetector:
             profit_threshold: Minimum profit threshold (e.g., 0.008 = 0.8%)
             trade_size: Trade size in USDC per outcome
             max_slippage: Maximum allowed slippage
+            cooldown_seconds: Seconds to wait before re-detecting same event
         """
         self.profit_threshold = profit_threshold
         self.trade_size = trade_size
         self.max_slippage = max_slippage
+        self.cooldown_seconds = cooldown_seconds
         self._check_count = 0
+        self._last_opportunity: dict[str, float] = {}  # event_id -> timestamp
 
     def detect(
         self,
@@ -219,14 +237,26 @@ class NegativeRiskArbitrageDetector:
         Returns:
             NegativeRiskArbitrageOpportunity if profitable, None otherwise
         """
+        # Check cooldown period
+        event_id = event.event_id
+        now = time.time()
+        if event_id in self._last_opportunity:
+            elapsed = now - self._last_opportunity[event_id]
+            if elapsed < self.cooldown_seconds:
+                return None  # Still in cooldown period
+
         # Try Buy-All-Yes first (often more common)
         opportunity = self._detect_buy_all_yes(event, order_books)
         if opportunity and opportunity.is_profitable(self.profit_threshold):
+            # Record opportunity time for cooldown
+            self._last_opportunity[event_id] = now
             return opportunity
 
         # Try Buy-All-No
         opportunity = self._detect_buy_all_no(event, order_books)
         if opportunity and opportunity.is_profitable(self.profit_threshold):
+            # Record opportunity time for cooldown
+            self._last_opportunity[event_id] = now
             return opportunity
 
         return None
