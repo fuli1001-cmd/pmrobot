@@ -1,0 +1,146 @@
+"""Telegram notification service."""
+
+import asyncio
+from typing import Optional
+
+import httpx
+
+from utils.logger import get_logger
+
+logger = get_logger(__name__)
+
+
+class TelegramNotifier:
+    """
+    Send notifications via Telegram Bot API.
+    """
+
+    BASE_URL = "https://api.telegram.org/bot{token}/sendMessage"
+
+    def __init__(self, bot_token: str, chat_id: str):
+        """
+        Initialize the Telegram notifier.
+
+        Args:
+            bot_token: Telegram bot token
+            chat_id: Target chat ID for notifications
+        """
+        self.bot_token = bot_token
+        self.chat_id = chat_id
+        self.url = self.BASE_URL.format(token=bot_token)
+
+    async def send(
+        self,
+        message: str,
+        parse_mode: str = "HTML",
+        disable_notification: bool = False,
+    ) -> bool:
+        """
+        Send a message via Telegram.
+
+        Args:
+            message: Message text to send
+            parse_mode: Message format (HTML or Markdown)
+            disable_notification: If True, send silently
+
+        Returns:
+            True if message was sent successfully
+        """
+        payload = {
+            "chat_id": self.chat_id,
+            "text": message,
+            "parse_mode": parse_mode,
+            "disable_notification": disable_notification,
+        }
+
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.post(self.url, json=payload, timeout=10.0)
+                response.raise_for_status()
+                logger.debug("Telegram message sent", chat_id=self.chat_id)
+                return True
+        except httpx.HTTPError as e:
+            logger.error("Failed to send Telegram message", error=str(e))
+            return False
+
+    async def send_alert(self, title: str, details: str) -> bool:
+        """
+        Send a formatted alert message.
+
+        Args:
+            title: Alert title
+            details: Alert details
+
+        Returns:
+            True if message was sent successfully
+        """
+        message = f"🚨 <b>{title}</b>\n\n{details}"
+        return await self.send(message)
+
+    async def send_trade_notification(
+        self,
+        market: str,
+        profit_pct: float,
+        trade_size: float,
+        success: bool,
+    ) -> bool:
+        """
+        Send a trade execution notification.
+
+        Args:
+            market: Market name/question
+            profit_pct: Expected profit percentage
+            trade_size: Trade size in USDC
+            success: Whether trade was successful
+
+        Returns:
+            True if message was sent successfully
+        """
+        emoji = "✅" if success else "❌"
+        status = "SUCCESS" if success else "FAILED"
+        message = (
+            f"{emoji} <b>Trade {status}</b>\n\n"
+            f"📊 Market: {market[:50]}...\n"
+            f"💰 Profit: {profit_pct:.2%}\n"
+            f"💵 Size: ${trade_size:.2f} USDC"
+        )
+        return await self.send(message)
+
+
+class DummyNotifier:
+    """
+    Dummy notifier that does nothing (for when Telegram is not configured).
+    """
+
+    async def send(self, message: str, **kwargs) -> bool:
+        """Log the message instead of sending."""
+        logger.info("Notification (not sent)", message=message[:100])
+        return True
+
+    async def send_alert(self, title: str, details: str) -> bool:
+        """Log the alert instead of sending."""
+        logger.warning("Alert (not sent)", title=title, details=details[:100])
+        return True
+
+    async def send_trade_notification(self, **kwargs) -> bool:
+        """Log the trade notification instead of sending."""
+        logger.info("Trade notification (not sent)", **kwargs)
+        return True
+
+
+def create_notifier(
+    bot_token: Optional[str], chat_id: Optional[str]
+) -> TelegramNotifier | DummyNotifier:
+    """
+    Create a notifier instance.
+
+    Args:
+        bot_token: Telegram bot token (optional)
+        chat_id: Telegram chat ID (optional)
+
+    Returns:
+        TelegramNotifier if credentials provided, otherwise DummyNotifier
+    """
+    if bot_token and chat_id:
+        return TelegramNotifier(bot_token, chat_id)
+    return DummyNotifier()
