@@ -119,15 +119,26 @@ class ArbitrageDetector:
             if elapsed < self.cooldown_seconds:
                 return None  # Still in cooldown period
 
+        # Dynamic position sizing based on available depth
+        # Use 30% of minimum available depth as safe position size
+        depth_yes = book_yes.get_available_depth("ask", max_levels=5)
+        depth_no = book_no.get_available_depth("ask", max_levels=5)
+        min_depth = min(depth_yes, depth_no)
+        effective_trade_size = min(self.trade_size, min_depth * 0.3)
+        
+        # Skip if insufficient depth
+        if effective_trade_size < 10.0:  # Minimum $10 trade
+            return None
+
         # Calculate average buy prices using depth penetration
-        avg_price_yes = book_yes.calculate_average_buy_price(self.trade_size / 2)
-        avg_price_no = book_no.calculate_average_buy_price(self.trade_size / 2)
+        avg_price_yes = book_yes.calculate_average_buy_price(effective_trade_size / 2)
+        avg_price_no = book_no.calculate_average_buy_price(effective_trade_size / 2)
 
         if avg_price_yes is None or avg_price_no is None:
             logger.debug(
                 "Insufficient liquidity",
                 market=market.slug,
-                trade_size=self.trade_size,
+                trade_size=effective_trade_size,
             )
             return None
 
@@ -154,7 +165,7 @@ class ArbitrageDetector:
             market=market,
             avg_price_yes=avg_price_yes,
             avg_price_no=avg_price_no,
-            trade_size_usdc=self.trade_size,
+            trade_size_usdc=effective_trade_size,
             total_cost=total_cost,
             estimated_fee=estimated_fee,
             timestamp=time.time(),

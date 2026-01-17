@@ -78,6 +78,25 @@ class OrderBook:
             return self.best_ask - self.best_bid
         return None
 
+    def get_available_depth(self, side: str = "ask", max_levels: int = 5) -> float:
+        """
+        Calculate total available liquidity (in USDC) on one side of the book.
+        
+        Args:
+            side: "ask" for buy side depth, "bid" for sell side depth
+            max_levels: Maximum number of levels to consider
+            
+        Returns:
+            Total USDC value available
+        """
+        levels = self.asks if side == "ask" else self.bids
+        total = 0.0
+        for i, level in enumerate(levels):
+            if i >= max_levels:
+                break
+            total += level.price * level.size
+        return total
+
     def calculate_average_buy_price(self, amount_usdc: float) -> Optional[float]:
         """
         Calculate weighted average price to buy a given USDC amount.
