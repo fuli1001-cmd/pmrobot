@@ -8,7 +8,7 @@ from typing import Callable, Dict, List, Optional, Set
 import websockets
 from websockets.exceptions import ConnectionClosed
 
-from config.constants import CLOB_WS_URL
+from config.constants import CLOB_WS_URL, get_profit_threshold
 from models.market import Market, NegativeRiskEvent, NegativeRiskStrategy, NegativeRiskArbitrageOpportunity
 from models.order import ArbitrageOpportunity, OrderBook, OrderBookLevel
 from utils.logger import get_logger
@@ -256,23 +256,26 @@ class NegativeRiskArbitrageDetector:
             if elapsed < self.cooldown_seconds:
                 return None  # Still in cooldown period
 
+        # Use dynamic threshold based on outcome count
+        effective_threshold = get_profit_threshold(event.outcome_count)
+
         # Try Buy-All-Yes first (often more common)
         opportunity = self._detect_buy_all_yes(event, order_books)
-        if opportunity and opportunity.is_profitable(self.profit_threshold):
+        if opportunity and opportunity.is_profitable(effective_threshold):
             # Record opportunity time for cooldown
             self._last_opportunity[event_id] = now
             return opportunity
 
         # Try Buy-All-No
         opportunity = self._detect_buy_all_no(event, order_books)
-        if opportunity and opportunity.is_profitable(self.profit_threshold):
+        if opportunity and opportunity.is_profitable(effective_threshold):
             # Record opportunity time for cooldown
             self._last_opportunity[event_id] = now
             return opportunity
 
         # Try Short Rebalance (when sum(Yes) > 1)
         opportunity = self._detect_short_rebalance(event, order_books)
-        if opportunity and opportunity.is_profitable(self.profit_threshold):
+        if opportunity and opportunity.is_profitable(effective_threshold):
             # Record opportunity time for cooldown
             self._last_opportunity[event_id] = now
             return opportunity

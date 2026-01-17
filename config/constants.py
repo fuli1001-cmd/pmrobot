@@ -37,3 +37,29 @@ ORDER_TYPE_GTD = "GTD"  # Good Till Date
 SIGNATURE_TYPE_EOA = 0
 SIGNATURE_TYPE_POLY_PROXY = 1
 SIGNATURE_TYPE_POLY_GNOSIS_SAFE = 2
+
+# Tiered Profit Thresholds (per strategy document recommendations)
+# Binary markets: lower threshold since only 2 trades needed
+PROFIT_THRESHOLD_BINARY = 0.01  # 1%
+# Negative Risk markets: higher threshold due to more trades
+PROFIT_THRESHOLD_NEG_RISK_SMALL = 0.02  # 2% for 3-5 outcomes
+PROFIT_THRESHOLD_NEG_RISK_LARGE = 0.025  # 2.5% for 6+ outcomes
+
+
+def get_profit_threshold(outcome_count: int = 2) -> float:
+    """
+    Get appropriate profit threshold based on number of outcomes.
+    
+    Args:
+        outcome_count: Number of outcomes in the market (2 for binary)
+        
+    Returns:
+        Recommended profit threshold as decimal (e.g., 0.01 = 1%)
+    """
+    if outcome_count <= 2:
+        return PROFIT_THRESHOLD_BINARY
+    elif outcome_count <= 5:
+        return PROFIT_THRESHOLD_NEG_RISK_SMALL
+    else:
+        return PROFIT_THRESHOLD_NEG_RISK_LARGE
+
