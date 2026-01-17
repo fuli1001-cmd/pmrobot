@@ -417,6 +417,7 @@ class MarketMonitor:
         self._ws: Optional[websockets.WebSocketClientProtocol] = None
         self._running = False
         self._reconnect_delay = 1.0
+        self._heartbeat_interval = 30.0  # Ping every 30 seconds
         
         # Debug counters
         self._message_count = 0
@@ -473,9 +474,26 @@ class MarketMonitor:
             await ws.send(json.dumps(subscribe_msg))
             logger.info("Subscribed to order books", num_tokens=len(token_ids))
 
-            # Process messages
-            async for message in ws:
-                await self._handle_message(message)
+            # Run message handler and heartbeat concurrently
+            await asyncio.gather(
+                self._process_messages(ws),
+                self._heartbeat(ws),
+            )
+
+    async def _heartbeat(self, ws: websockets.WebSocketClientProtocol) -> None:
+        """Send periodic ping to keep connection alive."""
+        while self._running:
+            try:
+                await asyncio.sleep(self._heartbeat_interval)
+                await ws.ping()
+                logger.debug("Heartbeat ping sent")
+            except Exception:
+                break  # Connection closed
+
+    async def _process_messages(self, ws: websockets.WebSocketClientProtocol) -> None:
+        """Process incoming WebSocket messages."""
+        async for message in ws:
+            await self._handle_message(message)
 
     async def _handle_message(self, message: str) -> None:
         """Handle incoming WebSocket message."""
@@ -656,6 +674,7 @@ class NegativeRiskMarketMonitor:
         self._ws: Optional[websockets.WebSocketClientProtocol] = None
         self._running = False
         self._reconnect_delay = 1.0
+        self._heartbeat_interval = 30.0  # Ping every 30 seconds
         
         # Track which events have been checked recently to avoid duplicate checks
         self._last_check_time: Dict[str, float] = {}
@@ -705,9 +724,26 @@ class NegativeRiskMarketMonitor:
             await self._subscribe(all_tokens)
             logger.info("NegRisk: Waiting for messages...")
 
-            # Process messages
-            async for message in ws:
-                await self._handle_message(message)
+            # Run message handler and heartbeat concurrently
+            await asyncio.gather(
+                self._process_messages(ws),
+                self._heartbeat(ws),
+            )
+
+    async def _heartbeat(self, ws: websockets.WebSocketClientProtocol) -> None:
+        """Send periodic ping to keep connection alive."""
+        while self._running:
+            try:
+                await asyncio.sleep(self._heartbeat_interval)
+                await ws.ping()
+                logger.debug("NegRisk: Heartbeat ping sent")
+            except Exception:
+                break  # Connection closed
+
+    async def _process_messages(self, ws: websockets.WebSocketClientProtocol) -> None:
+        """Process incoming WebSocket messages."""
+        async for message in ws:
+            await self._handle_message(message)
 
     async def _subscribe(self, token_ids: List[str]) -> None:
         """Subscribe to order books for given tokens in batches."""
