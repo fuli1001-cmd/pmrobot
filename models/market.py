@@ -180,8 +180,10 @@ class NegativeRiskEvent:
 
 class NegativeRiskStrategy(Enum):
     """Arbitrage strategy for Negative Risk events."""
-    BUY_ALL_NO = "buy_all_no"    # Buy No for all outcomes
-    BUY_ALL_YES = "buy_all_yes"  # Buy Yes for all outcomes
+    BUY_ALL_NO = "buy_all_no"        # Buy No for all outcomes (when sum(No) < N-1)
+    BUY_ALL_YES = "buy_all_yes"      # Buy Yes for all outcomes (when sum(Yes) < 1)
+    SHORT_REBALANCE = "short_rebalance"  # Buy all No when sum(Yes) > 1 (short the overpriced Yes)
+
 
 
 @dataclass

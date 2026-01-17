@@ -270,6 +270,13 @@ class NegativeRiskArbitrageDetector:
             self._last_opportunity[event_id] = now
             return opportunity
 
+        # Try Short Rebalance (when sum(Yes) > 1)
+        opportunity = self._detect_short_rebalance(event, order_books)
+        if opportunity and opportunity.is_profitable(self.profit_threshold):
+            # Record opportunity time for cooldown
+            self._last_opportunity[event_id] = now
+            return opportunity
+
         return None
 
     def _detect_buy_all_yes(
@@ -380,6 +387,82 @@ class NegativeRiskArbitrageDetector:
             event=event,
             strategy=NegativeRiskStrategy.BUY_ALL_NO,
             outcome_prices=outcome_prices,
+            trade_size_usdc=self.trade_size,
+            total_cost=total_no_cost,
+            expected_payout=expected_payout,
+            estimated_fee=0.0,
+            timestamp=time.time(),
+        )
+
+    def _detect_short_rebalance(
+        self,
+        event: NegativeRiskEvent,
+        order_books: "OrderBookManager",
+    ) -> Optional[NegativeRiskArbitrageOpportunity]:
+        """
+        Detect short rebalancing opportunity when sum(Yes prices) > 1.
+        
+        When the market overprices the total probability (sum(Yes) > 1),
+        we can profit by buying all No tokens (equivalent to shorting the overpriced Yes).
+        
+        Condition: sum(Yes prices) > 1 + threshold
+        Strategy: Buy all No tokens
+        Profit: sum(Yes) - 1 (which equals N-1 - sum(No))
+        """
+        outcome_no_prices = {}
+        total_yes_cost = 0.0
+        total_no_cost = 0.0
+        n = event.outcome_count
+
+        for outcome in event.outcomes:
+            book_yes = order_books.get(outcome.token_id_yes)
+            book_no = order_books.get(outcome.token_id_no)
+            
+            if not book_yes or not book_yes.bids:
+                return None  # Need Yes bid prices to calculate sum(Yes)
+            if not book_no or not book_no.asks:
+                return None  # Need No ask prices to buy
+
+            # Get Yes price (best bid = what we'd get if selling Yes)
+            yes_price = book_yes.best_bid
+            total_yes_cost += yes_price
+            
+            # Get No price (for buying)
+            no_avg_price = book_no.calculate_average_buy_price(self.trade_size / n)
+            if no_avg_price is None:
+                return None
+            
+            outcome_no_prices[outcome.condition_id] = no_avg_price
+            total_no_cost += no_avg_price
+
+        # Check if sum(Yes) > 1 (market is overpriced)
+        if total_yes_cost <= 1.0:
+            return None  # No short opportunity
+
+        # Calculate profit
+        # Buying all No costs total_no_cost, payout is (N-1)
+        expected_payout = n - 1
+        gross_profit = expected_payout - total_no_cost
+        
+        # Only profitable if gross_profit > 0
+        if gross_profit <= 0:
+            return None
+
+        # Periodic debug log
+        if self._check_count % 500 == 375:  # Offset from other checks
+            logger.info(
+                "NegRisk Price sample (Short-Rebalance)",
+                event=event.title[:40],
+                outcomes=n,
+                sum_yes=f"{total_yes_cost:.4f}",
+                sum_no=f"{total_no_cost:.4f}",
+                profit=f"{gross_profit / total_no_cost if total_no_cost > 0 else 0:.2%}",
+            )
+
+        return NegativeRiskArbitrageOpportunity(
+            event=event,
+            strategy=NegativeRiskStrategy.SHORT_REBALANCE,
+            outcome_prices=outcome_no_prices,
             trade_size_usdc=self.trade_size,
             total_cost=total_no_cost,
             expected_payout=expected_payout,
