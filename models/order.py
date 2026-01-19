@@ -138,6 +138,87 @@ class OrderBook:
         
         return total_cost / total_tokens if total_tokens > 0 else None
 
+    def calculate_depth_penetration(
+        self,
+        amount_usdc: float,
+        side: str = "buy",
+        max_slippage: Optional[float] = None,
+    ) -> dict:
+        """
+        Enhanced depth penetration calculation with detailed info.
+        
+        Args:
+            amount_usdc: Amount to trade in USDC
+            side: "buy" for asks, "sell" for bids
+            max_slippage: Optional maximum allowed slippage (e.g., 0.02 = 2%)
+            
+        Returns:
+            Dict with:
+                - avg_price: Weighted average execution price
+                - slippage: Slippage vs best price
+                - fillable_amount: How much can be filled
+                - levels_used: Number of order book levels consumed
+                - is_complete: Whether full amount can be filled
+        """
+        levels = self.asks if side == "buy" else self.bids
+        if not levels:
+            return {
+                "avg_price": None,
+                "slippage": None,
+                "fillable_amount": 0.0,
+                "levels_used": 0,
+                "is_complete": False,
+            }
+        
+        best_price = levels[0].price
+        remaining = amount_usdc
+        total_tokens = 0.0
+        total_cost = 0.0
+        levels_used = 0
+        
+        for level in levels:
+            # Check slippage constraint
+            if max_slippage is not None:
+                current_slippage = abs(level.price - best_price) / best_price
+                if current_slippage > max_slippage:
+                    break  # Stop at this level due to slippage limit
+            
+            level_value = level.price * level.size
+            levels_used += 1
+            
+            if remaining >= level_value:
+                total_tokens += level.size
+                total_cost += level_value
+                remaining -= level_value
+            else:
+                tokens_at_level = remaining / level.price
+                total_tokens += tokens_at_level
+                total_cost += remaining
+                remaining = 0
+                break
+        
+        if total_tokens == 0:
+            return {
+                "avg_price": None,
+                "slippage": None,
+                "fillable_amount": 0.0,
+                "levels_used": 0,
+                "is_complete": False,
+            }
+        
+        avg_price = total_cost / total_tokens
+        slippage = (avg_price - best_price) / best_price if side == "buy" else (best_price - avg_price) / best_price
+        fillable_amount = amount_usdc - remaining
+        
+        return {
+            "avg_price": avg_price,
+            "slippage": slippage,
+            "fillable_amount": fillable_amount,
+            "levels_used": levels_used,
+            "is_complete": remaining == 0,
+        }
+
+
     def calculate_average_sell_price(self, token_amount: float) -> Optional[float]:
         """
         Calculate weighted average price to sell a given token amount.
