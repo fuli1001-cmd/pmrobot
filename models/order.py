@@ -218,6 +218,99 @@ class OrderBook:
             "is_complete": remaining == 0,
         }
 
+    def calculate_greedy_fill(
+        self,
+        other_book: "OrderBook",
+        profit_threshold: float,
+        max_size: float,
+        min_size: float = 10.0,
+    ) -> dict:
+        """
+        Greedy fill algorithm: expand position size while profit threshold is met.
+        
+        For binary arbitrage where we buy both Yes and No:
+        - Start with first level of both books
+        - Incrementally add deeper levels
+        - Stop when combined cost exceeds profit threshold or max_size
+        
+        Args:
+            other_book: The other side's order book (e.g., No book if self is Yes)
+            profit_threshold: Minimum profit percentage required (e.g., 0.01 = 1%)
+            max_size: Maximum position size in USDC
+            min_size: Minimum position size in USDC
+            
+        Returns:
+            Dict with:
+                - optimal_size: Best size that meets profit threshold
+                - avg_price_self: Weighted avg price for this book
+                - avg_price_other: Weighted avg price for other book
+                - combined_cost: Total cost (should be < 1.0 for profit)
+                - profit_pct: Actual profit percentage
+                - levels_self: Levels consumed from this book
+                - levels_other: Levels consumed from other book
+        """
+        if not self.asks or not other_book.asks:
+            return {
+                "optimal_size": 0.0,
+                "avg_price_self": None,
+                "avg_price_other": None,
+                "combined_cost": None,
+                "profit_pct": 0.0,
+                "levels_self": 0,
+                "levels_other": 0,
+            }
+        
+        # Binary search for optimal size
+        best_result = None
+        test_sizes = [min_size]
+        
+        # Generate test sizes: min, min*2, min*4, ..., max
+        size = min_size * 2
+        while size <= max_size:
+            test_sizes.append(size)
+            size *= 2
+        test_sizes.append(max_size)
+        
+        for test_size in test_sizes:
+            # Calculate prices for each side (half the total size each)
+            half_size = test_size / 2
+            
+            info_self = self.calculate_depth_penetration(half_size, "buy")
+            info_other = other_book.calculate_depth_penetration(half_size, "buy")
+            
+            if not info_self["is_complete"] or not info_other["is_complete"]:
+                break  # Not enough liquidity at this size
+            
+            combined_cost = info_self["avg_price"] + info_other["avg_price"]
+            profit_pct = 1.0 - combined_cost
+            
+            if profit_pct >= profit_threshold:
+                best_result = {
+                    "optimal_size": test_size,
+                    "avg_price_self": info_self["avg_price"],
+                    "avg_price_other": info_other["avg_price"],
+                    "combined_cost": combined_cost,
+                    "profit_pct": profit_pct,
+                    "levels_self": info_self["levels_used"],
+                    "levels_other": info_other["levels_used"],
+                }
+            else:
+                # Profit dropped below threshold, stop expanding
+                break
+        
+        if best_result is None:
+            return {
+                "optimal_size": 0.0,
+                "avg_price_self": None,
+                "avg_price_other": None,
+                "combined_cost": None,
+                "profit_pct": 0.0,
+                "levels_self": 0,
+                "levels_other": 0,
+            }
+        
+        return best_result
+
 
     def calculate_average_sell_price(self, token_amount: float) -> Optional[float]:
         """

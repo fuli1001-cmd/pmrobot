@@ -125,27 +125,23 @@ class ArbitrageDetector:
             if elapsed < self.cooldown_seconds:
                 return None  # Still in cooldown period
 
-        # Dynamic position sizing based on available depth
-        # Use 30% of minimum available depth as safe position size
-        depth_yes = book_yes.get_available_depth("ask", max_levels=5)
-        depth_no = book_no.get_available_depth("ask", max_levels=5)
-        min_depth = min(depth_yes, depth_no)
-        effective_trade_size = min(self.trade_size, min_depth * 0.3)
+        # Use greedy fill algorithm to find optimal position size
+        greedy_result = book_yes.calculate_greedy_fill(
+            other_book=book_no,
+            profit_threshold=self.profit_threshold,
+            max_size=self.trade_size,
+            min_size=10.0,
+        )
         
-        # Skip if insufficient depth
-        if effective_trade_size < 10.0:  # Minimum $10 trade
+        # Skip if no profitable size found
+        if greedy_result["optimal_size"] == 0.0:
             return None
-
-        # Calculate average buy prices using depth penetration
-        avg_price_yes = book_yes.calculate_average_buy_price(effective_trade_size / 2)
-        avg_price_no = book_no.calculate_average_buy_price(effective_trade_size / 2)
+        
+        effective_trade_size = greedy_result["optimal_size"]
+        avg_price_yes = greedy_result["avg_price_self"]
+        avg_price_no = greedy_result["avg_price_other"]
 
         if avg_price_yes is None or avg_price_no is None:
-            logger.debug(
-                "Insufficient liquidity",
-                market=market.slug,
-                trade_size=effective_trade_size,
-            )
             return None
 
         # Check slippage against best ask
