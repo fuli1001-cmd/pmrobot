@@ -246,3 +246,60 @@ class ArbitrageOpportunity:
             True if opportunity is profitable after threshold
         """
         return self.net_profit_pct > threshold
+
+
+@dataclass
+class ShortArbitrageOpportunity:
+    """
+    Represents a SHORT arbitrage opportunity (Mint + Sell).
+    
+    This occurs when Bid(Yes) + Bid(No) > 1.0.
+    Strategy: Mint Yes+No tokens (cost $1), then sell both for total > $1.
+    """
+    market: Market
+    
+    # Best bid prices (what we can sell at)
+    bid_price_yes: float
+    bid_price_no: float
+    
+    # Trade parameters
+    trade_size_usdc: float
+    
+    # Profit calculation
+    total_revenue: float  # bid_yes + bid_no (should be > 1.0)
+    mint_cost: float = 1.0  # Minting always costs $1 per pair
+    estimated_gas_cost: float = 0.05  # Gas for Mint transaction
+    estimated_fee: float = 0.0  # Trading fees for selling
+    
+    timestamp: float = 0.0
+    
+    @property
+    def gross_profit_pct(self) -> float:
+        """Gross profit percentage (before gas and fees)."""
+        return self.total_revenue - self.mint_cost
+    
+    @property
+    def net_profit_pct(self) -> float:
+        """Net profit percentage (after gas and fees)."""
+        # Gas cost as percentage of trade size
+        gas_pct = self.estimated_gas_cost / self.trade_size_usdc if self.trade_size_usdc > 0 else 0
+        return self.gross_profit_pct - self.estimated_fee - gas_pct
+    
+    @property
+    def net_profit_usdc(self) -> float:
+        """Net profit in USDC."""
+        gross = (self.total_revenue - self.mint_cost) * self.trade_size_usdc
+        return gross - self.estimated_gas_cost - (self.estimated_fee * self.trade_size_usdc)
+    
+    def is_profitable(self, threshold: float = 0.015) -> bool:
+        """
+        Check if this short opportunity exceeds the profit threshold.
+        
+        Args:
+            threshold: Minimum profit threshold (default 1.5% for shorts)
+            
+        Returns:
+            True if opportunity is profitable after threshold
+        """
+        return self.net_profit_pct > threshold
+

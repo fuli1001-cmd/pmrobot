@@ -8,9 +8,15 @@ from typing import Callable, Dict, List, Optional, Set
 import websockets
 from websockets.exceptions import ConnectionClosed
 
-from config.constants import CLOB_WS_URL, get_profit_threshold
+from config.constants import (
+    CLOB_WS_URL, 
+    get_profit_threshold,
+    ESTIMATED_MINT_GAS_COST_USD,
+    MIN_SHORT_ARBITRAGE_SIZE,
+    SHORT_ARBITRAGE_THRESHOLD,
+)
 from models.market import Market, NegativeRiskEvent, NegativeRiskStrategy, NegativeRiskArbitrageOpportunity
-from models.order import ArbitrageOpportunity, OrderBook, OrderBookLevel
+from models.order import ArbitrageOpportunity, ShortArbitrageOpportunity, OrderBook, OrderBookLevel
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -196,6 +202,95 @@ class ArbitrageDetector:
             )
             return opportunity
 
+        return None
+
+    def detect_short(
+        self,
+        market: Market,
+        book_yes: OrderBook,
+        book_no: OrderBook,
+    ) -> Optional[ShortArbitrageOpportunity]:
+        """
+        Detect SHORT arbitrage opportunity (Mint + Sell).
+        
+        This occurs when Bid(Yes) + Bid(No) > 1.0.
+        Strategy: Mint tokens at $1, sell both for > $1.
+        
+        Args:
+            market: Market to check
+            book_yes: Order book for Yes token
+            book_no: Order book for No token
+            
+        Returns:
+            ShortArbitrageOpportunity if profitable, None otherwise
+        """
+        # Check cooldown period (use same cooldown as long)
+        market_id = market.condition_id or market.question_id or market.slug
+        now = time.time()
+        # Use different cooldown key for short opportunities
+        short_key = f"short_{market_id}"
+        if short_key in self._last_opportunity:
+            elapsed = now - self._last_opportunity[short_key]
+            if elapsed < self.cooldown_seconds:
+                return None
+        
+        # Check if we have bid prices
+        if not book_yes.best_bid or not book_no.best_bid:
+            return None
+        
+        bid_yes = book_yes.best_bid
+        bid_no = book_no.best_bid
+        total_revenue = bid_yes + bid_no
+        
+        # Skip if not a short opportunity
+        if total_revenue <= 1.0:
+            return None
+        
+        # Calculate effective trade size based on available depth
+        depth_yes = book_yes.get_available_depth("bid", max_levels=5)
+        depth_no = book_no.get_available_depth("bid", max_levels=5)
+        min_depth = min(depth_yes, depth_no)
+        effective_trade_size = min(self.trade_size, min_depth * 0.3)
+        
+        # Skip if below minimum for short arbitrage
+        if effective_trade_size < MIN_SHORT_ARBITRAGE_SIZE:
+            return None
+        
+        opportunity = ShortArbitrageOpportunity(
+            market=market,
+            bid_price_yes=bid_yes,
+            bid_price_no=bid_no,
+            trade_size_usdc=effective_trade_size,
+            total_revenue=total_revenue,
+            mint_cost=1.0,
+            estimated_gas_cost=ESTIMATED_MINT_GAS_COST_USD,
+            estimated_fee=market.estimate_fee(bid_yes),
+            timestamp=now,
+        )
+        
+        # Periodic debug log
+        self._check_count = getattr(self, '_check_count', 0)
+        if self._check_count % 1000 == 500:
+            logger.info(
+                "Short price sample",
+                market=market.slug[:30],
+                bid_yes=f"{bid_yes:.4f}",
+                bid_no=f"{bid_no:.4f}",
+                total=f"{total_revenue:.4f}",
+                profit=f"{opportunity.gross_profit_pct:.2%}",
+            )
+        
+        if opportunity.is_profitable(SHORT_ARBITRAGE_THRESHOLD):
+            self._last_opportunity[short_key] = now
+            logger.info(
+                "[SHORT OPPORTUNITY] Mint+Sell detected!",
+                market=market.slug,
+                gross_profit=f"{opportunity.gross_profit_pct:.4f}",
+                net_profit=f"{opportunity.net_profit_pct:.4f}",
+                profit_usdc=f"${opportunity.net_profit_usdc:.2f}",
+            )
+            return opportunity
+        
         return None
 
 

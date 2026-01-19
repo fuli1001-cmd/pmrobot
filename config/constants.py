@@ -45,6 +45,12 @@ PROFIT_THRESHOLD_BINARY = 0.01  # 1%
 PROFIT_THRESHOLD_NEG_RISK_SMALL = 0.02  # 2% for 3-5 outcomes
 PROFIT_THRESHOLD_NEG_RISK_LARGE = 0.025  # 2.5% for 6+ outcomes
 
+# Short Arbitrage (Mint + Sell) Constants
+USDC_CONTRACT_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"  # USDC on Polygon
+ESTIMATED_MINT_GAS_COST_USD = 0.05  # Conservative estimate for Polygon Mint gas cost
+MIN_SHORT_ARBITRAGE_SIZE = 50.0  # Minimum $50 to make short arbitrage worthwhile
+SHORT_ARBITRAGE_THRESHOLD = 0.015  # 1.5% min profit for short (higher to cover gas)
+
 
 def get_profit_threshold(outcome_count: int = 2) -> float:
     """
