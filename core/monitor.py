@@ -83,7 +83,7 @@ class ArbitrageDetector:
         profit_threshold: float = 0.008,
         trade_size: float = 100.0,
         max_slippage: float = 0.002,
-        cooldown_seconds: float = 60.0,
+        cooldown_seconds: float = 0.0,  # 0 for dry-run, use 5-10 for real trading
     ):
         """
         Initialize the arbitrage detector.
@@ -304,7 +304,7 @@ class NegativeRiskArbitrageDetector:
         profit_threshold: float = 0.008,
         trade_size: float = 100.0,
         max_slippage: float = 0.002,
-        cooldown_seconds: float = 60.0,
+        cooldown_seconds: float = 0.0,  # 0 for dry-run, use 5-10 for real trading
     ):
         """
         Initialize the Negative Risk arbitrage detector.
@@ -347,8 +347,42 @@ class NegativeRiskArbitrageDetector:
             if elapsed < self.cooldown_seconds:
                 return None  # Still in cooldown period
 
+        # Increment check counter for periodic logging
+        self._check_count += 1
+
         # Use dynamic threshold based on outcome count
         effective_threshold = get_profit_threshold(event.outcome_count)
+
+        # Quick sum calculation for debug logging (before full detection)
+        if self._check_count % 500 == 1:
+            sum_yes = 0.0
+            sum_no = 0.0
+            valid = True
+            for outcome in event.outcomes:
+                book_yes = order_books.get(outcome.token_id_yes)
+                book_no = order_books.get(outcome.token_id_no)
+                if book_yes and book_yes.best_ask:
+                    sum_yes += book_yes.best_ask
+                else:
+                    valid = False
+                if book_no and book_no.best_ask:
+                    sum_no += book_no.best_ask
+                else:
+                    valid = False
+            if valid:
+                n = event.outcome_count
+                profit_yes = 1.0 - sum_yes  # Profit if buy all Yes
+                profit_no = (n - 1) - sum_no  # Profit if buy all No
+                logger.info(
+                    "NegRisk Price sample",
+                    event=event.title[:40],
+                    outcomes=n,
+                    sum_yes=f"{sum_yes:.4f}",
+                    sum_no=f"{sum_no:.4f}",
+                    profit_yes=f"{profit_yes:.2%}",
+                    profit_no=f"{profit_no:.2%}",
+                    threshold=f"{effective_threshold:.2%}",
+                )
 
         # Try Buy-All-Yes first (often more common)
         opportunity = self._detect_buy_all_yes(event, order_books)

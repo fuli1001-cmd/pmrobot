@@ -98,7 +98,7 @@ class MarketScanner:
     async def fetch_all_markets(
         self,
         fee_free_only: bool = True,
-        max_markets: int = 1000,
+        max_markets: int = 2000,  # Increased from 1000 for better coverage
     ) -> List[Market]:
         """
         Fetch all active markets with pagination.

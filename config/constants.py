@@ -38,18 +38,18 @@ SIGNATURE_TYPE_EOA = 0
 SIGNATURE_TYPE_POLY_PROXY = 1
 SIGNATURE_TYPE_POLY_GNOSIS_SAFE = 2
 
-# Tiered Profit Thresholds (per strategy document recommendations)
+# Tiered Profit Thresholds (LOWERED for dry-run testing)
 # Binary markets: lower threshold since only 2 trades needed
-PROFIT_THRESHOLD_BINARY = 0.01  # 1%
-# Negative Risk markets: higher threshold due to more trades
-PROFIT_THRESHOLD_NEG_RISK_SMALL = 0.02  # 2% for 3-5 outcomes
-PROFIT_THRESHOLD_NEG_RISK_LARGE = 0.025  # 2.5% for 6+ outcomes
+PROFIT_THRESHOLD_BINARY = 0.005  # 0.5% (was 1%)
+# Negative Risk markets: lowered for more opportunities
+PROFIT_THRESHOLD_NEG_RISK_SMALL = 0.01  # 1% for 3-5 outcomes (was 2%)
+PROFIT_THRESHOLD_NEG_RISK_LARGE = 0.015  # 1.5% for 6+ outcomes (was 2.5%)
 
 # Short Arbitrage (Mint + Sell) Constants
 USDC_CONTRACT_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"  # USDC on Polygon
 ESTIMATED_MINT_GAS_COST_USD = 0.05  # Conservative estimate for Polygon Mint gas cost
 MIN_SHORT_ARBITRAGE_SIZE = 50.0  # Minimum $50 to make short arbitrage worthwhile
-SHORT_ARBITRAGE_THRESHOLD = 0.015  # 1.5% min profit for short (higher to cover gas)
+SHORT_ARBITRAGE_THRESHOLD = 0.01  # 1.0% min profit for short (was 1.5%)
 
 
 def get_profit_threshold(outcome_count: int = 2) -> float:
