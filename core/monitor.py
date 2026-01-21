@@ -130,7 +130,7 @@ class ArbitrageDetector:
             other_book=book_no,
             profit_threshold=self.profit_threshold,
             max_size=self.trade_size,
-            min_size=10.0,
+            min_size=5.0,  # Lowered from 10 to capture more opportunities
         )
         
         # Skip if no profitable size found
@@ -357,32 +357,34 @@ class NegativeRiskArbitrageDetector:
         if self._check_count % 500 == 1:
             sum_yes = 0.0
             sum_no = 0.0
-            valid = True
+            missing_books = 0
             for outcome in event.outcomes:
                 book_yes = order_books.get(outcome.token_id_yes)
                 book_no = order_books.get(outcome.token_id_no)
                 if book_yes and book_yes.best_ask:
                     sum_yes += book_yes.best_ask
                 else:
-                    valid = False
+                    missing_books += 1
                 if book_no and book_no.best_ask:
                     sum_no += book_no.best_ask
                 else:
-                    valid = False
-            if valid:
-                n = event.outcome_count
-                profit_yes = 1.0 - sum_yes  # Profit if buy all Yes
-                profit_no = (n - 1) - sum_no  # Profit if buy all No
-                logger.info(
-                    "NegRisk Price sample",
-                    event=event.title[:40],
-                    outcomes=n,
-                    sum_yes=f"{sum_yes:.4f}",
-                    sum_no=f"{sum_no:.4f}",
-                    profit_yes=f"{profit_yes:.2%}",
-                    profit_no=f"{profit_no:.2%}",
-                    threshold=f"{effective_threshold:.2%}",
-                )
+                    missing_books += 1
+            
+            # Always log for visibility (even with missing data)
+            n = event.outcome_count
+            profit_yes = 1.0 - sum_yes  # Profit if buy all Yes
+            profit_no = (n - 1) - sum_no  # Profit if buy all No
+            logger.info(
+                "NegRisk Price sample",
+                event=event.title[:40],
+                outcomes=n,
+                sum_yes=f"{sum_yes:.4f}",
+                sum_no=f"{sum_no:.4f}",
+                profit_yes=f"{profit_yes:.2%}",
+                profit_no=f"{profit_no:.2%}",
+                threshold=f"{effective_threshold:.2%}",
+                missing=missing_books,
+            )
 
         # Try Buy-All-Yes first (often more common)
         opportunity = self._detect_buy_all_yes(event, order_books)

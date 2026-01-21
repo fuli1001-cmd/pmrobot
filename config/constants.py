@@ -38,9 +38,9 @@ SIGNATURE_TYPE_EOA = 0
 SIGNATURE_TYPE_POLY_PROXY = 1
 SIGNATURE_TYPE_POLY_GNOSIS_SAFE = 2
 
-# Tiered Profit Thresholds (LOWERED for dry-run testing)
-# Binary markets: lower threshold since only 2 trades needed
-PROFIT_THRESHOLD_BINARY = 0.005  # 0.5% (was 1%)
+# Tiered Profit Thresholds (adjusted for testing)
+# Binary markets: 1% threshold for stable profit per trade
+PROFIT_THRESHOLD_BINARY = 0.01  # 1% (restored from 0.5%)
 # Negative Risk markets: lowered for more opportunities
 PROFIT_THRESHOLD_NEG_RISK_SMALL = 0.01  # 1% for 3-5 outcomes (was 2%)
 PROFIT_THRESHOLD_NEG_RISK_LARGE = 0.015  # 1.5% for 6+ outcomes (was 2.5%)
