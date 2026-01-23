@@ -999,7 +999,7 @@ class NegativeRiskMarketMonitor:
             subscription = {
                 "type": "subscribe",
                 "channel": "book",
-                "asset_ids": batch,
+                "assets_ids": batch,  # Fixed: was "asset_ids", Polymarket expects "assets_ids"
             }
             subscription_json = json.dumps(subscription)
             
