@@ -350,6 +350,15 @@ class NegativeRiskArbitrageDetector:
         # Increment check counter for periodic logging
         self._check_count += 1
 
+        # Early entry-point logging to confirm detect() is being called
+        if self._check_count % 500 == 1:
+            logger.info(
+                "NegRisk detect() called",
+                event=event.title[:30],
+                outcomes=event.outcome_count,
+                check_num=self._check_count,
+            )
+
         # Use dynamic threshold based on outcome count
         effective_threshold = get_profit_threshold(event.outcome_count)
 
