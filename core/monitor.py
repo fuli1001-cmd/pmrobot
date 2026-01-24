@@ -1113,7 +1113,7 @@ class NegativeRiskMarketMonitor:
             logger.info(
                 "NegRisk: Handling update", 
                 token=token_id, 
-                event=event.event_id,
+                event_id=event.event_id,  # Fixed: avoid conflict with logger 'event' arg
                 time_diff=now-last_check
             )
 
