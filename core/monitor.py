@@ -1100,11 +1100,23 @@ class NegativeRiskMarketMonitor:
         # Find event for this token
         event = self.token_to_event.get(token_id)
         if not event:
+            if self._book_update_count <= 5:
+                logger.debug("NegRisk: Token not mapped to event", token_id=token_id)
             return
 
         # Rate limit: avoid checking same event too frequently
         now = time.time()
         last_check = self._last_check_time.get(event.event_id, 0)
+        
+        # Debug log for first few updates to check flow
+        if self._book_update_count <= 5:
+            logger.debug(
+                "NegRisk: Handling update", 
+                token=token_id, 
+                event=event.event_id,
+                time_diff=now-last_check
+            )
+
         if now - last_check < self._min_check_interval:
             return
         
