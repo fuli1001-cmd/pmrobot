@@ -1059,9 +1059,9 @@ class NegativeRiskMarketMonitor:
         except json.JSONDecodeError as e:
             # Only log non-empty parsing errors at debug level
             if message and not message.isspace():
-                logger.debug("NegRisk: Non-JSON message received", msg_preview=message[:100])
+                logger.warning("NegRisk: Non-JSON message received", msg_preview=message[:100])
         except Exception as e:
-            logger.debug("Error handling NegRisk message", error=str(e))
+            logger.error("Error handling NegRisk message", error=str(e), traceback=True)
 
     async def _process_single_message(self, data: dict) -> None:
         """Process a single WebSocket message."""
@@ -1101,7 +1101,7 @@ class NegativeRiskMarketMonitor:
         event = self.token_to_event.get(token_id)
         if not event:
             if self._book_update_count <= 5:
-                logger.debug("NegRisk: Token not mapped to event", token_id=token_id)
+                logger.info("NegRisk: Token not mapped to event", token_id=token_id)
             return
 
         # Rate limit: avoid checking same event too frequently
@@ -1110,7 +1110,7 @@ class NegativeRiskMarketMonitor:
         
         # Debug log for first few updates to check flow
         if self._book_update_count <= 5:
-            logger.debug(
+            logger.info(
                 "NegRisk: Handling update", 
                 token=token_id, 
                 event=event.event_id,
