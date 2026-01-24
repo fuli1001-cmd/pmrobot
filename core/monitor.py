@@ -354,7 +354,7 @@ class NegativeRiskArbitrageDetector:
         if self._check_count % 500 == 1:
             logger.info(
                 "NegRisk detect() called",
-                event=event.title[:30],
+                event_title=event.title[:30],
                 outcomes=event.outcome_count,
                 check_num=self._check_count,
             )
@@ -454,7 +454,7 @@ class NegativeRiskArbitrageDetector:
         if self._check_count % 500 == 1:
             logger.info(
                 "NegRisk Price sample (Buy-All-Yes)",
-                event=event.title[:40],
+                event_title=event.title[:40],
                 outcomes=event.outcome_count,
                 total_yes=f"{total_yes_cost:.4f}",
                 profit=f"{gross_profit:.2%}",
@@ -512,7 +512,7 @@ class NegativeRiskArbitrageDetector:
         if self._check_count % 500 == 250:  # Offset from Yes checks
             logger.info(
                 "NegRisk Price sample (Buy-All-No)",
-                event=event.title[:40],
+                event_title=event.title[:40],
                 outcomes=n,
                 total_no=f"{total_no_cost:.4f}",
                 expected=f"{expected_payout:.1f}",
@@ -591,7 +591,7 @@ class NegativeRiskArbitrageDetector:
         if self._check_count % 500 == 375:  # Offset from other checks
             logger.info(
                 "NegRisk Price sample (Short-Rebalance)",
-                event=event.title[:40],
+                event_title=event.title[:40],
                 outcomes=n,
                 sum_yes=f"{total_yes_cost:.4f}",
                 sum_no=f"{total_no_cost:.4f}",
@@ -1129,7 +1129,7 @@ class NegativeRiskMarketMonitor:
             # Log with distinct marker for easy searching
             logger.info(
                 "🚀 [OPPORTUNITY] Negative Risk Arbitrage Detected",
-                event=opportunity.event.title[:60],
+                event_title=opportunity.event.title[:60],
                 strategy=opportunity.strategy.value,
                 net_profit=f"{opportunity.net_profit_pct:.2%}",
                 profit_usdc=f"${opportunity.net_profit_usdc:.2f}",
