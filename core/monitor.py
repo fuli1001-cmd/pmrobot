@@ -385,7 +385,7 @@ class NegativeRiskArbitrageDetector:
             profit_no = (n - 1) - sum_no  # Profit if buy all No
             logger.info(
                 "NegRisk Price sample",
-                event=event.title[:40],
+                event_title=event.title[:40],  # Fixed: avoid conflict with logger 'event' arg
                 outcomes=n,
                 sum_yes=f"{sum_yes:.4f}",
                 sum_no=f"{sum_no:.4f}",
