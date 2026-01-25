@@ -12,6 +12,7 @@ from py_clob_client.order_builder.constants import BUY
 
 from config.settings import get_settings
 from config.constants import CLOB_API_BASE_URL, POLYGON_CHAIN_ID, SIGNATURE_TYPE_POLY_GNOSIS_SAFE
+from models.market import NegativeRiskArbitrageOpportunity
 from models.order import ArbitrageOpportunity, Order, OrderSide, OrderStatus, OrderType
 from models.position import AccountState
 from utils.logger import get_logger
@@ -236,6 +237,134 @@ class OrderExecutor:
                 error_message=str(e),
                 execution_time_ms=execution_time,
             )
+
+    async def execute_neg_risk_arbitrage(
+        self,
+        opportunity: NegativeRiskArbitrageOpportunity,
+    ) -> ExecutionReport:
+        """
+        Execute a Negative Risk arbitrage opportunity (Multi-Leg).
+        
+        Submits multiple FOK orders concurrently.
+        """
+        start_time = time.time()
+        
+        # Build orders for all legs
+        orders: List[Order] = []
+        for condition_id, price in opportunity.outcome_prices.items():
+            # Find the token ID for this condition based on strategy
+            # We need to look up the specific token ID from the market/event
+            # This requires mapping condition_id to token_id
+            # TODO: The opportunity object should ideally provide token_ids directly
+            # For now, we iterate the event outcomes to match condition_id
+            
+            token_id = None
+            for outcome in opportunity.event.outcomes:
+                if outcome.condition_id == condition_id:
+                    if opportunity.strategy == "BuyAllYes":
+                        token_id = outcome.token_id_yes
+                    elif opportunity.strategy == "BuyAllNo" or opportunity.strategy == "ShortRebalance":
+                        token_id = outcome.token_id_no
+                    break
+            
+            if not token_id:
+                logger.error("Could not find token ID for condition", condition_id=condition_id)
+                continue
+
+            orders.append(Order(
+                token_id=token_id,
+                side=OrderSide.BUY,
+                price=price,
+                size=opportunity.trade_size_usdc / len(opportunity.outcome_prices) / price,
+                order_type=OrderType.FOK,
+            ))
+
+        if self.dry_run:
+            logger.info(
+                "DRY RUN: Would execute NegRisk arbitrage",
+                event=opportunity.event.title[:40],
+                strategy=opportunity.strategy.value,
+                legs=len(orders),
+                net_profit=f"{opportunity.net_profit_pct:.2%}",
+            )
+            return ExecutionReport(
+                result=ExecutionResult.SKIPPED,
+                opportunity=opportunity,  # This might need casting or generic type update
+                execution_time_ms=0,
+            )
+
+        # Execute vector
+        results = await self._execute_vector(orders)
+        execution_time = (time.time() - start_time) * 1000
+
+        # Check for partials
+        successful_orders = [o for o in results if o.is_filled]
+        failed_orders = [o for o in results if not o.is_filled]
+
+        if len(successful_orders) == len(orders):
+            # Perfect execution
+            return ExecutionReport(
+                result=ExecutionResult.SUCCESS,
+                opportunity=opportunity,
+                execution_time_ms=execution_time,
+            )
+        elif len(successful_orders) == 0:
+            # Total failure (safe)
+            return ExecutionReport(
+                result=ExecutionResult.FAILED,
+                opportunity=opportunity,
+                execution_time_ms=execution_time,
+            )
+        else:
+            # Partial fill - EMERGENCY EXIT
+            logger.warning(
+                "NegRisk Partial fill detected - initiating emergency exit",
+                filled=len(successful_orders),
+                total=len(orders),
+            )
+            await self._emergency_exit_vector(successful_orders)
+            return ExecutionReport(
+                result=ExecutionResult.PARTIAL,
+                opportunity=opportunity,
+                execution_time_ms=execution_time,
+            )
+
+    async def _execute_vector(self, orders: List[Order]) -> List[Order]:
+        """Execute a list of orders concurrently."""
+        tasks = [self._submit_order(order) for order in orders]
+        return await asyncio.gather(*tasks)
+
+    async def _emergency_exit_vector(self, filled_orders: List[Order]) -> None:
+        """Sell all filled orders in a failed vector execution."""
+        if not filled_orders:
+            return
+
+        logger.warning(
+            "Emergency exit vector: selling positions",
+            count=len(filled_orders),
+        )
+
+        tasks = []
+        for order in filled_orders:
+            tasks.append(self._submit_sell_exit(order))
+        
+        await asyncio.gather(*tasks)
+
+    async def _submit_sell_exit(self, filled_order: Order) -> None:
+        """Submit a market sell to exit a position."""
+        sell_price = filled_order.filled_avg_price * 0.90  # 10% dump for safety
+        try:
+            order_args = OrderArgs(
+                token_id=filled_order.token_id,
+                price=sell_price,
+                size=filled_order.filled_size,
+                side="SELL",
+            )
+            signed_order = self.client.create_order(order_args)
+            if signed_order:
+                 self.client.post_order(signed_order) # Fire and forget for speed
+        except Exception as e:
+            logger.error("Emergency exit failed for order", error=str(e))
 
     async def _submit_order(self, order: Order) -> Order:
         """

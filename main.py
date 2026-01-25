@@ -244,22 +244,47 @@ class ArbitrageBot:
                 if not self.risk_manager.can_trade():
                     continue
 
-                if self.dry_run:
-                    # Record as simulated success (direct stats update for NegRisk)
-                    self.risk_manager.stats.total_trades += 1
-                    self.risk_manager.stats.simulated_trades += 1
-                    self.risk_manager.stats.simulated_profit_usdc += opportunity.net_profit_usdc
-                    logger.info(
-                        "DRY RUN: Simulated Neg Risk arbitrage",
-                        event=opportunity.event.title[:40],
-                        strategy=opportunity.strategy.value,
-                        net_profit=f"{opportunity.net_profit_pct:.2%}",
-                        profit_usdc=f"${opportunity.net_profit_usdc:.2f}",
+                # Execute Negative Risk arbitrage
+                result = await self.executor.execute_neg_risk_arbitrage(opportunity)
+                
+                # Record results
+                if result.is_success:
+                    # Real success
+                    # Note: NegRisk doesn't have a single "market" object compatible with notification 
+                    # in the same way, need to adapt notification
+                    await self.risk_manager.record_success(
+                        opportunity, # This accepts generic opportunity
+                        opportunity.net_profit_usdc,
                     )
+                    await self.notifier.send_trade_notification(
+                        market=opportunity.event.title, # Use event title
+                        profit_pct=opportunity.net_profit_pct,
+                        trade_size=opportunity.trade_size_usdc,
+                        success=True,
+                    )
+                elif result.result == ExecutionResult.PARTIAL:
+                    # Partial fill handled by emergency exit in executor, recording loss
+                    # Assume 10% loss on trade size (roughly dump penalty)
+                    loss = opportunity.trade_size_usdc * 0.10
+                    await self.risk_manager.record_failure(
+                        opportunity,
+                        is_partial=True,
+                        loss_usdc=loss,
+                    )
+                    await self.notifier.send_alert(
+                        "NegRisk Partial Fill", 
+                        f"Event: {opportunity.event.title}\nDumped positions. Estimated Loss: ${loss:.2f}"
+                    )
+                elif result.result == ExecutionResult.SKIPPED and self.dry_run:
+                     # Already logged in executor if skipped
+                     pass
                 else:
-                    # TODO: Implement actual Negative Risk execution
-                    # This would require placing multiple orders for all outcomes
-                    logger.warning("Live Negative Risk execution not yet implemented")
+                    # Failed
+                     await self.risk_manager.record_failure(
+                        opportunity,
+                        is_partial=False,
+                        loss_usdc=0.0,
+                    )
 
             except asyncio.CancelledError:
                 break
