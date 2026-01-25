@@ -256,11 +256,18 @@ class ArbitrageBot:
                         opportunity, # This accepts generic opportunity
                         opportunity.net_profit_usdc,
                     )
+                    
+                    # Feature 1: Report Balance
+                    balance_info = ""
+                    if result.final_balance is not None:
+                        balance_info = f"\n💰 Balance: ${result.final_balance:.2f}"
+
                     await self.notifier.send_trade_notification(
                         market=opportunity.event.title, # Use event title
                         profit_pct=opportunity.net_profit_pct,
                         trade_size=opportunity.trade_size_usdc,
                         success=True,
+                        extra_info=balance_info
                     )
                 elif result.result == ExecutionResult.PARTIAL:
                     # Partial fill handled by emergency exit in executor, recording loss
@@ -272,9 +279,15 @@ class ArbitrageBot:
                         loss_usdc=loss,
                     )
                     await self.notifier.send_alert(
-                        "NegRisk Partial Fill", 
-                        f"Event: {opportunity.event.title}\nDumped positions. Estimated Loss: ${loss:.2f}"
+                        "🚨 Circuit Breaker Triggered", 
+                        f"Bot paused due to NegRisk partial fill.\n"
+                        f"Event: {opportunity.event.title}\n"
+                        f"Estimated Loss: ${loss:.2f}"
                     )
+                    # Implementation of Feature 2: Auto-Pause on Loss
+                    logger.error("Circuit breaker triggered: Stopping bot due to partial fill loss")
+                    asyncio.create_task(self.stop())
+                    return
                 elif result.result == ExecutionResult.SKIPPED and self.dry_run:
                      # Already logged in executor if skipped
                      pass
@@ -317,11 +330,18 @@ class ArbitrageBot:
                         opportunity,
                         opportunity.net_profit_usdc,
                     )
+                    
+                    # Feature 1: Report Balance
+                    balance_info = ""
+                    if result.final_balance is not None:
+                        balance_info = f"\n💰 Balance: ${result.final_balance:.2f}"
+
                     await self.notifier.send_trade_notification(
                         market=opportunity.market.question,
                         profit_pct=opportunity.net_profit_pct,
                         trade_size=opportunity.trade_size_usdc,
                         success=True,
+                        extra_info=balance_info
                     )
                 elif result.result == ExecutionResult.SKIPPED and self.dry_run:
                     # Dry-run mode: record as simulated success
@@ -344,6 +364,18 @@ class ArbitrageBot:
                         is_partial=is_partial,
                         loss_usdc=loss,
                     )
+                    
+                    if is_partial:
+                        # Feature 2: Circuit Breaker for Binary Markets too
+                        await self.notifier.send_alert(
+                            "🚨 Circuit Breaker Triggered", 
+                            f"Bot paused due to Binary partial fill.\n"
+                            f"Market: {opportunity.market.question}\n"
+                            f"Estimated Loss: ${loss:.2f}"
+                        )
+                        logger.error("Circuit breaker triggered: Stopping bot due to partial fill loss")
+                        asyncio.create_task(self.stop())
+                        return
 
             except Exception as e:
                 logger.error("Executor loop error", error=str(e))

@@ -41,7 +41,7 @@ class Settings(BaseSettings):
         0.008, ge=0.001, le=0.1, description="Minimum profit threshold (0.8%)"
     )
     single_trade_size: float = Field(
-        100.0, ge=10.0, le=10000.0, description="Single trade size in USDC"
+        100.0, ge=1.0, le=10000.0, description="Single trade size in USDC"
     )
     max_slippage: float = Field(
         0.002, ge=0.0001, le=0.05, description="Maximum allowed slippage (0.2%)"

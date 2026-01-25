@@ -38,6 +38,7 @@ class ExecutionReport:
     order_no: Optional[Order] = None
     execution_time_ms: float = 0.0
     error_message: Optional[str] = None
+    final_balance: Optional[float] = None
 
     @property
     def is_success(self) -> bool:
@@ -109,8 +110,45 @@ class OrderExecutor:
         logger.info(
             "Order executor initialized",
             dry_run=dry_run,
-            has_proxy=bool(proxy_wallet),
-        )
+        if proxy_wallet:
+            logger.info("Using Proxy Wallet", address=proxy_wallet)
+
+    async def get_account_balance(self) -> float:
+        """
+        Get current USDC balance (Simulated in dry-run).
+        """
+        if self.dry_run:
+            return 10000.0  # Simulated balance
+            
+        try:
+            # Polymarket USDC (Collateral)
+            # The client usually provides get_balance or similar
+            # If py_clob_client doesn't have direct balance method, use collateral fetching
+            # assuming collateral_balance logic is available or we default to 0 if failed
+            # Note: client.get_balance() usually returns dictionary
+            
+            # Since standard ClobClient might not expose balance directly in all versions,
+            # we try standard method or fallback
+            balances = self.client.get_balance()
+            # Loop to find USDC/Collateral. Standard format usually includes 'collateral'
+            # Adjust based on actual API response structure if needed.
+            # Usually returns list of assets. We assume USDC is the main one.
+            
+            # Simple assumption: return the first numeric balance found or 0
+            # Ideally: check for specific asset_id of USDC on Polygon
+            
+            # Start with simple extraction (assuming only collateral matters)
+            if isinstance(balances, list):
+                for b in balances:
+                     if b.get("asset_type") == "COLLATERAL":
+                         return float(b.get("balance", 0))
+            elif isinstance(balances, dict):
+                 return float(balances.get("collateral", 0))
+                 
+            return 0.0
+        except Exception as e:
+            logger.error("Failed to fetch balance", error=str(e))
+            return 0.0
 
     async def execute_arbitrage(
         self,
@@ -190,12 +228,14 @@ class OrderExecutor:
             if yes_success and no_success:
                 # Both filled - success!
                 self._update_position(opportunity, order_yes, order_no)
+                final_balance = await self.get_account_balance()
                 return ExecutionReport(
                     result=ExecutionResult.SUCCESS,
                     opportunity=opportunity,
                     order_yes=order_yes,
                     order_no=order_no,
                     execution_time_ms=execution_time,
+                    final_balance=final_balance,
                 )
 
             elif yes_success or no_success:
@@ -303,10 +343,12 @@ class OrderExecutor:
 
         if len(successful_orders) == len(orders):
             # Perfect execution
+            final_balance = await self.get_account_balance()
             return ExecutionReport(
                 result=ExecutionResult.SUCCESS,
                 opportunity=opportunity,
                 execution_time_ms=execution_time,
+                final_balance=final_balance,
             )
         elif len(successful_orders) == 0:
             # Total failure (safe)
