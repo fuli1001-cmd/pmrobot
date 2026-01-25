@@ -101,15 +101,30 @@ class OrderExecutor:
         
         # Set API credentials for authentication
         from py_clob_client.clob_types import ApiCreds
-        self.client.set_api_creds(ApiCreds(
-            api_key=api_key,
-            api_secret=api_secret,
-            api_passphrase=passphrase,
-        ))
+        
+        if api_key and api_secret and passphrase:
+            # Use provided credentials
+            self.client.set_api_creds(ApiCreds(
+                api_key=api_key,
+                api_secret=api_secret,
+                api_passphrase=passphrase,
+            ))
+        else:
+            # Auto-derive credentials from private key
+            logger.info("No API credentials provided, deriving from Private Key...")
+            try:
+                creds = self.client.create_or_derive_api_creds()
+                self.client.set_api_creds(creds)
+                logger.info("Successfully derived API credentials")
+            except Exception as e:
+                logger.error("Failed to derive API credentials", error=str(e))
+                raise ValueError(f"Could not derive API credentials: {e}")
 
         logger.info(
             "Order executor initialized",
             dry_run=dry_run,
+        )
+
         if proxy_wallet:
             logger.info("Using Proxy Wallet", address=proxy_wallet)
 

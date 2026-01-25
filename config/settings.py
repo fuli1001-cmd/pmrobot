@@ -18,9 +18,10 @@ class Settings(BaseSettings):
     )
 
     # Polymarket API Credentials
-    polymarket_api_key: str = Field(..., description="Polymarket CLOB API Key")
-    polymarket_api_secret: str = Field(..., description="Polymarket CLOB API Secret")
-    polymarket_passphrase: str = Field(..., description="Polymarket CLOB Passphrase")
+    # Polymarket API Credentials (Optional if deriving from Private Key)
+    polymarket_api_key: Optional[str] = Field(None, description="Polymarket CLOB API Key")
+    polymarket_api_secret: Optional[str] = Field(None, description="Polymarket CLOB API Secret")
+    polymarket_passphrase: Optional[str] = Field(None, description="Polymarket CLOB Passphrase")
 
     # Wallet Configuration
     private_key: Optional[str] = Field(None, description="Wallet private key for signing (optional)")
