@@ -79,11 +79,16 @@ class ArbitrageBot:
 
         # Initialize executor
         self.executor = create_executor(dry_run=self.dry_run)
+        
+        # Fetch initial balance for logging
+        initial_balance = await self.executor.get_account_balance()
+        logger.info(f"Initial Account Balance: ${initial_balance:.2f}")
 
         # Send startup notification
         await self.notifier.send(
             f"🚀 <b>Arbitrage Bot Started</b>\n\n"
             f"Mode: {'DRY RUN' if self.dry_run else 'LIVE'}\n"
+            f"Balance: ${initial_balance:.2f}\n"
             f"Threshold: {self.settings.profit_threshold:.2%}\n"
             f"Trade Size: ${self.settings.single_trade_size:.2f}"
         )

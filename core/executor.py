@@ -91,11 +91,13 @@ class OrderExecutor:
             raise ValueError("Private key is required for live trading")
 
         # Initialize CLOB client with private key for signing
+        # IMPORTANT: Use signature_type=1 (Poly Proxy) and funder=proxy_wallet
+        # This is critical for accounts where EOA is a signer for a Magic/Gnosis Safe
         self.client = ClobClient(
             host=CLOB_API_BASE_URL,
             key=private_key,
             chain_id=chain_id,
-            signature_type=SIGNATURE_TYPE_POLY_GNOSIS_SAFE if proxy_wallet else 0,
+            signature_type=1 if proxy_wallet else None,
             funder=proxy_wallet,
         )
         
@@ -127,43 +129,71 @@ class OrderExecutor:
 
         if proxy_wallet:
             logger.info("Using Proxy Wallet", address=proxy_wallet)
+        
+        self.proxy_wallet = proxy_wallet
 
     async def get_account_balance(self) -> float:
         """
-        Get current USDC balance (Simulated in dry-run).
+        Get current USDC balance.
+        
+        Checks standard API first (likely Bridged USDC).
+        If 0, falls back to Web3 check for Native USDC on Proxy.
+        
+        Returns:
+            float: Balance in USDC
         """
-        if self.dry_run:
-            return 10000.0  # Simulated balance
-            
+        if self.dry_run and not self.client:
+            return 10000.0
+
+        api_balance = 0.0
         try:
-            # Polymarket USDC (Collateral)
-            # The client usually provides get_balance or similar
-            # If py_clob_client doesn't have direct balance method, use collateral fetching
-            # assuming collateral_balance logic is available or we default to 0 if failed
-            # Note: client.get_balance() usually returns dictionary
-            
-            # Since standard ClobClient might not expose balance directly in all versions,
-            # we try standard method or fallback
-            balances = self.client.get_balance()
-            # Loop to find USDC/Collateral. Standard format usually includes 'collateral'
-            # Adjust based on actual API response structure if needed.
-            # Usually returns list of assets. We assume USDC is the main one.
-            
-            # Simple assumption: return the first numeric balance found or 0
-            # Ideally: check for specific asset_id of USDC on Polygon
-            
-            # Start with simple extraction (assuming only collateral matters)
-            if isinstance(balances, list):
-                for b in balances:
-                     if b.get("asset_type") == "COLLATERAL":
-                         return float(b.get("balance", 0))
-            elif isinstance(balances, dict):
-                 return float(balances.get("collateral", 0))
-                 
-            return 0.0
+            from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+            resp = self.client.get_balance_allowance(
+                params=BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+            )
+            raw_bal = resp.get("balance", "0")
+            api_balance = float(raw_bal)
         except Exception as e:
-            logger.error("Failed to fetch balance", error=str(e))
-            return 0.0
+            logger.error("Failed to fetch API balance", error=str(e))
+        
+        # If API returns > 0, trust it (it matches the token the API expects)
+        if api_balance > 0:
+            return api_balance
+            
+        # Fallback: Check Native USDC on Proxy via Web3
+        if self.client and self.proxy_wallet:
+            try:
+                from web3 import Web3
+                # Minimal ABI for balanceOf
+                abi = [{"constant": True, "inputs": [{"name": "_owner", "type": "address"}], "name": "balanceOf", "outputs": [{"name": "balance", "type": "uint256"}], "type": "function"}]
+                rpc = "https://polygon-rpc.com" # Default to public if env not set
+                w3 = Web3(Web3.HTTPProvider(rpc))
+                
+                if w3.is_connected():
+                    # Check both Native (New) and Bridged (Old) USDC
+                    native_addr = "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"
+                    bridged_addr = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+                    
+                    c_native = w3.eth.contract(address=native_addr, abi=abi)
+                    c_bridged = w3.eth.contract(address=bridged_addr, abi=abi)
+                    
+                    bal_n = c_native.functions.balanceOf(self.proxy_wallet).call()
+                    bal_b = c_bridged.functions.balanceOf(self.proxy_wallet).call()
+                    
+                    total_bal = (bal_n + bal_b) / 1e6
+                    
+                    if total_bal > 0:
+                        logger.info(
+                            "Funds Detected via Web3", 
+                            total=total_bal, 
+                            native=bal_n/1e6, 
+                            bridged=bal_b/1e6
+                        )
+                        return total_bal
+            except Exception as w3e:
+                logger.debug("Web3 fallback balance check failed", error=str(w3e))
+                
+        return api_balance
 
     async def execute_arbitrage(
         self,
