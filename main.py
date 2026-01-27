@@ -507,10 +507,13 @@ async def main() -> None:
     args = parse_args()
 
     # Setup logging
+    import os
+    os.makedirs("logs", exist_ok=True)
+    
     setup_logging(
         level=args.log_level,
         json_format=args.log_json,
-        log_file="log.txt",  # Auto-generate log file
+        log_file=os.path.join("logs", "pmrobot.log"),
     )
 
     # Load settings
