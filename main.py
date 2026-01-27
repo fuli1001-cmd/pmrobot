@@ -87,11 +87,11 @@ class ArbitrageBot:
 
         # Send startup notification
         await self.notifier.send(
-            f"🚀 <b>Arbitrage Bot Started</b>\n\n"
-            f"Mode: {'DRY RUN' if self.dry_run else 'LIVE'}\n"
-            f"Balance: ${initial_balance:.2f}\n"
-            f"Threshold: {self.settings.profit_threshold:.2%}\n"
-            f"Trade Size: ${self.settings.single_trade_size:.2f}"
+            f"🚀 <font color=\"info\"><b>Arbitrage Bot Started</b></font>\n\n"
+            f"> Mode: {'DRY RUN' if self.dry_run else 'LIVE'}\n"
+            f"> Balance: ${initial_balance:.2f}\n"
+            f"> Threshold: {self.settings.profit_threshold:.2%}\n"
+            f"> Trade Size: ${self.settings.single_trade_size:.2f}"
         )
 
         try:
@@ -122,7 +122,9 @@ class ArbitrageBot:
             logger.info("Bot cancelled")
         except Exception as e:
             logger.error("Bot error", error=str(e))
+            # Handled by main loop too, but good to have here
             await self.notifier.send_alert("Bot Error", str(e))
+            raise # Re-raise to let main() handle the crash notification
         finally:
             await self.stop()
 
@@ -143,10 +145,10 @@ class ArbitrageBot:
         # Final stats
         stats = self.risk_manager.get_stats_summary()
         await self.notifier.send(
-            f"🛑 <b>Arbitrage Bot Stopped</b>\n\n"
-            f"Total Trades: {stats['total_trades']}\n"
-            f"Success Rate: {stats['success_rate']}\n"
-            f"Net Profit: {stats['net_profit']}"
+            f"🛑 <font color=\"warning\"><b>Arbitrage Bot Stopped</b></font>\n\n"
+            f"> Total Trades: {stats['total_trades']}\n"
+            f"> Success Rate: {stats['success_rate']}\n"
+            f"> Net Profit: {stats['net_profit']}"
         )
 
     async def _scan_markets(self) -> list:
@@ -434,42 +436,26 @@ class ArbitrageBot:
                     continue
 
                 # 2. Update Monitor
-                # We need to act carefully here to not disrupt current monitoring
-                # For now, simplest approach is to restart the monitor with new list if we can
-                # But monitors are running loops. 
-                # Better approach: The monitor should support `update_markets`
-                
-                # Check if we have a way to update. core.monitor.NegativeRiskMarketMonitor doesn't have update method yet.
-                # Let's inspect monitor.py again. 
-                # If not, we might need to rely on restarting the bot, OR implemented update method.
-                # Given complexity, for Phase 6, let's just Log what we found vs what we have.
-                # If we found NEW events, we might want to alert user.
-                
-                current_ids = {e.event_id for e in self._neg_risk_events}
-                found_ids = {e.event_id for e in tradeable_events}
-                new_ids = found_ids - current_ids
-                
-                if new_ids:
-                    logger.info(f"Refresher: Found {len(new_ids)} NEW events! Restarting monitors...")
-                    # Update local list
-                    self._neg_risk_events = tradeable_events
-                    
-                    # Restart NegRisk Monitor
-                    # This requires the monitor to handle stop/start or update.
-                    # Let's assume we can stop and start a new task.
-                    if self.neg_risk_monitor:
-                       await self.neg_risk_monitor.stop()
-                    
-                    # Re-launch monitor logic (simplified inline here or call helper)
-                    # We can't easily re-call _run_neg_risk_monitor as it's an infinite loop in gather.
-                    # Actually _run_neg_risk_monitor just calls self.neg_risk_monitor.start() which IS the loop.
-                    # So if we stop it, the await in gather returns? No.
-                    
-                    # Correction: self.neg_risk_monitor.start() waits forever? 
-                    # Let's check monitor.py.
-                    pass 
+                # Dynamically update the monitor with any newly found events
+                if hasattr(self.monitor, 'update_events'):
+                    await self.monitor.update_events(tradeable_events)
                 else:
-                    logger.info("Refresher: No new events found.")
+                    logger.warning("Monitor does not support dynamic updates")
+
+                # Update local cache of events
+                current_ids = {e.event_id for e in self._neg_risk_events}
+                new_count = 0
+                for event in tradeable_events:
+                    if event.event_id not in current_ids:
+                        self._neg_risk_events.append(event)
+                        current_ids.add(event.event_id)
+                        new_count += 1
+                
+                if new_count > 0:
+                     logger.info("Bot state updated with new events", count=new_count)
+                
+                if new_count == 0:
+                     logger.debug("Refresher: No new events found")
 
             except asyncio.CancelledError:
                 break
@@ -551,10 +537,19 @@ async def main() -> None:
         
         await bot.start()
     except (KeyboardInterrupt, SystemExit):
-        logger.info("Keyboard interrupt received, shutting down...")
+        logger.info("Keyboard interrupt received, stopping...")
+        await bot.notifier.send_alert("Bot Stopped", "Keyboard Interrupt")
+    except Exception as e:
+        logger.critical("Bot crashed with unhandled exception", error=str(e), exc_info=True)
+        # Attempt to notify about crash
+        try:
+             await bot.notifier.send_alert("⚠️ Bot Crashed", f"Unhandled Exception:\n{str(e)}")
+        except Exception as notify_err:
+             logger.error("Failed to send crash notification", error=str(notify_err))
+        raise
     finally:
         await bot.stop()
-        logger.info("Bot exited gracefully")
+        logger.info("Bot exited")
 
 
 if __name__ == "__main__":

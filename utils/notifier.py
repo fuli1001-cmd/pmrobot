@@ -155,8 +155,8 @@ class WeChatNotifier:
 
     async def send_alert(self, title: str, details: str) -> bool:
         """Send a formatted alert message."""
-        # Add warning emoji and format
-        message = f"🚨 **{title}**\n\n{details}"
+        # Add warning emoji and format with color
+        message = f"🚨 <font color=\"warning\">**{title}**</font>\n\n{details}"
         return await self.send(message)
 
     async def send_trade_notification(
@@ -170,8 +170,9 @@ class WeChatNotifier:
         """Send a trade execution notification."""
         emoji = "✅" if success else "❌"
         status = "SUCCESS" if success else "FAILED"
+        color = "info" if success else "warning"
         message = (
-            f"{emoji} **Trade {status}**\n\n"
+            f"{emoji} <font color=\"{color}\">**Trade {status}**</font>\n\n"
             f"> 📊 Market: {market[:50]}...\n"
             f"> 💰 Profit: {profit_pct:.2%}\n"
             f"> 💵 Size: ${trade_size:.2f} USDC"
