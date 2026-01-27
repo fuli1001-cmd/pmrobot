@@ -57,6 +57,14 @@ class Settings(BaseSettings):
     # Telegram Notifications
     telegram_bot_token: Optional[str] = Field(None, description="Telegram bot token")
     telegram_chat_id: Optional[str] = Field(None, description="Telegram chat ID")
+    
+    # WeChat Notifications
+    wechat_webhook_url: Optional[str] = Field(None, description="Enterprise WeChat Webhook URL")
+
+    # Market Refresh
+    market_refresh_interval: int = Field(
+        1800, ge=0, le=86400, description="Market refresh interval in seconds (0 to disable)"
+    )
 
     # Environment
     env: str = Field("production", description="Environment: production or testnet")
@@ -86,8 +94,8 @@ class Settings(BaseSettings):
 
     @property
     def notifications_enabled(self) -> bool:
-        """Check if Telegram notifications are configured."""
-        return bool(self.telegram_bot_token and self.telegram_chat_id)
+        """Check if any notifications are configured."""
+        return bool((self.telegram_bot_token and self.telegram_chat_id) or self.wechat_webhook_url)
 
 
 @lru_cache()

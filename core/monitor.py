@@ -1059,7 +1059,10 @@ class NegativeRiskMarketMonitor:
         except json.JSONDecodeError as e:
             # Only log non-empty parsing errors at debug level
             if message and not message.isspace():
-                logger.warning("NegRisk: Non-JSON message received", msg_preview=message[:100])
+                if "INVALID OPERATION" in message or "404" in message:
+                    logger.debug("NegRisk: Ignored invalid op (likely 404/No Orderbook)", msg_preview=message[:100])
+                else:
+                    logger.warning("NegRisk: Non-JSON message received", msg_preview=message[:100])
         except Exception as e:
             logger.error("Error handling NegRisk message", error=str(e), traceback=True)
 

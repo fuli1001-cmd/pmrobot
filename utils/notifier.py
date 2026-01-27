@@ -107,6 +107,79 @@ class TelegramNotifier:
         return await self.send(message)
 
 
+
+class WeChatNotifier:
+    """
+    Send notifications via Enterprise WeChat Webhook.
+    """
+
+    def __init__(self, webhook_url: str):
+        self.webhook_url = webhook_url
+
+    async def send(
+        self,
+        message: str,
+        parse_mode: str = "markdown",  # Default to markdown
+        disable_notification: bool = False,
+    ) -> bool:
+        """
+        Send a message via WeChat Webhook.
+        """
+        # Convert HTML tags to simpler markdown if necessary, or just send text.
+        # WeChat markdown supports subset: bold **text**, links [text](url), etc.
+        # Simple cleanup for common HTML tags used in this bot
+        text = message.replace("<b>", "**").replace("</b>", "**")
+        
+        payload = {
+            "msgtype": "markdown",
+            "markdown": {
+                "content": text
+            }
+        }
+
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.post(self.webhook_url, json=payload, timeout=10.0)
+                response.raise_for_status()
+                # WeChat API returns JSON with errcode
+                res_json = response.json()
+                if res_json.get("errcode") == 0:
+                    logger.debug("WeChat message sent")
+                    return True
+                else:
+                    logger.error("WeChat API error", response=res_json)
+                    return False
+        except Exception as e:
+            logger.error("Failed to send WeChat message", error=str(e))
+            return False
+
+    async def send_alert(self, title: str, details: str) -> bool:
+        """Send a formatted alert message."""
+        # Add warning emoji and format
+        message = f"🚨 **{title}**\n\n{details}"
+        return await self.send(message)
+
+    async def send_trade_notification(
+        self,
+        market: str,
+        profit_pct: float,
+        trade_size: float,
+        success: bool,
+        extra_info: str = "",
+    ) -> bool:
+        """Send a trade execution notification."""
+        emoji = "✅" if success else "❌"
+        status = "SUCCESS" if success else "FAILED"
+        message = (
+            f"{emoji} **Trade {status}**\n\n"
+            f"> 📊 Market: {market[:50]}...\n"
+            f"> 💰 Profit: {profit_pct:.2%}\n"
+            f"> 💵 Size: ${trade_size:.2f} USDC"
+            f"{extra_info}"
+        )
+        return await self.send(message)
+
+
 class DummyNotifier:
     """
     Dummy notifier that does nothing (for when Telegram is not configured).
@@ -129,18 +202,20 @@ class DummyNotifier:
 
 
 def create_notifier(
-    bot_token: Optional[str], chat_id: Optional[str]
-) -> TelegramNotifier | DummyNotifier:
+    bot_token: Optional[str], 
+    chat_id: Optional[str],
+    wechat_webhook_url: Optional[str] = None,
+) -> TelegramNotifier | WeChatNotifier | DummyNotifier:
     """
     Create a notifier instance.
-
-    Args:
-        bot_token: Telegram bot token (optional)
-        chat_id: Telegram chat ID (optional)
-
-    Returns:
-        TelegramNotifier if credentials provided, otherwise DummyNotifier
+    Prioritizes WeChat if provided, then Telegram.
     """
+    if wechat_webhook_url:
+        logger.info("Using WeChat Notifier")
+        return WeChatNotifier(webhook_url=wechat_webhook_url)
+        
     if bot_token and chat_id:
+        logger.info("Using Telegram Notifier")
         return TelegramNotifier(bot_token, chat_id)
+        
     return DummyNotifier()
