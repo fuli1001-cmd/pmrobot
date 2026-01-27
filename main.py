@@ -130,6 +130,9 @@ class ArbitrageBot:
 
     async def stop(self) -> None:
         """Stop the arbitrage bot."""
+        if not self._running:
+            return
+            
         logger.info("Stopping arbitrage bot...")
         self._running = False
 
