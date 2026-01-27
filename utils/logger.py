@@ -70,7 +70,17 @@ def setup_logging(
 
     # Add file handler if specified
     if log_file:
-        file_handler = logging.FileHandler(log_file, encoding="utf-8")
+        from logging.handlers import TimedRotatingFileHandler
+        
+        # Daily rotation, keep 7 days
+        file_handler = TimedRotatingFileHandler(
+            log_file,
+            when="midnight",
+            interval=1,
+            backupCount=7,
+            encoding="utf-8"
+        )
+        file_handler.suffix = "%Y-%m-%d"  # Suffix format: log.txt.2023-01-01
         file_handler.setFormatter(file_formatter)
         root_logger.addHandler(file_handler)
 
