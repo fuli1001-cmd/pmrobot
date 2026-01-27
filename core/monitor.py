@@ -978,6 +978,31 @@ class NegativeRiskMarketMonitor:
         async for message in ws:
             await self._handle_message(message)
 
+    async def update_events(self, new_events: List[NegativeRiskEvent]) -> None:
+        """
+        Dynamically update the monitored events list.
+        Adds new events to the monitoring set and subscribes to them.
+        """
+        new_tokens_to_sub = []
+        count = 0
+        
+        for event in new_events:
+            if event.event_id not in self.events:
+                self.events[event.event_id] = event
+                # Add tokens
+                for token_id in event.get_all_token_ids():
+                    self.token_to_event[token_id] = event
+                    new_tokens_to_sub.append(token_id)
+                count += 1
+        
+        if new_tokens_to_sub:
+            logger.info("Monitor found new events", new_events=count, new_tokens=len(new_tokens_to_sub))
+            # If connected, subscribe immediately
+            if self._ws and not self._ws.closed:
+                await self._subscribe(new_tokens_to_sub)
+        else:
+            logger.debug("Monitor update called but no new events found")
+
     async def _subscribe(self, token_ids: List[str]) -> None:
         """Subscribe to order books for given tokens in batches."""
         # Polymarket WebSocket has limits on subscription message size
