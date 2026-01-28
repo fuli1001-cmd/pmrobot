@@ -206,7 +206,21 @@ class ArbitrageBot:
         def on_opportunity(opp: ArbitrageOpportunity):
             """Callback when opportunity is detected."""
             if self.risk_manager.can_trade_market(opp.market.condition_id):
+                logger.info(
+                    "Binary opportunity detected - queuing for execution",
+                    market=opp.market.slug[:50],
+                    net_profit_pct=f"{opp.net_profit_pct:.2%}",
+                    profit_usdc=f"${opp.net_profit_usdc:.2f}",
+                    trade_size=f"${opp.trade_size_usdc:.2f}",
+                )
                 asyncio.create_task(self._opportunity_queue.put(opp))
+            else:
+                logger.warning(
+                    "Binary opportunity detected but rejected by risk manager",
+                    market=opp.market.slug[:50],
+                    net_profit_pct=f"{opp.net_profit_pct:.2%}",
+                    reason="cooldown or circuit breaker",
+                )
 
         self.monitor = MarketMonitor(
             markets=markets,
@@ -228,7 +242,23 @@ class ArbitrageBot:
             """Callback when Negative Risk opportunity is detected."""
             # Note: event_id is not directly usable for risk management,
             # but we can use the event's slug or check all outcomes
-            asyncio.create_task(self._neg_risk_opportunity_queue.put(opp))
+            if self.risk_manager.can_trade():
+                logger.info(
+                    "NegRisk opportunity detected - queuing for execution",
+                    event=opp.event.title[:50],
+                    strategy=opp.strategy.value,
+                    net_profit_pct=f"{opp.net_profit_pct:.2%}",
+                    profit_usdc=f"${opp.net_profit_usdc:.2f}",
+                    outcomes=opp.event.outcome_count,
+                )
+                asyncio.create_task(self._neg_risk_opportunity_queue.put(opp))
+            else:
+                logger.warning(
+                    "NegRisk opportunity detected but rejected by risk manager",
+                    event=opp.event.title[:50],
+                    net_profit_pct=f"{opp.net_profit_pct:.2%}",
+                    reason="circuit breaker triggered",
+                )
 
         self.neg_risk_monitor = NegativeRiskMarketMonitor(
             events=events,
@@ -254,9 +284,18 @@ class ArbitrageBot:
                     continue
 
                 if not self.risk_manager.can_trade():
+                    logger.debug("NegRisk execution paused - risk manager check failed")
                     continue
 
                 # Execute Negative Risk arbitrage
+                logger.info(
+                    "Executing NegRisk arbitrage",
+                    event=opportunity.event.title[:50],
+                    strategy=opportunity.strategy.value,
+                    net_profit=f"{opportunity.net_profit_pct:.2%}",
+                    trade_size=f"${opportunity.trade_size_usdc:.2f}",
+                    outcomes=opportunity.event.outcome_count,
+                )
                 result = await self.executor.execute_neg_risk_arbitrage(opportunity)
                 
                 # Record results
@@ -330,9 +369,16 @@ class ArbitrageBot:
                     continue
 
                 if not self.risk_manager.can_trade():
+                    logger.debug("Execution paused - risk manager check failed")
                     continue
 
                 # Execute arbitrage
+                logger.info(
+                    "Executing Binary arbitrage",
+                    market=opportunity.market.slug[:50],
+                    net_profit=f"{opportunity.net_profit_pct:.2%}",
+                    trade_size=f"${opportunity.trade_size_usdc:.2f}",
+                )
                 result = await self.executor.execute_arbitrage(opportunity)
 
                 # Record results

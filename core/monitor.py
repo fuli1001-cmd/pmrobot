@@ -363,23 +363,40 @@ class NegativeRiskArbitrageDetector:
         effective_threshold = get_profit_threshold(event.outcome_count)
 
         # Quick sum calculation for debug logging (before full detection)
+        sum_yes = 0.0
+        sum_no = 0.0
+        missing_books = 0
+        
+        for outcome in event.outcomes:
+            book_yes = order_books.get(outcome.token_id_yes)
+            book_no = order_books.get(outcome.token_id_no)
+            if book_yes and book_yes.best_ask:
+                sum_yes += book_yes.best_ask
+            else:
+                missing_books += 1
+            if book_no and book_no.best_ask:
+                sum_no += book_no.best_ask
+            else:
+                missing_books += 1
+        
+        # CRITICAL FIX: Skip events with too much missing data
+        # If more than 30% of tokens have no liquidity, this is not a real opportunity
+        total_tokens = event.outcome_count * 2  # Yes + No for each outcome
+        missing_ratio = missing_books / total_tokens
+        
+        if missing_ratio > 0.3:
+            if self._check_count % 500 == 1:
+                logger.debug(
+                    "Skipping event due to insufficient liquidity",
+                    event_title=event.title[:40],
+                    missing_ratio=f"{missing_ratio:.1%}",
+                    missing_books=missing_books,
+                    total_tokens=total_tokens,
+                )
+            return None  # Not enough liquidity for real arbitrage
+        
+        # Log sample for visibility (only for events with sufficient data)
         if self._check_count % 500 == 1:
-            sum_yes = 0.0
-            sum_no = 0.0
-            missing_books = 0
-            for outcome in event.outcomes:
-                book_yes = order_books.get(outcome.token_id_yes)
-                book_no = order_books.get(outcome.token_id_no)
-                if book_yes and book_yes.best_ask:
-                    sum_yes += book_yes.best_ask
-                else:
-                    missing_books += 1
-                if book_no and book_no.best_ask:
-                    sum_no += book_no.best_ask
-                else:
-                    missing_books += 1
-            
-            # Always log for visibility (even with missing data)
             n = event.outcome_count
             profit_yes = 1.0 - sum_yes  # Profit if buy all Yes
             profit_no = (n - 1) - sum_no  # Profit if buy all No
