@@ -818,6 +818,10 @@ class MarketMonitor:
         self._message_count += 1
         
         try:
+            # Skip empty messages (e.g. during reconnection)
+            if not message or message.isspace():
+                return
+
             data = json.loads(message)
             
             # Log first few messages for debugging
@@ -848,7 +852,9 @@ class MarketMonitor:
                 self._last_log_time = now
 
         except json.JSONDecodeError as e:
-            logger.error("Failed to parse WebSocket message", error=str(e))
+            # Transient parse errors are normal during reconnections
+            if message and not message.isspace():
+                logger.debug("Failed to parse WebSocket message", error=str(e), msg_preview=message[:100])
         except Exception as e:
             logger.debug("Error handling message", error=str(e))
 
