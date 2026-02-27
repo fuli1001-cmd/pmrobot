@@ -1198,7 +1198,7 @@ class NegativeRiskMarketMonitor:
         event = self.token_to_event.get(token_id)
         if not event:
             if self._book_update_count <= 5:
-                logger.info("NegRisk: Token not mapped to event", token_id=token_id)
+                logger.debug("NegRisk: Token not mapped to event", token_id=token_id)
             return
 
         # Rate limit: avoid checking same event too frequently
@@ -1206,11 +1206,12 @@ class NegativeRiskMarketMonitor:
         last_check = self._last_check_time.get(event.event_id, 0)
         
         # Debug log for first few updates to check flow
-        if self._book_update_count <= 5:
-            logger.info(
+        self._handle_update_count = getattr(self, '_handle_update_count', 0) + 1
+        if self._handle_update_count <= 5:
+            logger.debug(
                 "NegRisk: Handling update", 
                 token=token_id, 
-                event_id=event.event_id,  # Fixed: avoid conflict with logger 'event' arg
+                event_id=event.event_id,
                 time_diff=now-last_check
             )
 
