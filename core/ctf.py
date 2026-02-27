@@ -3,8 +3,12 @@
 This module handles Mint and Redeem operations for Polymarket binary markets.
 Mint: Split USDC into Yes+No tokens
 Redeem: Merge Yes+No tokens back into USDC
+
+All blocking Web3 calls are wrapped with ``asyncio.to_thread`` so the
+asyncio event loop is never stalled.
 """
 
+import asyncio
 import time
 from dataclasses import dataclass
 from typing import Optional
@@ -168,6 +172,9 @@ class CTFContract:
         This is the core operation for short arbitrage:
         1. Approve USDC spending (if needed)
         2. Call splitPosition to get Yes+No tokens
+
+        All Web3 calls execute inside ``asyncio.to_thread`` to avoid
+        blocking the event loop.
         
         Args:
             condition_id: Market condition ID (bytes32 hex string)
@@ -196,59 +203,65 @@ class CTFContract:
             )
         
         try:
-            # Step 1: Check and approve USDC spending
-            allowance = self.usdc_contract.functions.allowance(
-                self.address,
-                CTF_CONTRACT_ADDRESS,
-            ).call()
-            
-            if allowance < amount_wei:
-                logger.info("Approving USDC for CTF contract...")
-                approve_tx = self.usdc_contract.functions.approve(
+            def _do_mint():
+                """Synchronous Web3 mint logic (runs in thread)."""
+                # Step 1: Check and approve USDC spending
+                allowance = self.usdc_contract.functions.allowance(
+                    self.address,
                     CTF_CONTRACT_ADDRESS,
-                    amount_wei * 10,  # Approve 10x to reduce future approvals
+                ).call()
+                
+                if allowance < amount_wei:
+                    logger.info("Approving USDC for CTF contract...")
+                    approve_tx = self.usdc_contract.functions.approve(
+                        CTF_CONTRACT_ADDRESS,
+                        amount_wei * 10,  # Approve 10x to reduce future approvals
+                    ).build_transaction({
+                        'from': self.address,
+                        'nonce': self.w3.eth.get_transaction_count(self.address),
+                        'gas': 100000,
+                        'gasPrice': self.w3.eth.gas_price,
+                        'chainId': self.chain_id,
+                    })
+                    
+                    signed_approve = self.account.sign_transaction(approve_tx)
+                    approve_hash = self.w3.eth.send_raw_transaction(signed_approve.rawTransaction)
+                    self.w3.eth.wait_for_transaction_receipt(approve_hash)
+                    logger.info("USDC approved", tx_hash=approve_hash.hex())
+                
+                # Step 2: Call splitPosition (Mint)
+                partition = [1, 2]
+                parent_collection_id = bytes(32)
+                cid_hex = condition_id[2:] if condition_id.startswith("0x") else condition_id
+                
+                mint_tx = self.ctf_contract.functions.splitPosition(
+                    USDC_CONTRACT_ADDRESS,
+                    parent_collection_id,
+                    bytes.fromhex(cid_hex),
+                    partition,
+                    amount_wei,
                 ).build_transaction({
                     'from': self.address,
                     'nonce': self.w3.eth.get_transaction_count(self.address),
-                    'gas': 100000,
+                    'gas': 250000,
                     'gasPrice': self.w3.eth.gas_price,
                     'chainId': self.chain_id,
                 })
                 
-                signed_approve = self.account.sign_transaction(approve_tx)
-                approve_hash = self.w3.eth.send_raw_transaction(signed_approve.rawTransaction)
-                self.w3.eth.wait_for_transaction_receipt(approve_hash)
-                logger.info("USDC approved", tx_hash=approve_hash.hex())
-            
-            # Step 2: Call splitPosition (Mint)
-            # Binary market partition: [1, 2] represents [No, Yes] outcomes
-            partition = [1, 2]
-            parent_collection_id = bytes(32)  # Zero bytes for root collection
-            
-            mint_tx = self.ctf_contract.functions.splitPosition(
-                USDC_CONTRACT_ADDRESS,
-                parent_collection_id,
-                bytes.fromhex(condition_id[2:] if condition_id.startswith("0x") else condition_id),
-                partition,
-                amount_wei,
-            ).build_transaction({
-                'from': self.address,
-                'nonce': self.w3.eth.get_transaction_count(self.address),
-                'gas': 250000,  # Mint typically uses ~150k gas
-                'gasPrice': self.w3.eth.gas_price,
-                'chainId': self.chain_id,
-            })
-            
-            signed_mint = self.account.sign_transaction(mint_tx)
-            mint_hash = self.w3.eth.send_raw_transaction(signed_mint.rawTransaction)
-            receipt = self.w3.eth.wait_for_transaction_receipt(mint_hash)
+                signed_mint = self.account.sign_transaction(mint_tx)
+                mint_hash = self.w3.eth.send_raw_transaction(signed_mint.rawTransaction)
+                receipt = self.w3.eth.wait_for_transaction_receipt(mint_hash)
+                return mint_hash, receipt
+
+            mint_hash, receipt = await asyncio.to_thread(_do_mint)
             
             execution_time = (time.time() - start_time) * 1000
             gas_used = receipt['gasUsed']
-            gas_price = self.w3.eth.gas_price
+
+            # Estimate gas cost in USD (blocking call in thread)
+            gas_price = await asyncio.to_thread(lambda: self.w3.eth.gas_price)
             gas_cost_matic = gas_used * gas_price / 1e18
-            # Rough MATIC to USD conversion (assume $0.80/MATIC)
-            gas_cost_usd = gas_cost_matic * 0.80
+            gas_cost_usd = gas_cost_matic * 0.80  # rough POL→USD
             
             logger.info(
                 "Mint successful",
@@ -287,8 +300,9 @@ class CTFContract:
     ) -> MintReport:
         """
         Merge Yes+No tokens back into USDC.
-        
-        This is the inverse of Mint - used for redeeming positions.
+
+        This is the inverse of Mint – calls ``mergePositions`` on the CTF
+        contract.  All Web3 calls run in a thread.
         
         Args:
             condition_id: Market condition ID
@@ -297,15 +311,82 @@ class CTFContract:
         Returns:
             MintReport with operation result
         """
-        # Similar implementation to mint but calls mergePositions
-        # For now, just log as not immediately needed for short arbitrage
-        logger.info(
-            "DRY RUN: Would merge tokens",
-            condition_id=condition_id[:16] + "...",
-            amount_tokens=amount_tokens,
-        )
-        return MintReport(
-            result=MintResult.SUCCESS,
-            condition_id=condition_id,
-            amount_usdc=amount_tokens,
-        )
+        start_time = time.time()
+        amount_wei = int(amount_tokens * 1_000_000)
+
+        if self.dry_run:
+            logger.info(
+                "DRY RUN: Would merge tokens",
+                condition_id=condition_id[:16] + "...",
+                amount_tokens=amount_tokens,
+            )
+            return MintReport(
+                result=MintResult.SUCCESS,
+                condition_id=condition_id,
+                amount_usdc=amount_tokens,
+            )
+
+        try:
+            def _do_merge():
+                partition = [1, 2]
+                parent_collection_id = bytes(32)
+                cid_hex = condition_id[2:] if condition_id.startswith("0x") else condition_id
+
+                merge_tx = self.ctf_contract.functions.mergePositions(
+                    USDC_CONTRACT_ADDRESS,
+                    parent_collection_id,
+                    bytes.fromhex(cid_hex),
+                    partition,
+                    amount_wei,
+                ).build_transaction({
+                    'from': self.address,
+                    'nonce': self.w3.eth.get_transaction_count(self.address),
+                    'gas': 200000,
+                    'gasPrice': self.w3.eth.gas_price,
+                    'chainId': self.chain_id,
+                })
+
+                signed = self.account.sign_transaction(merge_tx)
+                tx_hash = self.w3.eth.send_raw_transaction(signed.rawTransaction)
+                receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+                return tx_hash, receipt
+
+            tx_hash, receipt = await asyncio.to_thread(_do_merge)
+            execution_time = (time.time() - start_time) * 1000
+
+            if receipt['status'] == 1:
+                logger.info(
+                    "Merge successful",
+                    condition_id=condition_id[:16] + "...",
+                    amount=amount_tokens,
+                    gas_used=receipt['gasUsed'],
+                    tx_hash=tx_hash.hex(),
+                )
+                return MintReport(
+                    result=MintResult.SUCCESS,
+                    condition_id=condition_id,
+                    amount_usdc=amount_tokens,
+                    gas_used=receipt['gasUsed'],
+                    tx_hash=tx_hash.hex(),
+                    execution_time_ms=execution_time,
+                )
+            else:
+                logger.error("Merge transaction reverted", tx_hash=tx_hash.hex())
+                return MintReport(
+                    result=MintResult.FAILED,
+                    condition_id=condition_id,
+                    amount_usdc=amount_tokens,
+                    error_message="Transaction reverted",
+                    execution_time_ms=execution_time,
+                )
+
+        except Exception as e:
+            execution_time = (time.time() - start_time) * 1000
+            logger.error("Merge failed", error=str(e))
+            return MintReport(
+                result=MintResult.FAILED,
+                condition_id=condition_id,
+                amount_usdc=amount_tokens,
+                error_message=str(e),
+                execution_time_ms=execution_time,
+            )

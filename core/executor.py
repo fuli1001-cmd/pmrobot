@@ -8,12 +8,12 @@ from typing import List, Optional, Tuple
 
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import OrderArgs, OrderType as ClobOrderType
-from py_clob_client.order_builder.constants import BUY
+from py_clob_client.order_builder.constants import BUY, SELL
 
 from config.settings import get_settings
 from config.constants import CLOB_API_BASE_URL, POLYGON_CHAIN_ID, SIGNATURE_TYPE_POLY_GNOSIS_SAFE
 from models.market import NegativeRiskArbitrageOpportunity, NegativeRiskStrategy
-from models.order import ArbitrageOpportunity, Order, OrderSide, OrderStatus, OrderType
+from models.order import ArbitrageOpportunity, ShortArbitrageOpportunity, Order, OrderSide, OrderStatus, OrderType
 from models.position import AccountState
 from utils.logger import get_logger
 from utils.rate_limiter import RateLimiter
@@ -479,11 +479,12 @@ class OrderExecutor:
 
         try:
             # Build order arguments
+            clob_side = SELL if order.side == OrderSide.SELL else BUY
             order_args = OrderArgs(
                 token_id=order.token_id,
                 price=order.price,
                 size=order.size,
-                side=BUY,
+                side=clob_side,
             )
 
             # Create and sign order
@@ -607,6 +608,200 @@ class OrderExecutor:
     def account_state(self) -> AccountState:
         """Get current account state."""
         return self._account_state
+
+    # ------------------------------------------------------------------
+    # Short Arbitrage: Mint → Sell-Yes + Sell-No
+    # ------------------------------------------------------------------
+
+    async def execute_short_arbitrage(
+        self,
+        opportunity: ShortArbitrageOpportunity,
+        ctf_contract,
+    ) -> ExecutionReport:
+        """
+        Execute a short arbitrage: Mint Yes+No tokens, then sell both.
+
+        Flow:
+          1. Mint ``trade_size_usdc`` worth of Yes+No via CTF splitPosition.
+          2. Sell Yes tokens at ``bid_price_yes``.
+          3. Sell No tokens at ``bid_price_no``.
+
+        Both SELL orders use FOK so they either fill completely or not at all.
+        If only one sell fills, trigger emergency exit for the other side.
+
+        Args:
+            opportunity: Short arbitrage opportunity from the detector.
+            ctf_contract: ``CTFContract`` (or compatible) with an async
+                ``mint(condition_id, amount_usdc)`` method.
+
+        Returns:
+            ExecutionReport summarising the result.
+        """
+        start_time = time.time()
+        market = opportunity.market
+        trade_size = opportunity.trade_size_usdc
+
+        # How many tokens we get per $1 mint → 1 Yes + 1 No per $1
+        # Token quantity = trade_size (USDC) → we get ``trade_size`` Yes + ``trade_size`` No
+        num_tokens = trade_size  # 1:1 mint ratio
+
+        if self.dry_run:
+            logger.info(
+                "DRY RUN: Would execute short arbitrage (Mint+Sell)",
+                market=market.slug,
+                trade_size=f"${trade_size:.2f}",
+                profit=f"{opportunity.net_profit_pct:.4f}",
+            )
+            # Build placeholder orders for the report
+            order_yes = Order(
+                token_id=market.token_id_yes,
+                side=OrderSide.SELL,
+                price=opportunity.bid_price_yes,
+                size=num_tokens,
+                order_type=OrderType.FOK,
+            )
+            order_no = Order(
+                token_id=market.token_id_no,
+                side=OrderSide.SELL,
+                price=opportunity.bid_price_no,
+                size=num_tokens,
+                order_type=OrderType.FOK,
+            )
+            return ExecutionReport(
+                result=ExecutionResult.SKIPPED,
+                opportunity=opportunity,
+                order_yes=order_yes,
+                order_no=order_no,
+                execution_time_ms=0,
+            )
+
+        try:
+            # ── Step 1: Mint tokens ──────────────────────────────────
+            condition_id = market.condition_id
+            logger.info(
+                "Short arb – minting tokens",
+                market=market.slug[:50],
+                amount=f"${trade_size:.2f}",
+            )
+            mint_report = await ctf_contract.mint(condition_id, trade_size)
+
+            from core.ctf import MintResult  # local import to avoid circular
+
+            if mint_report.result != MintResult.SUCCESS:
+                logger.error(
+                    "Short arb – mint failed",
+                    error=mint_report.error_message,
+                    market=market.slug[:50],
+                )
+                return ExecutionReport(
+                    result=ExecutionResult.FAILED,
+                    opportunity=opportunity,
+                    error_message=f"Mint failed: {mint_report.error_message}",
+                    execution_time_ms=(time.time() - start_time) * 1000,
+                )
+
+            logger.info(
+                "Short arb – mint succeeded, selling tokens",
+                gas_cost=f"${mint_report.gas_cost_usd:.4f}",
+                tx_hash=mint_report.tx_hash or "N/A",
+            )
+
+            # ── Step 2: Sell Yes + No concurrently ───────────────────
+            order_yes = Order(
+                token_id=market.token_id_yes,
+                side=OrderSide.SELL,
+                price=opportunity.bid_price_yes,
+                size=num_tokens,
+                order_type=OrderType.FOK,
+            )
+            order_no = Order(
+                token_id=market.token_id_no,
+                side=OrderSide.SELL,
+                price=opportunity.bid_price_no,
+                size=num_tokens,
+                order_type=OrderType.FOK,
+            )
+
+            results = await asyncio.gather(
+                self._submit_order(order_yes),
+                self._submit_order(order_no),
+                return_exceptions=True,
+            )
+
+            order_yes_res, order_no_res = results[0], results[1]
+            execution_time = (time.time() - start_time) * 1000
+
+            if isinstance(order_yes_res, Exception) or isinstance(order_no_res, Exception):
+                error_msg = str(
+                    order_yes_res if isinstance(order_yes_res, Exception) else order_no_res
+                )
+                return ExecutionReport(
+                    result=ExecutionResult.FAILED,
+                    opportunity=opportunity,
+                    error_message=error_msg,
+                    execution_time_ms=execution_time,
+                )
+
+            yes_ok = order_yes_res.is_filled
+            no_ok = order_no_res.is_filled
+
+            if yes_ok and no_ok:
+                final_balance = await self.get_account_balance()
+                logger.info(
+                    "Short arb – both sells filled!",
+                    profit_est=f"${opportunity.net_profit_usdc:.2f}",
+                    exec_ms=f"{execution_time:.0f}",
+                )
+                return ExecutionReport(
+                    result=ExecutionResult.SUCCESS,
+                    opportunity=opportunity,
+                    order_yes=order_yes_res,
+                    order_no=order_no_res,
+                    execution_time_ms=execution_time,
+                    final_balance=final_balance,
+                )
+
+            if yes_ok or no_ok:
+                logger.warning(
+                    "Short arb – partial sell, emergency exit needed",
+                    yes_filled=yes_ok,
+                    no_filled=no_ok,
+                )
+                await self._emergency_exit(
+                    opportunity,
+                    order_yes_res if yes_ok else None,
+                    order_no_res if no_ok else None,
+                )
+                return ExecutionReport(
+                    result=ExecutionResult.PARTIAL,
+                    opportunity=opportunity,
+                    order_yes=order_yes_res,
+                    order_no=order_no_res,
+                    execution_time_ms=execution_time,
+                )
+
+            # Both sells rejected – we're stuck holding minted tokens
+            logger.error(
+                "Short arb – both sells failed (holding tokens)",
+                market=market.slug[:50],
+            )
+            return ExecutionReport(
+                result=ExecutionResult.FAILED,
+                opportunity=opportunity,
+                order_yes=order_yes_res,
+                order_no=order_no_res,
+                execution_time_ms=execution_time,
+            )
+
+        except Exception as e:
+            execution_time = (time.time() - start_time) * 1000
+            logger.error("Short arb execution failed", error=str(e))
+            return ExecutionReport(
+                result=ExecutionResult.FAILED,
+                opportunity=opportunity,
+                error_message=str(e),
+                execution_time_ms=execution_time,
+            )
 
 
 def create_executor(dry_run: bool = False) -> OrderExecutor:

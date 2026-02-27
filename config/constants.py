@@ -38,6 +38,10 @@ SIGNATURE_TYPE_EOA = 0
 SIGNATURE_TYPE_POLY_PROXY = 1
 SIGNATURE_TYPE_POLY_GNOSIS_SAFE = 2
 
+# Relayer URLs
+RELAYER_URL = "https://relayer-v2.polymarket.com"
+RELAYER_URL_TESTNET = "https://relayer-v2-staging.polymarket.dev"
+
 # Tiered Profit Thresholds (adjusted for testing)
 # Binary markets: 1% threshold for stable profit per trade
 PROFIT_THRESHOLD_BINARY = 0.01  # 1% (restored from 0.5%)

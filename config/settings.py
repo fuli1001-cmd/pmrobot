@@ -29,6 +29,14 @@ class Settings(BaseSettings):
         None, description="Gnosis Safe proxy wallet address"
     )
 
+    # Builder / Relayer Credentials (for gasless merge & mint)
+    builder_api_key: Optional[str] = Field(None, description="Polymarket Builder API Key")
+    builder_secret: Optional[str] = Field(None, description="Polymarket Builder API Secret")
+    builder_passphrase: Optional[str] = Field(None, description="Polymarket Builder Passphrase")
+    relayer_tx_type: str = Field(
+        "PROXY", description="Relayer wallet type: SAFE or PROXY"
+    )
+
     # Polygon RPC
     polygon_rpc_url: str = Field(
         "https://polygon-rpc.com", description="Polygon mainnet RPC URL"

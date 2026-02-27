@@ -11,13 +11,15 @@ import sys
 from typing import Optional
 
 from config.settings import get_settings, Settings
+from config.constants import POLYGON_CHAIN_ID
 from core.scanner import MarketScanner
 from core.monitor import MarketMonitor, NegativeRiskArbitrageDetector, OrderBookManager, NegativeRiskMarketMonitor
 from core.executor import OrderExecutor, create_executor, ExecutionResult
 from core.settler import PositionSettler, create_settler
+from core.ctf import CTFContract
 from core.risk import RiskManager, RiskConfig
 from models.market import NegativeRiskEvent, NegativeRiskArbitrageOpportunity
-from models.order import ArbitrageOpportunity
+from models.order import ArbitrageOpportunity, ShortArbitrageOpportunity
 from utils.logger import setup_logging, get_logger
 from utils.notifier import create_notifier
 
@@ -48,6 +50,7 @@ class ArbitrageBot:
         self._running = False
         self._opportunity_queue: asyncio.Queue[ArbitrageOpportunity] = asyncio.Queue(maxsize=100)
         self._neg_risk_opportunity_queue: asyncio.Queue[NegativeRiskArbitrageOpportunity] = asyncio.Queue(maxsize=100)
+        self._short_opportunity_queue: asyncio.Queue[ShortArbitrageOpportunity] = asyncio.Queue(maxsize=100)
         self._neg_risk_events: list = []
 
         # Initialize components
@@ -58,6 +61,7 @@ class ArbitrageBot:
         )
         self.executor: Optional[OrderExecutor] = None
         self.settler: Optional[PositionSettler] = None
+        self.ctf_contract: Optional[CTFContract] = None
         self.monitor: Optional[MarketMonitor] = None
         self.neg_risk_monitor: Optional[NegativeRiskMarketMonitor] = None
         self.notifier = create_notifier(
@@ -80,6 +84,14 @@ class ArbitrageBot:
 
         # Initialize executor
         self.executor = create_executor(dry_run=self.dry_run)
+
+        # Initialize CTF contract for short arbitrage (Mint)
+        self.ctf_contract = CTFContract(
+            private_key=self.settings.private_key or "",
+            rpc_url=self.settings.rpc_url,
+            chain_id=POLYGON_CHAIN_ID if not self.settings.is_testnet else 80002,
+            dry_run=self.dry_run,
+        )
         
         # Fetch initial balance for logging
         initial_balance = await self.executor.get_account_balance()
@@ -113,6 +125,7 @@ class ArbitrageBot:
                 self._run_neg_risk_monitor(neg_risk_events),
                 self._run_executor(),
                 self._run_neg_risk_executor(),
+                self._run_short_executor(),
                 self._run_settler(),
                 self._run_stats_reporter(),
                 self._run_market_refresher(),
@@ -225,12 +238,33 @@ class ArbitrageBot:
                     reason="cooldown or circuit breaker",
                 )
 
+        def on_short_opportunity(opp: ShortArbitrageOpportunity):
+            """Callback when short (Mint+Sell) opportunity is detected."""
+            if self.risk_manager.can_trade_market(opp.market.condition_id):
+                logger.info(
+                    "Short opportunity detected - queuing for execution",
+                    market=opp.market.slug[:50],
+                    net_profit_pct=f"{opp.net_profit_pct:.2%}",
+                    profit_usdc=f"${opp.net_profit_usdc:.2f}",
+                    trade_size=f"${opp.trade_size_usdc:.2f}",
+                )
+                try:
+                    self._short_opportunity_queue.put_nowait(opp)
+                except asyncio.QueueFull:
+                    logger.warning("Short opportunity queue full, dropping")
+            else:
+                logger.warning(
+                    "Short opportunity rejected by risk manager",
+                    market=opp.market.slug[:50],
+                )
+
         self.monitor = MarketMonitor(
             markets=markets,
             profit_threshold=self.settings.profit_threshold,
             trade_size=self.settings.single_trade_size,
             max_slippage=self.settings.max_slippage,
             on_opportunity=on_opportunity,
+            on_short_opportunity=on_short_opportunity,
         )
 
         await self.monitor.start()
@@ -454,6 +488,93 @@ class ArbitrageBot:
 
             except Exception as e:
                 logger.error("Executor loop error", error=str(e))
+
+    async def _run_short_executor(self) -> None:
+        """
+        Run the Short Arbitrage (Mint+Sell) execution loop.
+
+        Consumes ``ShortArbitrageOpportunity`` items from
+        ``_short_opportunity_queue`` and executes them via the
+        ``OrderExecutor.execute_short_arbitrage()`` pipeline:
+
+            detect_short() → queue → mint() → SELL-Yes + SELL-No
+        """
+        while self._running:
+            try:
+                try:
+                    opportunity = await asyncio.wait_for(
+                        self._short_opportunity_queue.get(),
+                        timeout=1.0,
+                    )
+                except asyncio.TimeoutError:
+                    continue
+
+                if not self.risk_manager.can_trade():
+                    logger.debug("Short execution paused - risk manager check failed")
+                    continue
+
+                logger.info(
+                    "Executing Short Arbitrage (Mint+Sell)",
+                    market=opportunity.market.slug[:50],
+                    net_profit=f"{opportunity.net_profit_pct:.2%}",
+                    trade_size=f"${opportunity.trade_size_usdc:.2f}",
+                )
+                result = await self.executor.execute_short_arbitrage(
+                    opportunity,
+                    self.ctf_contract,
+                )
+
+                if result.is_success:
+                    await self.risk_manager.record_success(
+                        opportunity,
+                        opportunity.net_profit_usdc,
+                    )
+
+                    balance_info = ""
+                    if result.final_balance is not None:
+                        balance_info = f"\n💰 Balance: ${result.final_balance:.2f}"
+
+                    await self.notifier.send_trade_notification(
+                        market=f"[SHORT] {opportunity.market.question}",
+                        profit_pct=opportunity.net_profit_pct,
+                        trade_size=opportunity.trade_size_usdc,
+                        success=True,
+                        extra_info=balance_info,
+                    )
+                elif result.result == ExecutionResult.SKIPPED and self.dry_run:
+                    await self.risk_manager.record_success(
+                        opportunity,
+                        opportunity.net_profit_usdc,
+                        is_simulated=True,
+                    )
+                    logger.info(
+                        "DRY RUN: Simulated short arbitrage",
+                        market=opportunity.market.slug[:50],
+                        net_profit=f"{opportunity.net_profit_pct:.2%}",
+                        profit_usdc=f"${opportunity.net_profit_usdc:.2f}",
+                    )
+                else:
+                    is_partial = result.result == ExecutionResult.PARTIAL
+                    loss = opportunity.trade_size_usdc * 0.10 if is_partial else 0
+                    await self.risk_manager.record_failure(
+                        opportunity,
+                        is_partial=is_partial,
+                        loss_usdc=loss,
+                    )
+                    if is_partial:
+                        await self.notifier.send_alert(
+                            "🚨 Short Arb Partial Fill",
+                            f"Market: {opportunity.market.question}\n"
+                            f"Estimated Loss: ${loss:.2f}",
+                        )
+                        logger.error("Circuit breaker: short arb partial fill")
+                        asyncio.create_task(self.stop())
+                        return
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error("Short executor loop error", error=str(e))
 
     async def _run_settler(self) -> None:
         """Run the settlement loop."""

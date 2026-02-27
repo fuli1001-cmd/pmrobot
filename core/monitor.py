@@ -670,6 +670,7 @@ class MarketMonitor:
         trade_size: float = 100.0,
         max_slippage: float = 0.002,
         on_opportunity: Optional[Callable[[ArbitrageOpportunity], None]] = None,
+        on_short_opportunity: Optional[Callable[[ShortArbitrageOpportunity], None]] = None,
     ):
         """
         Initialize the market monitor.
@@ -679,7 +680,8 @@ class MarketMonitor:
             profit_threshold: Minimum profit threshold
             trade_size: Trade size in USDC
             max_slippage: Maximum allowed slippage
-            on_opportunity: Callback when opportunity is detected
+            on_opportunity: Callback when long arbitrage opportunity is detected
+            on_short_opportunity: Callback when short (Mint+Sell) opportunity is detected
         """
         self.markets = {m.condition_id: m for m in markets}
         self.token_to_market: Dict[str, Market] = {}
@@ -695,6 +697,7 @@ class MarketMonitor:
             max_slippage=max_slippage,
         )
         self.on_opportunity = on_opportunity
+        self.on_short_opportunity = on_short_opportunity
 
         self._ws: Optional[websockets.WebSocketClientProtocol] = None
         self._running = False
@@ -894,7 +897,7 @@ class MarketMonitor:
         if not book_yes or not book_no:
             return
 
-        # Check for arbitrage
+        # Check for long arbitrage (Buy-Yes + Buy-No < $1)
         opportunity = self.detector.detect(market, book_yes, book_no)
 
         if opportunity:
@@ -909,6 +912,20 @@ class MarketMonitor:
             
             if self.on_opportunity:
                 self.on_opportunity(opportunity)
+
+        # Check for short arbitrage (Mint + Sell: Bid-Yes + Bid-No > $1)
+        short_opp = self.detector.detect_short(market, book_yes, book_no)
+
+        if short_opp:
+            logger.info(
+                "🩳 [SHORT OPPORTUNITY] Mint+Sell Arbitrage Detected",
+                market=market.slug,
+                net_profit=f"{short_opp.net_profit_pct:.2%}",
+                profit_usdc=f"${short_opp.net_profit_usdc:.2f}",
+            )
+
+            if self.on_short_opportunity:
+                self.on_short_opportunity(short_opp)
 
 
 class NegativeRiskMarketMonitor:
