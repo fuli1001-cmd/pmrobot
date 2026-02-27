@@ -202,21 +202,64 @@ class DummyNotifier:
         return True
 
 
+class CompositeNotifier:
+    """
+    Sends notifications to multiple backends simultaneously.
+
+    Falls back gracefully: if one channel fails, the others still deliver.
+    """
+
+    def __init__(self, notifiers: list):
+        self._notifiers = notifiers
+
+    async def send(self, message: str, **kwargs) -> bool:
+        results = await asyncio.gather(
+            *(n.send(message, **kwargs) for n in self._notifiers),
+            return_exceptions=True,
+        )
+        return any(r is True for r in results)
+
+    async def send_alert(self, title: str, details: str) -> bool:
+        results = await asyncio.gather(
+            *(n.send_alert(title, details) for n in self._notifiers),
+            return_exceptions=True,
+        )
+        return any(r is True for r in results)
+
+    async def send_trade_notification(self, **kwargs) -> bool:
+        results = await asyncio.gather(
+            *(n.send_trade_notification(**kwargs) for n in self._notifiers),
+            return_exceptions=True,
+        )
+        return any(r is True for r in results)
+
+
 def create_notifier(
     bot_token: Optional[str], 
     chat_id: Optional[str],
     wechat_webhook_url: Optional[str] = None,
-) -> TelegramNotifier | WeChatNotifier | DummyNotifier:
+):
     """
     Create a notifier instance.
-    Prioritizes WeChat if provided, then Telegram.
+
+    If both Telegram and WeChat are configured, returns a CompositeNotifier
+    that sends to both. Otherwise returns the single available channel,
+    or a DummyNotifier as fallback.
     """
-    if wechat_webhook_url:
-        logger.info("Using WeChat Notifier")
-        return WeChatNotifier(webhook_url=wechat_webhook_url)
-        
+    notifiers = []
+
     if bot_token and chat_id:
-        logger.info("Using Telegram Notifier")
-        return TelegramNotifier(bot_token, chat_id)
-        
-    return DummyNotifier()
+        notifiers.append(TelegramNotifier(bot_token, chat_id))
+
+    if wechat_webhook_url:
+        notifiers.append(WeChatNotifier(webhook_url=wechat_webhook_url))
+
+    if len(notifiers) >= 2:
+        logger.info("Using Composite Notifier (Telegram + WeChat)")
+        return CompositeNotifier(notifiers)
+    elif len(notifiers) == 1:
+        name = type(notifiers[0]).__name__
+        logger.info(f"Using {name}")
+        return notifiers[0]
+    else:
+        return DummyNotifier()

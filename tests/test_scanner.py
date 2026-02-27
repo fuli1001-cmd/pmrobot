@@ -7,41 +7,35 @@ from core.scanner import MarketScanner
 from models.market import Market, FeeCategory, MarketType
 
 
-# Sample API response data
+# Sample API response data (camelCase keys matching real Gamma API format)
 SAMPLE_MARKET_RESPONSE = [
     {
-        "condition_id": "0x123abc",
+        "conditionId": "0x123abc",
         "question": "Will Bitcoin reach $100k in 2026?",
         "slug": "bitcoin-100k-2026",
-        "tokens": [
-            {"token_id": "token_yes_1", "outcome": "Yes"},
-            {"token_id": "token_no_1", "outcome": "No"},
-        ],
-        "minimum_tick_size": "0.01",
-        "neg_risk": False,
+        "clobTokenIds": '["token_yes_1", "token_no_1"]',
+        "orderPriceMinTickSize": "0.01",
+        "negRisk": False,
         "tags": ["crypto", "bitcoin"],
-        "volume_24hr": "50000",
+        "volume24hr": "50000",
         "liquidity": "10000",
         "active": True,
         "closed": False,
-        "enable_order_book": True,
+        "enableOrderBook": True,
     },
     {
-        "condition_id": "0x456def",
+        "conditionId": "0x456def",
         "question": "Will Democrats win 2028 election?",
         "slug": "democrats-2028",
-        "tokens": [
-            {"token_id": "token_yes_2", "outcome": "Yes"},
-            {"token_id": "token_no_2", "outcome": "No"},
-        ],
-        "minimum_tick_size": "0.01",
-        "neg_risk": False,
+        "clobTokenIds": '["token_yes_2", "token_no_2"]',
+        "orderPriceMinTickSize": "0.01",
+        "negRisk": False,
         "tags": ["politics", "elections"],
-        "volume_24hr": "100000",
+        "volume24hr": "100000",
         "liquidity": "50000",
         "active": True,
         "closed": False,
-        "enable_order_book": True,
+        "enableOrderBook": True,
     },
 ]
 
@@ -76,8 +70,9 @@ class TestMarketScanner:
     def test_parse_market_insufficient_tokens(self, scanner):
         """Test that markets with insufficient tokens return None."""
         invalid_data = {
-            "condition_id": "0x789",
-            "tokens": [{"token_id": "only_one", "outcome": "Yes"}],
+            "conditionId": "0x789",
+            "clobTokenIds": '["only_one"]',
+            "enableOrderBook": True,
         }
         market = scanner._parse_market(invalid_data)
         assert market is None

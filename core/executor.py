@@ -12,7 +12,7 @@ from py_clob_client.order_builder.constants import BUY
 
 from config.settings import get_settings
 from config.constants import CLOB_API_BASE_URL, POLYGON_CHAIN_ID, SIGNATURE_TYPE_POLY_GNOSIS_SAFE
-from models.market import NegativeRiskArbitrageOpportunity
+from models.market import NegativeRiskArbitrageOpportunity, NegativeRiskStrategy
 from models.order import ArbitrageOpportunity, Order, OrderSide, OrderStatus, OrderType
 from models.position import AccountState
 from utils.logger import get_logger
@@ -164,32 +164,31 @@ class OrderExecutor:
         if self.client and self.proxy_wallet:
             try:
                 from web3 import Web3
-                # Minimal ABI for balanceOf
-                abi = [{"constant": True, "inputs": [{"name": "_owner", "type": "address"}], "name": "balanceOf", "outputs": [{"name": "balance", "type": "uint256"}], "type": "function"}]
-                rpc = "https://polygon-rpc.com" # Default to public if env not set
-                w3 = Web3(Web3.HTTPProvider(rpc))
-                
-                if w3.is_connected():
-                    # Check both Native (New) and Bridged (Old) USDC
+
+                proxy_wallet = self.proxy_wallet  # capture for closure
+
+                def _check_web3_balance():
+                    abi = [{"constant": True, "inputs": [{"name": "_owner", "type": "address"}], "name": "balanceOf", "outputs": [{"name": "balance", "type": "uint256"}], "type": "function"}]
+                    rpc = "https://polygon-rpc.com"
+                    w3 = Web3(Web3.HTTPProvider(rpc))
+                    if not w3.is_connected():
+                        return 0.0
                     native_addr = "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"
                     bridged_addr = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
-                    
                     c_native = w3.eth.contract(address=native_addr, abi=abi)
                     c_bridged = w3.eth.contract(address=bridged_addr, abi=abi)
-                    
-                    bal_n = c_native.functions.balanceOf(self.proxy_wallet).call()
-                    bal_b = c_bridged.functions.balanceOf(self.proxy_wallet).call()
-                    
-                    total_bal = (bal_n + bal_b) / 1e6
-                    
-                    if total_bal > 0:
-                        logger.info(
-                            "Funds Detected via Web3", 
-                            total=total_bal, 
-                            native=bal_n/1e6, 
-                            bridged=bal_b/1e6
-                        )
-                        return total_bal
+                    bal_n = c_native.functions.balanceOf(proxy_wallet).call()
+                    bal_b = c_bridged.functions.balanceOf(proxy_wallet).call()
+                    return (bal_n + bal_b) / 1e6
+
+                total_bal = await asyncio.to_thread(_check_web3_balance)
+
+                if total_bal > 0:
+                    logger.info(
+                        "Funds Detected via Web3",
+                        total=total_bal,
+                    )
+                    return total_bal
             except Exception as w3e:
                 logger.debug("Web3 fallback balance check failed", error=str(w3e))
                 
@@ -346,9 +345,9 @@ class OrderExecutor:
             token_id = None
             for outcome in opportunity.event.outcomes:
                 if outcome.condition_id == condition_id:
-                    if opportunity.strategy == "BuyAllYes":
+                    if opportunity.strategy == NegativeRiskStrategy.BUY_ALL_YES:
                         token_id = outcome.token_id_yes
-                    elif opportunity.strategy == "BuyAllNo" or opportunity.strategy == "ShortRebalance":
+                    elif opportunity.strategy in (NegativeRiskStrategy.BUY_ALL_NO, NegativeRiskStrategy.SHORT_REBALANCE):
                         token_id = outcome.token_id_no
                     break
             
@@ -438,20 +437,33 @@ class OrderExecutor:
         await asyncio.gather(*tasks)
 
     async def _submit_sell_exit(self, filled_order: Order) -> None:
-        """Submit a market sell to exit a position."""
-        sell_price = filled_order.filled_avg_price * 0.90  # 10% dump for safety
-        try:
-            order_args = OrderArgs(
-                token_id=filled_order.token_id,
-                price=sell_price,
-                size=filled_order.filled_size,
-                side="SELL",
-            )
-            signed_order = self.client.create_order(order_args)
-            if signed_order:
-                 self.client.post_order(signed_order) # Fire and forget for speed
-        except Exception as e:
-            logger.error("Emergency exit failed for order", error=str(e))
+        """Submit a market sell to exit a position (with retry)."""
+        max_retries = 3
+        for attempt in range(1, max_retries + 1):
+            discount = 0.90 - 0.05 * (attempt - 1)  # 10%, 15%, 20% discount
+            sell_price = round(filled_order.filled_avg_price * discount, 2)
+            sell_price = max(sell_price, 0.01)
+            try:
+                order_args = OrderArgs(
+                    token_id=filled_order.token_id,
+                    price=sell_price,
+                    size=filled_order.filled_size,
+                    side="SELL",
+                )
+                signed_order = self.client.create_order(order_args)
+                if signed_order:
+                    resp = self.client.post_order(signed_order)
+                    if resp and resp.get("success"):
+                        logger.info("Vector exit order placed", attempt=attempt)
+                        return
+            except Exception as e:
+                logger.error(
+                    "Emergency exit failed for order",
+                    error=str(e),
+                    attempt=attempt,
+                )
+            if attempt < max_retries:
+                await asyncio.sleep(0.5 * attempt)
 
     async def _submit_order(self, order: Order) -> Order:
         """
@@ -536,26 +548,45 @@ class OrderExecutor:
             size=filled_order.filled_size,
         )
 
-        # Create sell order at market (use a lower price to ensure fill)
-        sell_price = filled_order.filled_avg_price * 0.95  # 5% below buy price
+        # Retry up to 3 times with increasing price discount
+        max_retries = 3
+        for attempt in range(1, max_retries + 1):
+            discount = 0.95 - 0.03 * (attempt - 1)  # 5%, 8%, 11% discount
+            sell_price = round(filled_order.filled_avg_price * discount, 2)
+            sell_price = max(sell_price, 0.01)  # Floor at CLOB min tick
 
-        try:
-            order_args = OrderArgs(
-                token_id=filled_order.token_id,
-                price=sell_price,
-                size=filled_order.filled_size,
-                side="SELL",
-            )
-            signed_order = self.client.create_order(order_args)
-            response = self.client.post_order(signed_order)
+            try:
+                order_args = OrderArgs(
+                    token_id=filled_order.token_id,
+                    price=sell_price,
+                    size=filled_order.filled_size,
+                    side="SELL",
+                )
+                signed_order = self.client.create_order(order_args)
+                response = self.client.post_order(signed_order)
 
-            if response.get("success"):
-                logger.info("Emergency exit successful", order_id=response.get("orderID"))
-            else:
-                logger.error("Emergency exit failed", reason=response.get("errorMsg"))
+                if response.get("success"):
+                    logger.info(
+                        "Emergency exit successful",
+                        order_id=response.get("orderID"),
+                        attempt=attempt,
+                    )
+                    return  # Success — stop retrying
+                else:
+                    logger.error(
+                        "Emergency exit rejected",
+                        reason=response.get("errorMsg"),
+                        attempt=attempt,
+                    )
+            except Exception as e:
+                logger.error(
+                    "Emergency exit exception",
+                    error=str(e),
+                    attempt=attempt,
+                )
 
-        except Exception as e:
-            logger.error("Emergency exit exception", error=str(e))
+            if attempt < max_retries:
+                await asyncio.sleep(1.0 * attempt)
 
     def _update_position(
         self,

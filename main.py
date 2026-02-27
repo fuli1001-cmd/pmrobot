@@ -46,8 +46,8 @@ class ArbitrageBot:
         self.settings = settings
         self.dry_run = dry_run
         self._running = False
-        self._opportunity_queue: asyncio.Queue[ArbitrageOpportunity] = asyncio.Queue()
-        self._neg_risk_opportunity_queue: asyncio.Queue[NegativeRiskArbitrageOpportunity] = asyncio.Queue()
+        self._opportunity_queue: asyncio.Queue[ArbitrageOpportunity] = asyncio.Queue(maxsize=100)
+        self._neg_risk_opportunity_queue: asyncio.Queue[NegativeRiskArbitrageOpportunity] = asyncio.Queue(maxsize=100)
         self._neg_risk_events: list = []
 
         # Initialize components
@@ -213,7 +213,10 @@ class ArbitrageBot:
                     profit_usdc=f"${opp.net_profit_usdc:.2f}",
                     trade_size=f"${opp.trade_size_usdc:.2f}",
                 )
-                asyncio.create_task(self._opportunity_queue.put(opp))
+                try:
+                    self._opportunity_queue.put_nowait(opp)
+                except asyncio.QueueFull:
+                    logger.warning("Opportunity queue full, dropping oldest")
             else:
                 logger.warning(
                     "Binary opportunity detected but rejected by risk manager",
@@ -251,7 +254,10 @@ class ArbitrageBot:
                     profit_usdc=f"${opp.net_profit_usdc:.2f}",
                     outcomes=opp.event.outcome_count,
                 )
-                asyncio.create_task(self._neg_risk_opportunity_queue.put(opp))
+                try:
+                    self._neg_risk_opportunity_queue.put_nowait(opp)
+                except asyncio.QueueFull:
+                    logger.warning("NegRisk opportunity queue full, dropping")
             else:
                 logger.warning(
                     "NegRisk opportunity detected but rejected by risk manager",
@@ -340,8 +346,19 @@ class ArbitrageBot:
                     asyncio.create_task(self.stop())
                     return
                 elif result.result == ExecutionResult.SKIPPED and self.dry_run:
-                     # Already logged in executor if skipped
-                     pass
+                    # Dry-run mode: record as simulated success
+                    await self.risk_manager.record_success(
+                        opportunity,
+                        opportunity.net_profit_usdc,
+                        is_simulated=True,
+                    )
+                    logger.info(
+                        "DRY RUN: Simulated NegRisk arbitrage",
+                        event=opportunity.event.title[:50],
+                        strategy=opportunity.strategy.value,
+                        net_profit=f"{opportunity.net_profit_pct:.2%}",
+                        profit_usdc=f"${opportunity.net_profit_usdc:.2f}",
+                    )
                 else:
                     # Failed
                      await self.risk_manager.record_failure(
@@ -467,29 +484,30 @@ class ArbitrageBot:
                 
                 logger.info("Refreshing markets...")
 
-                # 1. Scan for new Negative Risk events
-                # We focus on Neg Risk for now as it's the primary strategy
-                # Full scanner might be heavy, but let's try to update events
+                min_liquidity = self.settings.single_trade_size * 2
+
                 async with MarketScanner(rate_limit=self.settings.api_rate_limit) as scanner:
+                    # 1. Scan for new Binary markets
+                    new_binary = await scanner.fetch_all_markets(
+                        fee_free_only=True,
+                        max_markets=1000,
+                    )
+                    # 2. Scan for new Negative Risk events
                     new_events = await scanner.fetch_negative_risk_events(
                         min_outcomes=3,
                         max_events=100,
                     )
 
-                # Filter for liquidity
-                min_liquidity = self.settings.single_trade_size * 2
+                # --- Binary markets ---
+                tradeable_binary = [m for m in new_binary if m.liquidity >= min_liquidity]
+                if tradeable_binary and self.monitor and hasattr(self.monitor, 'update_markets'):
+                    await self.monitor.update_markets(tradeable_binary)
+
+                # --- Negative Risk events ---
                 tradeable_events = [e for e in new_events if e.liquidity >= min_liquidity]
                 
-                if not tradeable_events:
-                    logger.info("Refresher: No tradeable events found")
-                    continue
-
-                # 2. Update Monitor
-                # Dynamically update the monitor with any newly found events
-                if hasattr(self.monitor, 'update_events'):
-                    await self.monitor.update_events(tradeable_events)
-                else:
-                    logger.warning("Monitor does not support dynamic updates")
+                if tradeable_events and self.neg_risk_monitor and hasattr(self.neg_risk_monitor, 'update_events'):
+                    await self.neg_risk_monitor.update_events(tradeable_events)
 
                 # Update local cache of events
                 current_ids = {e.event_id for e in self._neg_risk_events}
@@ -502,8 +520,7 @@ class ArbitrageBot:
                 
                 if new_count > 0:
                      logger.info("Bot state updated with new events", count=new_count)
-                
-                if new_count == 0:
+                else:
                      logger.debug("Refresher: No new events found")
 
             except asyncio.CancelledError:

@@ -396,7 +396,13 @@ class ArbitrageOpportunity:
     
     @property
     def gross_profit_pct(self) -> float:
-        """Gross profit percentage (before fees)."""
+        """Gross profit percentage (before fees).
+
+        For Binary markets total_cost ≈ 1.0, so this is effectively
+        the same as ROI = (payout - cost) / cost.  The NegRisk model
+        uses explicit ROI because total_cost can differ significantly
+        from the expected payout.
+        """
         return 1.0 - self.total_cost
     
     @property

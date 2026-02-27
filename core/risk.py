@@ -200,7 +200,15 @@ class RiskManager:
         """
         self.stats.total_trades += 1
         self.stats.last_trade_time = datetime.now()
-        self._market_last_trade[opportunity.market.condition_id] = time.time()
+
+        # Compatible with both ArbitrageOpportunity (.market) and NegativeRiskArbitrageOpportunity (.event)
+        if hasattr(opportunity, 'market'):
+            market_id = opportunity.market.condition_id
+        elif hasattr(opportunity, 'event'):
+            market_id = opportunity.event.event_id
+        else:
+            market_id = "unknown"
+        self._market_last_trade[market_id] = time.time()
 
         if is_simulated:
             self.stats.simulated_trades += 1
@@ -245,9 +253,17 @@ class RiskManager:
             self._daily_loss += loss_usdc
             self._consecutive_failures += 1
 
+            # Compatible with both ArbitrageOpportunity (.market) and NegativeRiskArbitrageOpportunity (.event)
+            if hasattr(opportunity, 'market'):
+                market_label = opportunity.market.slug[:30]
+            elif hasattr(opportunity, 'event'):
+                market_label = opportunity.event.title[:30]
+            else:
+                market_label = "unknown"
+
             await self.notifier.send_alert(
                 "Partial Fill Loss",
-                f"Lost ${loss_usdc:.2f} on {opportunity.market.slug[:30]}",
+                f"Lost ${loss_usdc:.2f} on {market_label}",
             )
         else:
             self.stats.failed_trades += 1

@@ -321,6 +321,35 @@ class NegativeRiskArbitrageDetector:
         self.cooldown_seconds = cooldown_seconds
         self._check_count = 0
         self._last_opportunity: dict[str, float] = {}  # event_id -> timestamp
+        self._min_trade_size = 10.0  # Floor: don't bother below $10
+
+    def _effective_trade_size(
+        self,
+        event: NegativeRiskEvent,
+        order_books: "OrderBookManager",
+        side: str = "yes",
+    ) -> float:
+        """
+        Return the maximum trade size supported by the shallowest leg.
+
+        Clamps self.trade_size down to avoid exceeding available depth.
+        """
+        n = len(event.outcomes)
+        if n == 0:
+            return self.trade_size
+        per_leg = self.trade_size / n
+        min_depth = float("inf")
+        for outcome in event.outcomes:
+            token_id = outcome.token_id_yes if side == "yes" else outcome.token_id_no
+            book = order_books.get(token_id)
+            if book:
+                depth = book.get_available_depth(side="ask")
+                min_depth = min(min_depth, depth)
+            else:
+                return self._min_trade_size  # Missing book → fall back to min
+        # Scale back so the smallest leg still fits; don't go below floor
+        capped = min(self.trade_size, min_depth * n * 0.8)  # 80% of shallowest leg
+        return max(capped, self._min_trade_size)
 
     def detect(
         self,
@@ -446,6 +475,7 @@ class NegativeRiskArbitrageDetector:
         Condition: sum(Yes prices) < 1 - threshold - fees
         Profit: 1 - sum(Yes prices)
         """
+        effective_size = self._effective_trade_size(event, order_books, side="yes")
         outcome_prices = {}
         total_yes_cost = 0.0
 
@@ -455,7 +485,7 @@ class NegativeRiskArbitrageDetector:
                 return None
 
             # Get best ask price for Yes
-            avg_price = book_yes.calculate_average_buy_price(self.trade_size / len(event.outcomes))
+            avg_price = book_yes.calculate_average_buy_price(effective_size / len(event.outcomes))
             if avg_price is None:
                 return None
 
@@ -466,8 +496,7 @@ class NegativeRiskArbitrageDetector:
         expected_payout = 1.0  # Only one Yes will be worth 1
         gross_profit = expected_payout - total_yes_cost
 
-        # Periodic debug log
-        self._check_count += 1
+        # Periodic debug log (use parent detect()'s _check_count, no duplicate increment)
         if self._check_count % 500 == 1:
             logger.info(
                 "NegRisk Price sample (Buy-All-Yes)",
@@ -485,7 +514,7 @@ class NegativeRiskArbitrageDetector:
             event=event,
             strategy=NegativeRiskStrategy.BUY_ALL_YES,
             outcome_prices=outcome_prices,
-            trade_size_usdc=self.trade_size,
+            trade_size_usdc=effective_size,
             total_cost=total_yes_cost,
             expected_payout=expected_payout,
             estimated_fee=0.0,  # Assume fee-free for now
@@ -503,6 +532,7 @@ class NegativeRiskArbitrageDetector:
         Condition: sum(No prices) < N-1 - threshold - fees
         Profit: (N-1) - sum(No prices)
         """
+        effective_size = self._effective_trade_size(event, order_books, side="no")
         outcome_prices = {}
         total_no_cost = 0.0
         n = event.outcome_count
@@ -513,7 +543,7 @@ class NegativeRiskArbitrageDetector:
                 return None
 
             # Get best ask price for No
-            avg_price = book_no.calculate_average_buy_price(self.trade_size / n)
+            avg_price = book_no.calculate_average_buy_price(effective_size / n)
             if avg_price is None:
                 return None
 
@@ -543,7 +573,7 @@ class NegativeRiskArbitrageDetector:
             event=event,
             strategy=NegativeRiskStrategy.BUY_ALL_NO,
             outcome_prices=outcome_prices,
-            trade_size_usdc=self.trade_size,
+            trade_size_usdc=effective_size,
             total_cost=total_no_cost,
             expected_payout=expected_payout,
             estimated_fee=0.0,
@@ -569,6 +599,7 @@ class NegativeRiskArbitrageDetector:
         total_yes_cost = 0.0
         total_no_cost = 0.0
         n = event.outcome_count
+        effective_size = self._effective_trade_size(event, order_books, side="no")
 
         for outcome in event.outcomes:
             book_yes = order_books.get(outcome.token_id_yes)
@@ -584,7 +615,7 @@ class NegativeRiskArbitrageDetector:
             total_yes_cost += yes_price
             
             # Get No price (for buying)
-            no_avg_price = book_no.calculate_average_buy_price(self.trade_size / n)
+            no_avg_price = book_no.calculate_average_buy_price(effective_size / n)
             if no_avg_price is None:
                 return None
             
@@ -619,7 +650,7 @@ class NegativeRiskArbitrageDetector:
             event=event,
             strategy=NegativeRiskStrategy.SHORT_REBALANCE,
             outcome_prices=outcome_no_prices,
-            trade_size_usdc=self.trade_size,
+            trade_size_usdc=effective_size,
             total_cost=total_no_cost,
             expected_payout=expected_payout,
             estimated_fee=0.0,
@@ -656,6 +687,7 @@ class MarketMonitor:
             self.token_to_market[m.token_id_yes] = m
             self.token_to_market[m.token_id_no] = m
 
+        self.profit_threshold = profit_threshold
         self.order_books = OrderBookManager()
         self.detector = ArbitrageDetector(
             profit_threshold=profit_threshold,
@@ -705,11 +737,44 @@ class MarketMonitor:
         if self._ws:
             await self._ws.close()
 
+    async def update_markets(self, new_markets: list) -> None:
+        """
+        Dynamically add new Binary markets to the monitoring set.
+
+        Subscribes the WebSocket to any newly-added tokens so the
+        ArbitrageDetector will start evaluating them immediately.
+        """
+        new_tokens_to_sub = []
+        count = 0
+        for market in new_markets:
+            if market.condition_id not in self.markets:
+                self.markets[market.condition_id] = market
+                self.token_to_market[market.token_id_yes] = market
+                self.token_to_market[market.token_id_no] = market
+                new_tokens_to_sub.extend([market.token_id_yes, market.token_id_no])
+                count += 1
+
+        if new_tokens_to_sub and self._ws:
+            subscribe_msg = {
+                "type": "subscribe",
+                "channel": "book",
+                "assets_ids": new_tokens_to_sub,
+            }
+            await self._ws.send(json.dumps(subscribe_msg))
+            logger.info(
+                "Subscribed to new Binary tokens",
+                new_markets=count,
+                new_tokens=len(new_tokens_to_sub),
+            )
+
     async def _connect_and_subscribe(self) -> None:
         """Connect to WebSocket and subscribe to markets."""
         async with websockets.connect(CLOB_WS_URL) as ws:
             self._ws = ws
             self._reconnect_delay = 1.0  # Reset on successful connection
+
+            # I4: Discard stale order-book state from previous connection
+            self.order_books = OrderBookManager()
 
             # Subscribe to all token order books
             token_ids = []
@@ -799,48 +864,14 @@ class MarketMonitor:
         elif msg_type == "subscribed":
             logger.debug("Subscription confirmed")
         elif msg_type == "price_change":
-            # Price change events - extract book data from price_changes
-            await self._handle_price_change(data)
+            # price_change events don't carry full order book depth data,
+            # so they cannot support depth penetration calculations.
+            # Ignore them; we rely on 'book' channel updates instead.
+            pass
         elif "asset_id" in data and ("bids" in data or "asks" in data):
             # Initial snapshot format (no type field, just raw book data)
             self._book_update_count += 1
             await self._handle_book_update(data)
-
-    async def _handle_price_change(self, data: dict) -> None:
-        """Handle price_change event and update order books."""
-        market_id = data.get("market")
-        price_changes = data.get("price_changes", [])
-        
-        for change in price_changes:
-            if not isinstance(change, dict):
-                continue
-            
-            asset_id = change.get("asset_id")
-            if not asset_id:
-                continue
-            
-            # Extract price from price_change
-            price = change.get("price")
-            if price is None:
-                continue
-            
-            # Get existing book or create minimal one
-            book = self.order_books.get(asset_id)
-            if book and book.asks:
-                # Update best ask with new price (simplified)
-                # This is a rough approximation since price_change doesn't give full book
-                pass
-            
-            # Find market and check for arbitrage
-            market = self.token_to_market.get(asset_id)
-            if market:
-                book_yes = self.order_books.get(market.token_id_yes)
-                book_no = self.order_books.get(market.token_id_no)
-                
-                if book_yes and book_no:
-                    opportunity = self.detector.detect(market, book_yes, book_no)
-                    if opportunity and self.on_opportunity:
-                        self.on_opportunity(opportunity)
 
     async def _handle_book_update(self, data: dict) -> None:
         """Handle order book update."""
@@ -870,7 +901,7 @@ class MarketMonitor:
             # Log with distinct marker for easy searching
             logger.info(
                 "🚀 [OPPORTUNITY] Binary Market Arbitrage Detected",
-                market=market.ticker,
+                market=market.slug,
                 net_profit=f"{opportunity.net_profit_pct:.2%}",
                 profit_usdc=f"${opportunity.net_profit_usdc:.2f}",
                 threshold=f"{self.profit_threshold:.2%}",
@@ -913,6 +944,7 @@ class NegativeRiskMarketMonitor:
             for token_id in event.get_all_token_ids():
                 self.token_to_event[token_id] = event
 
+        self.profit_threshold = profit_threshold
         self.order_books = OrderBookManager()
         self.detector = NegativeRiskArbitrageDetector(
             profit_threshold=profit_threshold,
@@ -967,6 +999,9 @@ class NegativeRiskMarketMonitor:
             self._ws = ws
             self._reconnect_delay = 1.0
             logger.info("NegRisk: WebSocket connected successfully")
+
+            # I4: Discard stale order-book state from previous connection
+            self.order_books = OrderBookManager()
 
             # Subscribe to all tokens
             all_tokens = list(self.token_to_event.keys())

@@ -96,6 +96,7 @@ class PositionSettler:
         self.notifier = create_notifier(
             settings.telegram_bot_token,
             settings.telegram_chat_id,
+            settings.wechat_webhook_url,
         )
 
         logger.info(
@@ -179,41 +180,35 @@ class PositionSettler:
         amount_wei = int(amount * 1e6)  # USDC has 6 decimals
 
         try:
-            # Build transaction
-            # Partition for binary market: [1, 2] represents Yes and No
-            partition = [1, 2]
+            # All Web3 calls are synchronous and blocking; run them in a
+            # thread so we don't stall the asyncio event loop.
+            def _build_sign_send():
+                partition = [1, 2]
+                tx = self.ctf.functions.mergePositions(
+                    Web3.to_checksum_address(USDC_ADDRESS),
+                    bytes(32),  # parentCollectionId (empty for root)
+                    bytes.fromhex(position.condition_id[2:]),  # conditionId
+                    partition,
+                    amount_wei,
+                ).build_transaction({
+                    "from": self.account.address,
+                    "nonce": self.w3.eth.get_transaction_count(self.account.address),
+                    "gas": 200000,
+                    "gasPrice": self.w3.eth.gas_price,
+                })
+                signed_tx = self.w3.eth.account.sign_transaction(tx, self.account.key)
+                tx_hash = self.w3.eth.send_raw_transaction(signed_tx.rawTransaction)
+                receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+                return tx_hash, receipt
 
-            tx = self.ctf.functions.mergePositions(
-                Web3.to_checksum_address(USDC_ADDRESS),
-                bytes(32),  # parentCollectionId (empty for root)
-                bytes.fromhex(position.condition_id[2:]),  # conditionId
-                partition,
-                amount_wei,
-            ).build_transaction({
-                "from": self.account.address,
-                "nonce": self.w3.eth.get_transaction_count(self.account.address),
-                "gas": 200000,
-                "gasPrice": self.w3.eth.gas_price,
-            })
-
-            # Sign and send
-            signed_tx = self.w3.eth.account.sign_transaction(tx, self.account.key)
-            tx_hash = self.w3.eth.send_raw_transaction(signed_tx.rawTransaction)
-
-            logger.info(
-                "Merge transaction sent",
-                tx_hash=tx_hash.hex(),
-                amount=amount,
-            )
-
-            # Wait for confirmation
-            receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
+            tx_hash, receipt = await asyncio.to_thread(_build_sign_send)
 
             if receipt["status"] == 1:
                 logger.info(
                     "Merge successful",
                     tx_hash=tx_hash.hex(),
                     gas_used=receipt["gasUsed"],
+                    amount=amount,
                 )
                 return True
             else:
