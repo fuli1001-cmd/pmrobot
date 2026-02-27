@@ -15,7 +15,15 @@ from typing import Optional
 from enum import Enum
 
 from web3 import Web3
-from web3.middleware import geth_poa_middleware
+
+# web3.py v6+ compatibility
+try:
+    from web3.middleware import ExtraDataToPOAMiddleware as geth_poa_middleware
+except ImportError:
+    try:
+        from web3.middleware.geth import geth_poa_middleware
+    except ImportError:
+        from web3.middleware import geth_poa_middleware
 
 from config.constants import (
     CTF_CONTRACT_ADDRESS,
