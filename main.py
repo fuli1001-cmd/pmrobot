@@ -708,7 +708,8 @@ async def main() -> None:
         settings.env = args.env
 
     # Create and run bot
-    bot = ArbitrageBot(settings, dry_run=args.dry_run)
+    dry_run = args.dry_run or settings.dry_run
+    bot = ArbitrageBot(settings, dry_run=dry_run)
 
     # Handle signals
     stop_event = asyncio.Event()
