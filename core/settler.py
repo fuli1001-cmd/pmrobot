@@ -77,6 +77,7 @@ class PositionSettler:
         builder_passphrase: Optional[str] = None,
         relay_tx_type: str = "PROXY",
         is_testnet: bool = False,
+        dry_run: bool = False,
     ):
         """
         Initialize the position settler.
@@ -91,7 +92,9 @@ class PositionSettler:
             builder_passphrase: Polymarket Builder Passphrase
             relay_tx_type: "SAFE" or "PROXY" (wallet type on Relayer)
             is_testnet: Use staging Relayer URL
+            dry_run: If True, log merge candidates but skip real transactions
         """
+        self._dry_run = dry_run
         self.min_merge_amount = min_merge_amount
         self.merge_interval = merge_interval
         self._last_merge_time = 0.0
@@ -231,11 +234,18 @@ class PositionSettler:
             account_state: Account state to monitor
         """
         self._running = True
-        logger.info("Starting position settler", enabled=self._enabled)
+        logger.info(
+            "Starting position settler",
+            enabled=self._enabled,
+            dry_run=self._dry_run,
+        )
 
         if not self._enabled:
             logger.warning("Position merging disabled: No private key provided")
             return
+
+        if self._dry_run:
+            logger.info("Position merging in DRY RUN mode: will detect but not execute merges")
 
         while self._running:
             try:
@@ -270,6 +280,13 @@ class PositionSettler:
         merged_total = 0.0
         for condition_id, position in list(account_state.positions.items()):
             if position.can_merge:
+                if self._dry_run:
+                    logger.info(
+                        "DRY RUN: would merge position",
+                        condition_id=condition_id,
+                        amount=f"${position.mergeable_amount:.2f}",
+                    )
+                    continue
                 success = await self._merge_position(position)
                 if success:
                     merged_amount = position.mergeable_amount
@@ -461,4 +478,5 @@ def create_settler() -> PositionSettler:
         builder_passphrase=settings.builder_passphrase,
         relay_tx_type=settings.relayer_tx_type,
         is_testnet=settings.is_testnet,
+        dry_run=settings.dry_run,
     )

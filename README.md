@@ -1,8 +1,8 @@
 # Polymarket 套利机器人 (Polymarket Arbitrage Bot)
 
-全自动化的 Polymarket 预测市场套利机器人。实时监控 Binary（二元）市场和 Negative Risk（负风险）市场，利用价格无效率自动捕获无风险（或接近无风险）利润。
+全自动化的 Polymarket 预测市场套利机器人。实时监控 Binary（二元）市场和 Negative Risk（负风险）市场，利用价格无效率自动捕获无风险（或接近无风险）利润。支持 Long Arb（买入套利）和 Short Arb（Mint+卖出套利）两种执行路径。
 
-> **一句话概括**：当一组互斥结果的价格之和不等于理论值时，同时买入所有结果即可锁定差价利润。
+> **一句话概括**：当一组互斥结果的价格之和偏离理论值时，通过买入或铸造+卖出来锁定差价利润。
 
 ---
 
@@ -133,6 +133,29 @@ Other No:   $0.79    ← 买入
 
 此策略是对市场过度乐观情绪的修正。
 
+### 3. Short Arbitrage（做空套利 — Mint+Sell）
+
+**原理**：通过 CTF 合约铸造（Mint）一组完整的 Yes+No 代币，然后在市场上卖出获利。
+
+**获利条件**：`Bid(Yes) + Bid(No) > 1.0 + 手续费 + Gas`
+
+**举例**：
+```
+市场："比特币会在年底突破 $100K 吗？"
+  Yes 最高买价 (Bid): $0.55
+  No  最高买价 (Bid): $0.48
+  总收入: $0.55 + $0.48 = $1.03
+  铸造成本: $1.00 (CTF 合约 mint 1组代币)
+  利润: $1.03 - $1.00 - 手续费 = ~$0.02 (2%)
+```
+
+**操作**：
+1. 调用 CTF 合约的 `splitPosition` 铸造 Yes+No 代币对（花费 $1.00 USDC 得到 1 Yes + 1 No）
+2. 同时以 FOK 订单卖出 Yes 和 No 代币
+3. 如果总卖出价 > 铸造成本 + 手续费，即锁定利润
+
+> 💡 与 Long Arb（买入两边等结算）不同，Short Arb 通过铸造+卖出**立即**实现利润，无需等待事件结算。但需要链上 Gas（或通过 Relayer 免 Gas）。
+
 ---
 
 ## 🏗️ 系统架构
@@ -156,9 +179,10 @@ Other No:   $0.79    ← 买入
 |------|------|------|
 | **Scanner** | `core/scanner.py` | 启动时通过 Gamma API 扫描全量市场，过滤出流动性足够的 Binary 市场和 NegRisk 事件组 |
 | **Monitor** | `core/monitor.py` | 通过 WebSocket 实时接收订单簿更新，内置 `ArbitrageDetector` 和 `NegativeRiskArbitrageDetector` 进行实时套利检测 |
-| **Executor** | `core/executor.py` | 接收套利机会队列，通过 CLOB API 并发提交 FOK 订单；处理部分成交时的紧急平仓 |
-| **Settler** | `core/settler.py` | 定期扫描账户持仓，对可合并的头寸调用 CTF 合约的 `mergePositions` 函数，将代币对换回 USDC |
+| **Executor** | `core/executor.py` | 接收套利机会队列，通过 CLOB API 并发提交 FOK 订单；处理部分成交时的紧急平仓。支持 Long Arb（买入）和 Short Arb（Mint+卖出）两种执行路径 |
+| **Settler** | `core/settler.py` | 定期扫描账户持仓，对可合并的头寸调用 CTF 合约的 `mergePositions` 函数，将代币对换回 USDC。支持 Relayer 无 Gas 模式和 EOA 直签模式 |
 | **Risk** | `core/risk.py` | 交易统计、市场冷却期、熔断器（连续失败自动暂停） |
+| **CTF** | `core/ctf.py` | CTF 合约交互，封装 `splitPosition`（铸造 Yes+No 代币）和 `mergePositions`（合并代币回 USDC）操作 |
 | **Notifier** | `utils/notifier.py` | 支持 Telegram、企业微信、或同时发送到两者（CompositeNotifier） |
 
 ### 数据流
@@ -166,8 +190,12 @@ Other No:   $0.79    ← 买入
 ```
 1. Scanner → 获取市场列表 → 传给 Monitor
 2. Monitor → WebSocket 订阅订单簿 → 检测到套利机会 → 放入队列
+   ├─ Long Arb (Ask+Ask < 1.0) → long_opportunity_queue
+   └─ Short Arb (Bid+Bid > 1.0) → short_opportunity_queue
 3. Executor → 从队列取出机会 → 校验 + 下单 → 更新 Risk 统计
-4. Settler → 定期检查持仓 → 找到可合并头寸 → 链上 Merge → 收回 USDC
+   ├─ Long Arb → 并发买入 Yes + No
+   └─ Short Arb → CTF Mint → 并发卖出 Yes + No
+4. Settler → 定期检查持仓 → 找到可合并头寸 → Relayer/EOA Merge → 收回 USDC
 5. Refresher → 定期重新扫描市场 → 动态更新 Monitor 的监控列表
 ```
 
@@ -190,9 +218,9 @@ pmrobot/
 │   ├── scanner.py          # 市场扫描（Gamma REST API）
 │   ├── monitor.py          # WebSocket 监控 + 套利检测器
 │   ├── executor.py         # 订单执行引擎（CLOB API）
-│   ├── settler.py          # 持仓结算（Web3 链上合并）
+│   ├── settler.py          # 持仓结算（Relayer 无 Gas / EOA 直签）
 │   ├── risk.py             # 风险管理器
-│   └── ctf.py              # CTF 合约 ABI 定义
+│   └── ctf.py              # CTF 合约交互（Mint/Merge）
 │
 ├── models/
 │   ├── market.py           # 市场/事件/套利机会数据模型
@@ -267,6 +295,11 @@ POLYMARKET_PASSPHRASE=your_passphrase
 PROXY_WALLET_ADDRESS=0xYourProxyWallet
 
 # ═══ 可选 ═══
+# Builder Program 凭证（启用 Relayer 无 Gas 合并，不配时用 EOA 直签）
+BUILDER_API_KEY=
+BUILDER_SECRET=
+BUILDER_PASSPHRASE=
+
 # 交易参数
 PROFIT_THRESHOLD=0.008          # 最低利润阈值 (0.8%)
 SINGLE_TRADE_SIZE=100           # 单笔交易金额 (USDC)
@@ -397,7 +430,7 @@ python main.py --dry-run 2>&1 | findstr "NegRisk Price sample"
 | **滑点风险** | 从检测到下单存在延迟，价格可能变动 | FOK 订单 + 滑点上限 (`MAX_SLIPPAGE`) |
 | **部分成交** | 多腿交易中只有部分腿成交，产生裸头寸 | 自动紧急平仓（带重试），5%~11% 折价卖出 |
 | **API 故障** | Polymarket API 或 Polygon RPC 可能不稳定 | WebSocket 自动重连 + 指数退避 |
-| **Gas 消耗** | Settler 合并操作需要链上 Gas | Gas 成本已纳入 Short 策略的利润计算 |
+| **Gas 消耗** | Settler 合并和 Short Arb 铸造需要链上 Gas | Gas 成本已纳入利润计算；可配置 Relayer 免 Gas 合并 |
 | **资金安全** | 私钥泄露 = 资金损失 | 使用环境变量存储私钥，避免硬编码 |
 
 ### 安全建议
@@ -413,7 +446,7 @@ python main.py --dry-run 2>&1 | findstr "NegRisk Price sample"
 ## ❓ 常见问题
 
 ### Q: Dry Run 模式下会消耗资金吗？
-**A**: 不会。Dry Run 仅模拟下单流程，所有订单都被跳过（`SKIPPED`），余额显示为虚拟的 $10,000。
+**A**: 不会。Dry Run 模拟所有交易和合并操作——Executor 的订单会被跳过（`SKIPPED`），Settler 的链上合并也会被跳过（仅记录日志），余额显示为虚拟的 $10,000。
 
 ### Q: 套利真的是"无风险"吗？
 **A**: 理论上是——只要所有腿同时成交。实际中最大的风险是**部分成交**（只有部分订单填满），此时机器人会以折扣价紧急卖出已成交的部分以止损。
@@ -436,4 +469,5 @@ python main.py --dry-run 2>&1 | findstr "NegRisk Price sample"
 - **Gamma REST API** — 获取市场列表和元数据
 - **CLOB WebSocket** — 实时订单簿推送
 - **CLOB REST API** — 下单、查余额
-- **Polygon RPC** — 调用 CTF 合约进行链上合并（Settler）
+- **Polygon RPC** — 调用 CTF 合约进行链上铸造（Mint）和合并（Merge）
+- **Relayer API**（可选）— 无 Gas meta-transaction 合并
