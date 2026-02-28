@@ -73,3 +73,20 @@ def get_profit_threshold(outcome_count: int = 2) -> float:
     else:
         return PROFIT_THRESHOLD_NEG_RISK_LARGE
 
+
+# ═══ Azuro Protocol Constants ═══
+AZURO_DATA_FEED_POLYGON_URL = (
+    "https://thegraph-1.onchainfeed.org/subgraphs/name/"
+    "azuro-protocol/azuro-data-feed-polygon"
+)
+
+# Cross-platform profit threshold (higher than intra-platform
+# due to Azuro bet exit risk — NFTs cannot be resold instantly)
+CROSS_PLATFORM_PROFIT_THRESHOLD = 0.03  # 3%
+
+# Default slippage buffer for Azuro minOdds parameter
+DEFAULT_AZURO_MIN_ODDS_SLIPPAGE = 0.02  # 2%
+
+# Estimated gas cost per Azuro bet on Polygon (USDC)
+ESTIMATED_AZURO_GAS_COST_USD = 0.02
+

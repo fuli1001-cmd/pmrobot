@@ -79,6 +79,26 @@ class Settings(BaseSettings):
     dry_run: bool = Field(False, description="Dry run mode (no real trades)")
     log_level: str = Field("INFO", description="Logging level")
 
+    # ═══ Azuro Configuration ═══
+    azuro_enabled: bool = Field(False, description="Enable Azuro exchange adapter")
+    azuro_lp_address: Optional[str] = Field(None, description="Azuro LP contract address (Polygon)")
+    azuro_core_address: Optional[str] = Field(None, description="Azuro Core contract address (Polygon)")
+    azuro_subgraph_url: str = Field(
+        "https://thegraph-1.onchainfeed.org/subgraphs/name/azuro-protocol/azuro-data-feed-polygon",
+        description="Azuro data-feed subgraph URL",
+    )
+
+    # ═══ Cross-Platform Arbitrage ═══
+    cross_platform_enabled: bool = Field(False, description="Enable cross-platform arbitrage")
+    cross_profit_threshold: float = Field(
+        0.03, ge=0.005, le=0.2, description="Cross-platform profit threshold (3%)"
+    )
+    cross_trade_size: float = Field(
+        50.0, ge=5.0, le=5000.0, description="Cross-platform trade size in USDC"
+    )
+    alignment_use_llm: bool = Field(False, description="Enable LLM fallback for event alignment")
+    llm_api_key: Optional[str] = Field(None, description="LLM API key for alignment fallback")
+
     # Removed validate_private_key as private_key is now optional
 
     @field_validator("env")

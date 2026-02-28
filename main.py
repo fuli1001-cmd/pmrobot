@@ -1,7 +1,8 @@
 """
-Polymarket Arbitrage Bot - Main Entry Point
+Prediction Market Arbitrage Bot - Main Entry Point
 
-A fully automated arbitrage bot for Polymarket prediction markets.
+A fully automated arbitrage bot supporting Polymarket and Azuro
+prediction markets (single-platform and cross-platform strategies).
 """
 
 import argparse
@@ -22,6 +23,14 @@ from models.market import NegativeRiskEvent, NegativeRiskArbitrageOpportunity
 from models.order import ArbitrageOpportunity, ShortArbitrageOpportunity
 from utils.logger import setup_logging, get_logger
 from utils.notifier import create_notifier
+
+# Cross-platform imports (lazy-loaded when enabled)
+from exchanges.base import BaseExchange
+from exchanges.polymarket import PolymarketExchange
+from exchanges.azuro import AzuroExchange
+from core.alignment import MarketAligner
+from core.cross_platform import CrossPlatformDetector, CrossPlatformExecutor
+from models.cross_models import CrossPlatformOpportunity, CrossExecutionReport
 
 logger = get_logger(__name__)
 
@@ -51,6 +60,7 @@ class ArbitrageBot:
         self._opportunity_queue: asyncio.Queue[ArbitrageOpportunity] = asyncio.Queue(maxsize=100)
         self._neg_risk_opportunity_queue: asyncio.Queue[NegativeRiskArbitrageOpportunity] = asyncio.Queue(maxsize=100)
         self._short_opportunity_queue: asyncio.Queue[ShortArbitrageOpportunity] = asyncio.Queue(maxsize=100)
+        self._cross_opportunity_queue: asyncio.Queue[CrossPlatformOpportunity] = asyncio.Queue(maxsize=100)
         self._neg_risk_events: list = []
 
         # Initialize components
@@ -69,6 +79,13 @@ class ArbitrageBot:
             settings.telegram_chat_id,
             settings.wechat_webhook_url,
         )
+
+        # Cross-platform components (initialised in start() if enabled)
+        self._pm_exchange: Optional[PolymarketExchange] = None
+        self._az_exchange: Optional[AzuroExchange] = None
+        self._market_aligner: Optional[MarketAligner] = None
+        self._cross_detector: Optional[CrossPlatformDetector] = None
+        self._cross_executor: Optional[CrossPlatformExecutor] = None
 
     async def start(self) -> None:
         """Start the arbitrage bot."""
@@ -119,8 +136,12 @@ class ArbitrageBot:
             neg_risk_events = await self._scan_negative_risk_events()
             logger.info(f"Found {len(neg_risk_events)} Negative Risk events")
 
+            # Phase 1c: Initialise cross-platform (if enabled)
+            if self.settings.cross_platform_enabled and self.settings.azuro_enabled:
+                await self._init_cross_platform()
+
             # Phase 2: Start monitoring and execution loops
-            await asyncio.gather(
+            tasks = [
                 self._run_monitor(markets),
                 self._run_neg_risk_monitor(neg_risk_events),
                 self._run_executor(),
@@ -129,7 +150,15 @@ class ArbitrageBot:
                 self._run_settler(),
                 self._run_stats_reporter(),
                 self._run_market_refresher(),
-            )
+            ]
+
+            # Add cross-platform tasks if enabled
+            if self._cross_detector and self._cross_executor:
+                tasks.append(self._run_cross_platform_scanner())
+                tasks.append(self._run_cross_platform_executor())
+                logger.info("Cross-platform arbitrage tasks added")
+
+            await asyncio.gather(*tasks)
 
         except asyncio.CancelledError:
             logger.info("Bot cancelled")
@@ -650,10 +679,164 @@ class ArbitrageBot:
                 logger.error("Market refresher error", error=str(e))
 
 
+    # ------------------------------------------------------------------
+    # Cross-platform methods
+    # ------------------------------------------------------------------
+
+    async def _init_cross_platform(self) -> None:
+        """Initialise cross-platform exchange adapters and components."""
+        logger.info("Initialising cross-platform arbitrage...")
+
+        # Polymarket exchange adapter
+        self._pm_exchange = PolymarketExchange(dry_run=self.dry_run)
+        await self._pm_exchange.connect()
+
+        # Azuro exchange adapter
+        self._az_exchange = AzuroExchange(
+            subgraph_url=self.settings.azuro_subgraph_url,
+            lp_address=self.settings.azuro_lp_address or "",
+            core_address=self.settings.azuro_core_address or "",
+            rpc_url=self.settings.rpc_url,
+            private_key=self.settings.private_key or "",
+            dry_run=self.dry_run,
+        )
+        await self._az_exchange.connect()
+
+        # Market aligner
+        self._market_aligner = MarketAligner(
+            use_llm=self.settings.alignment_use_llm,
+            llm_api_key=self.settings.llm_api_key or "",
+        )
+
+        # Detector and executor
+        self._cross_detector = CrossPlatformDetector(
+            pm_exchange=self._pm_exchange,
+            az_exchange=self._az_exchange,
+            profit_threshold=self.settings.cross_profit_threshold,
+            trade_size=self.settings.cross_trade_size,
+        )
+        self._cross_executor = CrossPlatformExecutor(
+            pm_exchange=self._pm_exchange,
+            az_exchange=self._az_exchange,
+            dry_run=self.dry_run,
+        )
+
+        logger.info(
+            "Cross-platform arbitrage initialised",
+            profit_threshold=f"{self.settings.cross_profit_threshold:.2%}",
+            trade_size=f"${self.settings.cross_trade_size:.2f}",
+        )
+
+    async def _run_cross_platform_scanner(self) -> None:
+        """Periodically scan for cross-platform arbitrage opportunities."""
+        scan_interval = 60  # Check every 60 seconds
+
+        while self._running:
+            try:
+                # Fetch sports markets from both platforms
+                pm_markets = await self._pm_exchange.get_markets(sport="sports")
+                az_markets = await self._az_exchange.get_markets(sport="football")
+
+                if not pm_markets or not az_markets:
+                    logger.debug(
+                        "Cross-scan: insufficient markets",
+                        pm=len(pm_markets),
+                        az=len(az_markets),
+                    )
+                    await asyncio.sleep(scan_interval)
+                    continue
+
+                # Align markets
+                pairs = self._market_aligner.align(pm_markets, az_markets)
+
+                if pairs:
+                    # Scan for opportunities
+                    opportunities = await self._cross_detector.scan(pairs)
+
+                    for opp in opportunities:
+                        if self.risk_manager.can_trade():
+                            try:
+                                self._cross_opportunity_queue.put_nowait(opp)
+                            except asyncio.QueueFull:
+                                logger.warning("Cross-platform queue full")
+                        else:
+                            logger.debug("Cross opportunity rejected by risk manager")
+
+                await asyncio.sleep(scan_interval)
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error("Cross-platform scanner error", error=str(e))
+                await asyncio.sleep(scan_interval)
+
+    async def _run_cross_platform_executor(self) -> None:
+        """Execute cross-platform arbitrage opportunities from the queue."""
+        while self._running:
+            try:
+                try:
+                    opportunity = await asyncio.wait_for(
+                        self._cross_opportunity_queue.get(),
+                        timeout=1.0,
+                    )
+                except asyncio.TimeoutError:
+                    continue
+
+                if not self.risk_manager.can_trade():
+                    logger.debug("Cross execution paused - risk check failed")
+                    continue
+
+                logger.info(
+                    "Executing cross-platform arbitrage",
+                    pm_q=opportunity.pm_question[:50],
+                    profit=f"{opportunity.net_profit_pct:.2%}",
+                    size=f"${opportunity.trade_size_usdc:.2f}",
+                    yes_on=opportunity.yes_platform.value,
+                )
+
+                report = await self._cross_executor.execute(opportunity)
+
+                if report.is_success:
+                    est_profit = opportunity.net_profit_pct * opportunity.trade_size_usdc
+                    logger.info(
+                        "Cross-platform arb SUCCESS",
+                        profit=f"${est_profit:.2f}",
+                    )
+                    await self.notifier.send_trade_notification(
+                        market=f"[CROSS] {opportunity.pm_question[:50]}",
+                        profit_pct=opportunity.net_profit_pct,
+                        trade_size=opportunity.trade_size_usdc,
+                        success=True,
+                    )
+                elif report.result == CrossExecutionReport.Result.PARTIAL:
+                    loss = opportunity.trade_size_usdc * 0.10
+                    await self.notifier.send_alert(
+                        "🚨 Cross-Platform Partial Fill",
+                        f"PM: {opportunity.pm_question[:50]}\n"
+                        f"AZ: {opportunity.az_question[:50]}\n"
+                        f"Error: {report.error_message}\n"
+                        f"Estimated Loss: ${loss:.2f}",
+                    )
+                    logger.error("Cross-platform partial fill — pausing bot")
+                    asyncio.create_task(self.stop())
+                    return
+                elif report.result == CrossExecutionReport.Result.SKIPPED and self.dry_run:
+                    logger.info(
+                        "DRY RUN: Simulated cross-platform arb",
+                        pm_q=opportunity.pm_question[:50],
+                        profit=f"{opportunity.net_profit_pct:.2%}",
+                    )
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error("Cross executor loop error", error=str(e))
+
+
 def parse_args() -> argparse.Namespace:
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
-        description="Polymarket Arbitrage Bot",
+        description="Prediction Market Arbitrage Bot (Polymarket + Azuro)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
