@@ -98,6 +98,12 @@ class Settings(BaseSettings):
     )
     alignment_use_llm: bool = Field(False, description="Enable LLM fallback for event alignment")
     llm_api_key: Optional[str] = Field(None, description="LLM API key for alignment fallback")
+    llm_base_url: str = Field(
+        "https://api.openai.com/v1", description="LLM API base URL (OpenAI-compatible)"
+    )
+    llm_model: str = Field(
+        "gpt-4o-mini", description="LLM model name for alignment"
+    )
 
     # Removed validate_private_key as private_key is now optional
 

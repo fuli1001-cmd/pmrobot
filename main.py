@@ -706,6 +706,8 @@ class ArbitrageBot:
         self._market_aligner = MarketAligner(
             use_llm=self.settings.alignment_use_llm,
             llm_api_key=self.settings.llm_api_key or "",
+            llm_base_url=self.settings.llm_base_url,
+            llm_model=self.settings.llm_model,
         )
 
         # Detector and executor

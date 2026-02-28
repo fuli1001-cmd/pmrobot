@@ -410,7 +410,9 @@ python main.py
 | 跨平台利润阈值 | `CROSS_PROFIT_THRESHOLD` | 0.03 (3%) | 跨平台最低利润阈值（高于平台内，因含 Azuro 断腿风险） |
 | 跨平台金额 | `CROSS_TRADE_SIZE` | 50.0 | 跨平台单笔 USDC 金额 |
 | LLM 对齐 | `ALIGNMENT_USE_LLM` | false | 启用 LLM 事件对齐兜底 |
-| LLM Key | `LLM_API_KEY` | — | LLM API Key |
+| LLM Key | `LLM_API_KEY` | — | LLM API Key（支持 OpenAI/DeepSeek 等兼容 API） |
+| LLM URL | `LLM_BASE_URL` | api.openai.com/v1 | LLM API 基础 URL（DeepSeek: `api.deepseek.com/v1`） |
+| LLM 模型 | `LLM_MODEL` | gpt-4o-mini | 模型名称（DeepSeek: `deepseek-chat`） |
 
 ### 利润阈值调优建议
 

@@ -56,9 +56,17 @@ class MarketAligner:
         pairs = aligner.align(pm_markets, az_markets)
     """
 
-    def __init__(self, use_llm: bool = False, llm_api_key: str = ""):
+    def __init__(
+        self,
+        use_llm: bool = False,
+        llm_api_key: str = "",
+        llm_base_url: str = "https://api.openai.com/v1",
+        llm_model: str = "gpt-4o-mini",
+    ):
         self.use_llm = use_llm
         self.llm_api_key = llm_api_key
+        self.llm_base_url = llm_base_url
+        self.llm_model = llm_model
         # Cache: sha256(pm_question + az_question) -> AlignedMarketPair | None
         self._cache: Dict[str, Optional[AlignedMarketPair]] = {}
 
