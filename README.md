@@ -1,8 +1,8 @@
-# Polymarket 套利机器人 (Polymarket Arbitrage Bot)
+# 预测市场套利机器人 (Prediction Market Arbitrage Bot)
 
-全自动化的 Polymarket 预测市场套利机器人。实时监控 Binary（二元）市场和 Negative Risk（负风险）市场，利用价格无效率自动捕获无风险（或接近无风险）利润。支持 Long Arb（买入套利）和 Short Arb（Mint+卖出套利）两种执行路径。
+全自动化的多平台预测市场套利机器人。支持 **Polymarket** 和 **Azuro** 两大平台，实时监控 Binary（二元）市场和 Negative Risk（负风险）市场，利用价格无效率自动捕获无风险（或接近无风险）利润。支持平台内套利（Long / Short / NegRisk）和**跨平台合成套利**（Polymarket vs Azuro）。
 
-> **一句话概括**：当一组互斥结果的价格之和偏离理论值时，通过买入或铸造+卖出来锁定差价利润。
+> **一句话概括**：当一组互斥结果的价格之和偏离理论值时——无论在同一平台内或跨平台——通过买入或铸造+卖出来锁定差价利润。
 
 ---
 
@@ -10,6 +10,7 @@
 
 - [背景知识：什么是预测市场和套利](#-背景知识什么是预测市场和套利)
 - [核心策略详解](#-核心策略详解)
+- [跨平台套利 (Cross-Platform)](#-跨平台套利-cross-platform)
 - [系统架构](#-系统架构)
 - [项目结构](#-项目结构)
 - [快速开始](#-快速开始)
@@ -197,7 +198,38 @@ Other No:   $0.79    ← 买入
    └─ Short Arb → CTF Mint → 并发卖出 Yes + No
 4. Settler → 定期检查持仓 → 找到可合并头寸 → Relayer/EOA Merge → 收回 USDC
 5. Refresher → 定期重新扫描市场 → 动态更新 Monitor 的监控列表
+6. [跨平台] CrossScanner → 拉取两平台市场 → 对齐事件 → 比较价格 → cross_queue
+7. [跨平台] CrossExecutor → 从队列取出 → 并发双腿下单（PM FOK + Azuro LP.bet）
 ```
+
+---
+
+## 🔀 跨平台套利 (Cross-Platform)
+
+### 原理
+
+Polymarket（订单簿 CLOB）和 Azuro（AMM 流动性池）使用完全不同的定价引擎。对于同一体育赛事，两平台的价格可能存在显著差异。
+
+**合成二元对冲：** 在便宜的平台买 YES，在另一个平台买 NO。
+
+```
+事件："曼城 vs 利物浦 — 曼城胜？"
+
+Polymarket: Yes = $0.48 (Best Ask)
+Azuro:      No  = $0.46 (有效价格，含 AMM 价格冲击)
+─────────────────────────
+总成本:     $0.94
+保证收益:   $1.00 - $0.94 = $0.06 (6.4%)
+```
+
+### 关键特点
+
+- **事件对齐：** 使用结构化规则（球队名标准化 + 日期 + 赛事类型）匹配两平台事件
+- **滑点保护：** Polymarket 用 FOK 限价单，Azuro 用 `minOdds` 参数
+- **并发执行：** 双腿同时下单，最大化成交概率
+- **断腿处理：** Polymarket 侧可市价反向平仓；Azuro 侧为 NFT，需持有至结算
+
+> ⚠️ **风险：** Azuro bet 是 NFT 凭证，下注后无法即时退出。跨平台利润阈值默认 3%（高于平台内）以补偿此风险。
 
 ---
 
@@ -205,7 +237,7 @@ Other No:   $0.79    ← 买入
 
 ```
 pmrobot/
-├── main.py                 # 入口：ArbitrageBot 主循环
+├── main.py                 # 入口：ArbitrageBot 主循环（含跨平台编排）
 ├── gen_creds.py            # 辅助脚本：用私钥派生 CLOB API 凭证
 ├── requirements.txt        # Python 依赖
 ├── .env                    # 环境变量配置（需自行创建）
@@ -214,23 +246,32 @@ pmrobot/
 │   ├── settings.py         # Pydantic 配置模型，从 .env 加载
 │   └── constants.py        # 链上地址、API URL、阈值常量
 │
+├── exchanges/              # ★ 统一交易所适配器层
+│   ├── base.py             # BaseExchange ABC + 统一数据模型
+│   ├── polymarket.py       # Polymarket 适配器（CLOB + WebSocket）
+│   └── azuro.py            # Azuro 适配器（GraphQL + LP 合约）
+│
 ├── core/
 │   ├── scanner.py          # 市场扫描（Gamma REST API）
 │   ├── monitor.py          # WebSocket 监控 + 套利检测器
 │   ├── executor.py         # 订单执行引擎（CLOB API）
 │   ├── settler.py          # 持仓结算（Relayer 无 Gas / EOA 直签）
 │   ├── risk.py             # 风险管理器
-│   └── ctf.py              # CTF 合约交互（Mint/Merge）
+│   ├── ctf.py              # CTF 合约交互（Mint/Merge）
+│   ├── alignment.py        # ★ 跨平台事件对齐（结构化规则 + LLM 兜底）
+│   └── cross_platform.py   # ★ 跨平台套利检测器 + 执行控制器
 │
 ├── models/
 │   ├── market.py           # 市场/事件/套利机会数据模型
 │   ├── order.py            # 订单/订单簿/机会数据模型
-│   └── position.py         # 持仓/账户状态数据模型
+│   ├── position.py         # 持仓/账户状态数据模型
+│   └── cross_models.py     # ★ 跨平台套利机会 + 执行报告模型
 │
 ├── utils/
 │   ├── logger.py           # structlog 日志配置
 │   ├── notifier.py         # 通知服务（Telegram / 企业微信）
-│   └── rate_limiter.py     # API 限速器
+│   ├── rate_limiter.py     # API 限速器
+│   └── name_normalizer.py  # ★ 球队/选手名称标准化
 │
 ├── tests/
 │   ├── test_monitor.py     # Monitor 单元测试
@@ -357,6 +398,20 @@ python main.py
 | 刷新间隔 | `MARKET_REFRESH_INTERVAL` | 1800 (30分钟) | 0~86400 | 定期重新扫描新市场/事件。设为 0 禁用。 |
 | API 限速 | `API_RATE_LIMIT` | 10 req/s | 1~100 | Scanner 和 Executor 对 API 的请求速率上限。 |
 
+### Azuro / 跨平台参数
+
+| 参数 | 环境变量 | 默认值 | 说明 |
+|------|----------|--------|------|
+| 启用 Azuro | `AZURO_ENABLED` | false | 启用 Azuro 交易所适配器 |
+| LP 合约地址 | `AZURO_LP_ADDRESS` | — | Azuro LP 合约地址 (Polygon) |
+| Core 合约地址 | `AZURO_CORE_ADDRESS` | — | Azuro Core 合约地址 (Polygon) |
+| Subgraph URL | `AZURO_SUBGRAPH_URL` | (data-feed-polygon) | Azuro 数据子图端点 |
+| 启用跨平台 | `CROSS_PLATFORM_ENABLED` | false | 启用跨平台套利 |
+| 跨平台利润阈值 | `CROSS_PROFIT_THRESHOLD` | 0.03 (3%) | 跨平台最低利润阈值（高于平台内，因含 Azuro 断腿风险） |
+| 跨平台金额 | `CROSS_TRADE_SIZE` | 50.0 | 跨平台单笔 USDC 金额 |
+| LLM 对齐 | `ALIGNMENT_USE_LLM` | false | 启用 LLM 事件对齐兜底 |
+| LLM Key | `LLM_API_KEY` | — | LLM API Key |
+
 ### 利润阈值调优建议
 
 - **保守偏好**：`PROFIT_THRESHOLD=0.015`（1.5%）——只抓大机会，很少交易
@@ -364,6 +419,8 @@ python main.py
 - **激进偏好**：`PROFIT_THRESHOLD=0.003`（0.3%）——频繁交易，利润薄，对延迟敏感
 
 > 对于 NegRisk 市场，利润阈值会根据结果数量动态调整（结果越多，阈值按比例放宽），具体逻辑见 `config/constants.py` 中的 `get_profit_threshold()`。
+> 
+> **跨平台阈值默认 3%**，显著高于平台内，因为 Azuro 下注后生成 NFT 凭证，无法像订单簿一样即时卖出——断腿场景下只能持有至结算。
 
 ---
 
