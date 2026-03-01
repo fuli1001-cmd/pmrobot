@@ -39,7 +39,8 @@ _LLM_CONFIDENCE_THRESHOLD = 0.80
 _LLM_TIMEOUT = 60
 
 # Maximum number of question pairs per LLM batch call.
-_LLM_BATCH_SIZE = 10
+# DeepSeek supports 64K context; 20 pairs ≈ 3K input tokens, well within limits.
+_LLM_BATCH_SIZE = 20
 
 # Maximum gap (seconds) between event start times for a structural match.
 _TIME_TOLERANCE_SECONDS = 6 * 3600  # 6 hours
