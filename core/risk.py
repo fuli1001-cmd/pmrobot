@@ -201,11 +201,15 @@ class RiskManager:
         self.stats.total_trades += 1
         self.stats.last_trade_time = datetime.now()
 
-        # Compatible with both ArbitrageOpportunity (.market) and NegativeRiskArbitrageOpportunity (.event)
+        # Compatible with ArbitrageOpportunity (.market),
+        # NegativeRiskArbitrageOpportunity (.event),
+        # and CrossPlatformOpportunity (.pm_market_id).
         if hasattr(opportunity, 'market'):
             market_id = opportunity.market.condition_id
         elif hasattr(opportunity, 'event'):
             market_id = opportunity.event.event_id
+        elif hasattr(opportunity, 'pm_market_id'):
+            market_id = opportunity.pm_market_id
         else:
             market_id = "unknown"
         self._market_last_trade[market_id] = time.time()
@@ -253,11 +257,15 @@ class RiskManager:
             self._daily_loss += loss_usdc
             self._consecutive_failures += 1
 
-            # Compatible with both ArbitrageOpportunity (.market) and NegativeRiskArbitrageOpportunity (.event)
+            # Compatible with ArbitrageOpportunity (.market),
+            # NegativeRiskArbitrageOpportunity (.event),
+            # and CrossPlatformOpportunity (.pm_question).
             if hasattr(opportunity, 'market'):
                 market_label = opportunity.market.slug[:30]
             elif hasattr(opportunity, 'event'):
                 market_label = opportunity.event.title[:30]
+            elif hasattr(opportunity, 'pm_question'):
+                market_label = f"[CROSS] {opportunity.pm_question[:30]}"
             else:
                 market_label = "unknown"
 

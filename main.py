@@ -785,12 +785,30 @@ class ArbitrageBot:
                 opportunities = await self._cross_detector.scan(pairs)
                 for opp in opportunities:
                     if self.risk_manager.can_trade():
+                        logger.info(
+                            "Cross opportunity detected - queuing for execution",
+                            pm_market=opp.pm_question[:60],
+                            az_market=opp.az_question[:60],
+                            strategy=opp.strategy.value,
+                            yes_on=opp.yes_platform.value,
+                            price_yes=f"{opp.price_yes:.4f}",
+                            price_no=f"{opp.price_no:.4f}",
+                            total_cost=f"{opp.total_cost:.4f}",
+                            net_profit_pct=f"{opp.net_profit_pct:.2%}",
+                            profit_usdc=f"${opp.net_profit_pct * opp.trade_size_usdc:.2f}",
+                            trade_size=f"${opp.trade_size_usdc:.2f}",
+                        )
                         try:
                             self._cross_opportunity_queue.put_nowait(opp)
                         except asyncio.QueueFull:
                             logger.warning("Cross-platform queue full")
                     else:
-                        logger.debug("Cross opportunity rejected by risk manager")
+                        logger.warning(
+                            "Cross opportunity detected but rejected by risk manager",
+                            pm_market=opp.pm_question[:60],
+                            net_profit_pct=f"{opp.net_profit_pct:.2%}",
+                            reason="cooldown or circuit breaker",
+                        )
 
         except Exception as e:
             logger.error("Cross-platform scan cycle error", error=str(e))
@@ -846,10 +864,25 @@ class ArbitrageBot:
                     asyncio.create_task(self.stop())
                     return
                 elif report.result == CrossExecutionReport.Result.SKIPPED and self.dry_run:
+                    est_profit = opportunity.net_profit_pct * opportunity.trade_size_usdc
                     logger.info(
                         "DRY RUN: Simulated cross-platform arb",
-                        pm_q=opportunity.pm_question[:50],
-                        profit=f"{opportunity.net_profit_pct:.2%}",
+                        pm_market=opportunity.pm_question[:60],
+                        az_market=opportunity.az_question[:60],
+                        strategy=opportunity.strategy.value,
+                        yes_on=opportunity.yes_platform.value,
+                        price_yes=f"{opportunity.price_yes:.4f}",
+                        price_no=f"{opportunity.price_no:.4f}",
+                        total_cost=f"{opportunity.total_cost:.4f}",
+                        net_profit_pct=f"{opportunity.net_profit_pct:.2%}",
+                        profit_usdc=f"${est_profit:.2f}",
+                        trade_size=f"${opportunity.trade_size_usdc:.2f}",
+                    )
+                    # Record simulated success for stats tracking
+                    await self.risk_manager.record_success(
+                        opportunity,
+                        est_profit,
+                        is_simulated=True,
                     )
 
             except asyncio.CancelledError:
