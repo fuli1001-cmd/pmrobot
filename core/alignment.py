@@ -8,6 +8,8 @@ Matching strategy (in priority order):
    (sport, date ± tolerance, team_a, team_b).
 2. **LLM semantic fallback** – if rules fail, call an LLM to
    decide whether two questions are logically equivalent.
+   Pairs are **batched** (up to 10 per API call) to minimise
+   token usage and request frequency.
 
 Results are cached by SHA-256 hash of both questions to avoid redundant
 work (and LLM API calls).  The LLM cache is persisted to SQLite so
@@ -34,7 +36,10 @@ logger = get_logger(__name__)
 _LLM_CONFIDENCE_THRESHOLD = 0.80
 
 # httpx timeout for LLM requests (seconds).
-_LLM_TIMEOUT = 30
+_LLM_TIMEOUT = 60
+
+# Maximum number of question pairs per LLM batch call.
+_LLM_BATCH_SIZE = 10
 
 # Maximum gap (seconds) between event start times for a structural match.
 _TIME_TOLERANCE_SECONDS = 6 * 3600  # 6 hours
@@ -53,6 +58,10 @@ class AlignedMarketPair:
     confidence: float = 1.0  # 1.0 for structural, <1.0 for LLM
     match_method: str = "structural"
     matched_at: float = field(default_factory=time.time)
+
+
+# Internal type for an LLM candidate pair.
+_CandidatePair = Tuple[UnifiedMarket, UnifiedMarket, str]  # (pm, az, cache_key)
 
 
 # ---------------------------------------------------------------------------
@@ -149,6 +158,10 @@ class MarketAligner:
     ) -> List[AlignedMarketPair]:
         """Find matching market pairs across the two platforms.
 
+        Two-phase approach:
+          Phase 1 – structural matching (fast, free)
+          Phase 2 – LLM batch fallback (only for unmatched markets)
+
         Args:
             pm_markets: Polymarket markets (sports-filtered).
             az_markets: Azuro markets.
@@ -161,21 +174,284 @@ class MarketAligner:
         # Build lookup index for Azuro markets by normalised team pair
         az_index = self._build_team_index(az_markets)
 
+        # ── Phase 1: Structural matching ──
+        unmatched_pms: List[UnifiedMarket] = []
         for pm in pm_markets:
-            pair = await self._match_one(pm, az_markets, az_index)
+            pair = self._structural_match(pm, az_markets, az_index)
             if pair:
                 pairs.append(pair)
+            else:
+                unmatched_pms.append(pm)
+
+        # ── Phase 2: LLM batch fallback ──
+        if self.use_llm and self.llm_api_key and unmatched_pms:
+            llm_pairs = await self._llm_batch_match(unmatched_pms, az_markets)
+            pairs.extend(llm_pairs)
 
         logger.info(
             "Market alignment complete",
             pm_count=len(pm_markets),
             az_count=len(az_markets),
-            matched=len(pairs),
+            structural=len(pairs) - len([p for p in pairs if p.match_method == "llm"]),
+            llm=len([p for p in pairs if p.match_method == "llm"]),
+            total_matched=len(pairs),
         )
         return pairs
 
     # ------------------------------------------------------------------
-    # Internal
+    # Phase 1: Structural matching
+    # ------------------------------------------------------------------
+
+    def _structural_match(
+        self,
+        pm: UnifiedMarket,
+        az_markets: List[UnifiedMarket],
+        az_index: Dict[str, List[UnifiedMarket]],
+    ) -> Optional[AlignedMarketPair]:
+        """Try to match via cache hit or structural rules (no LLM)."""
+
+        # Check in-memory cache first
+        for az in az_markets:
+            cache_key = self._cache_key(pm.question, az.question)
+            if cache_key in self._cache:
+                return self._cache[cache_key]
+
+        # Structural match via team-pair index
+        pm_key = self._team_pair_key(pm.team_a, pm.team_b)
+        if not pm_key:
+            pm_key = self._extract_team_pair_from_question(pm.question)
+
+        if not pm_key:
+            return None
+
+        candidates = az_index.get(pm_key, [])
+        for az in candidates:
+            if self._times_close(pm.start_time, az.start_time):
+                pair = AlignedMarketPair(
+                    polymarket=pm, azuro=az,
+                    confidence=1.0, match_method="structural",
+                )
+                self._cache[self._cache_key(pm.question, az.question)] = pair
+                logger.debug(
+                    "Structural match found",
+                    pm_q=pm.question[:60],
+                    az_q=az.question[:60],
+                )
+                return pair
+        return None
+
+    # ------------------------------------------------------------------
+    # Phase 2: LLM batch matching
+    # ------------------------------------------------------------------
+
+    async def _llm_batch_match(
+        self,
+        unmatched_pms: List[UnifiedMarket],
+        az_markets: List[UnifiedMarket],
+    ) -> List[AlignedMarketPair]:
+        """Collect candidate pairs, check persistent cache, then batch-call LLM.
+
+        Returns matched pairs found via LLM.
+        """
+        pairs: List[AlignedMarketPair] = []
+        # Already matched AZ market_ids (avoid double-matching)
+        matched_az_ids: set = set()
+
+        # Collect candidates that need LLM judgment
+        candidates: List[_CandidatePair] = []
+        for pm in unmatched_pms:
+            for az in az_markets:
+                if az.market_id in matched_az_ids:
+                    continue
+                if not self._times_close(pm.start_time, az.start_time):
+                    continue
+
+                cache_key = self._cache_key(pm.question, az.question)
+
+                # Check persistent LLM cache first
+                if cache_key in self._llm_cache:
+                    is_match, confidence = self._llm_cache[cache_key]
+                    if is_match:
+                        pair = AlignedMarketPair(
+                            polymarket=pm, azuro=az,
+                            confidence=confidence, match_method="llm",
+                        )
+                        self._cache[cache_key] = pair
+                        pairs.append(pair)
+                        matched_az_ids.add(az.market_id)
+                        break  # This PM is matched, move to next
+                    continue  # Cached negative, skip
+
+                candidates.append((pm, az, cache_key))
+
+        if not candidates:
+            return pairs
+
+        logger.info(
+            "LLM batch alignment starting",
+            candidate_pairs=len(candidates),
+            batches=(len(candidates) + _LLM_BATCH_SIZE - 1) // _LLM_BATCH_SIZE,
+        )
+
+        # Process in batches
+        for i in range(0, len(candidates), _LLM_BATCH_SIZE):
+            batch = candidates[i : i + _LLM_BATCH_SIZE]
+
+            # Skip pairs whose PM or AZ was already matched in a prior batch
+            active_batch: List[_CandidatePair] = []
+            for pm, az, ck in batch:
+                if az.market_id in matched_az_ids:
+                    continue
+                # Check if this PM already matched (via an earlier batch)
+                if any(p.polymarket.market_id == pm.market_id for p in pairs):
+                    continue
+                active_batch.append((pm, az, ck))
+
+            if not active_batch:
+                continue
+
+            results = await self._llm_judge_batch(active_batch)
+
+            for (pm, az, cache_key), (is_match, confidence) in zip(
+                active_batch, results
+            ):
+                self._persist_llm_result(cache_key, is_match, confidence)
+                if is_match and az.market_id not in matched_az_ids:
+                    pair = AlignedMarketPair(
+                        polymarket=pm, azuro=az,
+                        confidence=confidence, match_method="llm",
+                    )
+                    self._cache[cache_key] = pair
+                    pairs.append(pair)
+                    matched_az_ids.add(az.market_id)
+                    logger.info(
+                        "LLM match found",
+                        pm_q=pm.question[:60],
+                        az_q=az.question[:60],
+                        confidence=f"{confidence:.2f}",
+                    )
+
+        return pairs
+
+    # ------------------------------------------------------------------
+    # LLM integration
+    # ------------------------------------------------------------------
+
+    async def _llm_judge_batch(
+        self, batch: List[_CandidatePair]
+    ) -> List[Tuple[bool, float]]:
+        """Judge multiple question pairs in a single LLM call.
+
+        Args:
+            batch: Up to _LLM_BATCH_SIZE candidate pairs.
+
+        Returns:
+            A list of (is_match, confidence) tuples, one per input pair.
+            On failure returns (False, 0.0) for every pair.
+        """
+        n = len(batch)
+        fail_results: List[Tuple[bool, float]] = [(False, 0.0)] * n
+
+        # Build the batch prompt
+        pair_lines: List[str] = []
+        for idx, (pm, az, _) in enumerate(batch, 1):
+            pair_lines.append(
+                f"Pair {idx}:\n"
+                f"  A (Polymarket): {pm.question}\n"
+                f"  B (Azuro):      {az.question}"
+            )
+
+        system_prompt = (
+            "You are a prediction-market event matcher. Given MULTIPLE pairs "
+            "of questions from different platforms, determine for EACH pair "
+            "whether they refer to the SAME real-world event and the SAME "
+            "outcome direction.\n\n"
+            "Respond with ONLY a JSON array (no markdown fences):\n"
+            '[{"pair":1,"match":true/false,"confidence":0.0-1.0,"reason":"..."},...]'
+        )
+        user_prompt = (
+            "Judge the following pairs:\n\n"
+            + "\n\n".join(pair_lines)
+        )
+
+        url = f"{self.llm_base_url}/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {self.llm_api_key}",
+            "Content-Type": "application/json",
+        }
+        # ~60 tokens per pair result
+        max_tokens = max(200, n * 80)
+        payload = {
+            "model": self.llm_model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": 0.0,
+            "max_tokens": max_tokens,
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=_LLM_TIMEOUT) as client:
+                resp = await client.post(url, json=payload, headers=headers)
+                resp.raise_for_status()
+
+            data = resp.json()
+            content = data["choices"][0]["message"]["content"].strip()
+
+            # Strip markdown fences if present
+            if content.startswith("```"):
+                content = content.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+
+            items = json.loads(content)
+            if not isinstance(items, list):
+                items = [items]
+
+            # Build result list indexed by pair number
+            result_map: Dict[int, Tuple[bool, float]] = {}
+            for item in items:
+                pair_idx = int(item.get("pair", 0))
+                is_match = bool(item.get("match", False))
+                conf = float(item.get("confidence", 0.0))
+                reason = item.get("reason", "")
+                effective_conf = conf if (is_match and conf >= _LLM_CONFIDENCE_THRESHOLD) else 0.0
+                result_map[pair_idx] = (effective_conf > 0, effective_conf)
+                logger.debug(
+                    "LLM batch judgement",
+                    pair=pair_idx,
+                    match=is_match,
+                    confidence=f"{conf:.2f}",
+                    reason=reason[:60],
+                )
+
+            # Map back to ordered results
+            results: List[Tuple[bool, float]] = []
+            for idx in range(1, n + 1):
+                results.append(result_map.get(idx, (False, 0.0)))
+
+            logger.info(
+                "LLM batch complete",
+                pairs=n,
+                matches=sum(1 for m, _ in results if m),
+            )
+            return results
+
+        except httpx.HTTPStatusError as e:
+            logger.warning(
+                "LLM API HTTP error",
+                status=e.response.status_code,
+                detail=e.response.text[:200],
+            )
+            return fail_results
+        except (json.JSONDecodeError, KeyError, ValueError) as e:
+            logger.warning("LLM batch response parse error", error=str(e))
+            return fail_results
+        except Exception as e:
+            logger.warning("LLM batch call failed", error=str(e))
+            return fail_results
+
+    # ------------------------------------------------------------------
+    # Helpers
     # ------------------------------------------------------------------
 
     def _build_team_index(
@@ -202,183 +478,6 @@ class MarketAligner:
             return None
         parts = sorted([na, nb])
         return f"{parts[0]}|{parts[1]}"
-
-    async def _match_one(
-        self,
-        pm: UnifiedMarket,
-        az_markets: List[UnifiedMarket],
-        az_index: Dict[str, List[UnifiedMarket]],
-    ) -> Optional[AlignedMarketPair]:
-        """Try to match a Polymarket market to an Azuro market.
-
-        Priority: cache → structural rules → LLM fallback.
-        """
-
-        # ── Step 1: Check in-memory cache ──
-        for az in az_markets:
-            cache_key = self._cache_key(pm.question, az.question)
-            if cache_key in self._cache:
-                return self._cache[cache_key]
-
-        # ── Step 2: Structural match via team-pair index ──
-        pm_key = self._team_pair_key(pm.team_a, pm.team_b)
-
-        # If Polymarket doesn't have structured team names, try to
-        # extract them from the question text
-        if not pm_key:
-            pm_key = self._extract_team_pair_from_question(pm.question)
-
-        if pm_key:
-            candidates = az_index.get(pm_key, [])
-            for az in candidates:
-                # Check time proximity
-                if self._times_close(pm.start_time, az.start_time):
-                    pair = AlignedMarketPair(
-                        polymarket=pm,
-                        azuro=az,
-                        confidence=1.0,
-                        match_method="structural",
-                    )
-                    self._cache[self._cache_key(pm.question, az.question)] = pair
-                    logger.debug(
-                        "Structural match found",
-                        pm_q=pm.question[:60],
-                        az_q=az.question[:60],
-                    )
-                    return pair
-
-        # ── Step 3: LLM semantic fallback ──
-        if not self.use_llm or not self.llm_api_key:
-            return None
-
-        for az in az_markets:
-            # Skip if time difference is too large (even LLM can't fix that)
-            if not self._times_close(pm.start_time, az.start_time):
-                continue
-
-            cache_key = self._cache_key(pm.question, az.question)
-
-            # Check persistent LLM cache first
-            if cache_key in self._llm_cache:
-                is_match, confidence = self._llm_cache[cache_key]
-                if is_match:
-                    pair = AlignedMarketPair(
-                        polymarket=pm,
-                        azuro=az,
-                        confidence=confidence,
-                        match_method="llm",
-                    )
-                    self._cache[cache_key] = pair
-                    return pair
-                # Cached negative — skip this pair
-                continue
-
-            # Call LLM
-            result = await self._llm_judge(pm.question, az.question)
-
-            if result is not None:
-                is_match = result >= _LLM_CONFIDENCE_THRESHOLD
-                self._persist_llm_result(cache_key, is_match, result)
-
-                if is_match:
-                    pair = AlignedMarketPair(
-                        polymarket=pm,
-                        azuro=az,
-                        confidence=result,
-                        match_method="llm",
-                    )
-                    self._cache[cache_key] = pair
-                    logger.info(
-                        "LLM match found",
-                        pm_q=pm.question[:60],
-                        az_q=az.question[:60],
-                        confidence=f"{result:.2f}",
-                    )
-                    return pair
-
-        return None
-
-    # ------------------------------------------------------------------
-    # LLM integration
-    # ------------------------------------------------------------------
-
-    async def _llm_judge(self, q1: str, q2: str) -> Optional[float]:
-        """Ask the LLM whether two prediction-market questions are equivalent.
-
-        Returns a confidence score in [0, 1], or None on failure.
-        Uses the OpenAI-compatible chat-completions endpoint.
-        """
-        system_prompt = (
-            "You are a prediction-market event matcher.  Given two questions "
-            "from different platforms, determine whether they refer to the "
-            "SAME real-world event and the SAME outcome direction.\n\n"
-            "Respond with ONLY a JSON object: "
-            '{"match": true/false, "confidence": 0.0-1.0, "reason": "..."}\n'
-            "Do NOT include anything outside the JSON."
-        )
-        user_prompt = (
-            f"Question A (Polymarket): {q1}\n"
-            f"Question B (Azuro):      {q2}\n\n"
-            "Are these about the same event and outcome?"
-        )
-
-        url = f"{self.llm_base_url}/chat/completions"
-        headers = {
-            "Authorization": f"Bearer {self.llm_api_key}",
-            "Content-Type": "application/json",
-        }
-        payload = {
-            "model": self.llm_model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            "temperature": 0.0,
-            "max_tokens": 200,
-        }
-
-        try:
-            async with httpx.AsyncClient(timeout=_LLM_TIMEOUT) as client:
-                resp = await client.post(url, json=payload, headers=headers)
-                resp.raise_for_status()
-
-            data = resp.json()
-            content = data["choices"][0]["message"]["content"].strip()
-
-            # Parse the JSON response
-            # Strip markdown fences if present
-            if content.startswith("```"):
-                content = content.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
-
-            result = json.loads(content)
-            confidence = float(result.get("confidence", 0.0))
-            is_match = bool(result.get("match", False))
-            reason = result.get("reason", "")
-
-            logger.debug(
-                "LLM alignment judgement",
-                q1=q1[:50],
-                q2=q2[:50],
-                match=is_match,
-                confidence=f"{confidence:.2f}",
-                reason=reason[:80],
-            )
-
-            return confidence if is_match else 0.0
-
-        except httpx.HTTPStatusError as e:
-            logger.warning(
-                "LLM API HTTP error",
-                status=e.response.status_code,
-                detail=e.response.text[:200],
-            )
-            return None
-        except (json.JSONDecodeError, KeyError, ValueError) as e:
-            logger.warning("LLM response parse error", error=str(e))
-            return None
-        except Exception as e:
-            logger.warning("LLM call failed", error=str(e))
-            return None
 
     def _extract_team_pair_from_question(self, question: str) -> Optional[str]:
         """Best-effort extraction of team names from a question string.
