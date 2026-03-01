@@ -96,6 +96,9 @@ class Settings(BaseSettings):
     cross_trade_size: float = Field(
         50.0, ge=5.0, le=5000.0, description="Cross-platform trade size in USDC"
     )
+    cross_scan_interval: int = Field(
+        180, ge=30, le=3600, description="Cross-platform scan interval in seconds (default 3 min)"
+    )
     alignment_use_llm: bool = Field(False, description="Enable LLM fallback for event alignment")
     llm_api_key: Optional[str] = Field(None, description="LLM API key for alignment fallback")
     llm_base_url: str = Field(

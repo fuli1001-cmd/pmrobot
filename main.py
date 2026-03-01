@@ -731,7 +731,7 @@ class ArbitrageBot:
 
     async def _run_cross_platform_scanner(self) -> None:
         """Periodically scan for cross-platform arbitrage opportunities."""
-        scan_interval = 60  # Check every 60 seconds
+        scan_interval = self.settings.cross_scan_interval
 
         while self._running:
             try:
