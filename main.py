@@ -749,7 +749,7 @@ class ArbitrageBot:
                     continue
 
                 # Align markets
-                pairs = self._market_aligner.align(pm_markets, az_markets)
+                pairs = await self._market_aligner.align(pm_markets, az_markets)
 
                 if pairs:
                     # Scan for opportunities

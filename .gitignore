@@ -51,6 +51,9 @@ logs/
 *.log
 log.txt
 
+# Data (runtime caches)
+data/
+
 # OS
 .DS_Store
 Thumbs.db
