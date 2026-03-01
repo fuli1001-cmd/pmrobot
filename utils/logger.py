@@ -63,6 +63,16 @@ def setup_logging(
     root_logger.setLevel(getattr(logging, level.upper()))
     root_logger.handlers = []  # Clear existing handlers
 
+    # Suppress noisy third-party loggers (they flood DEBUG with HTTP/2 internals)
+    _noisy_loggers = [
+        "httpcore", "httpcore.connection", "httpcore.http11",
+        "httpcore.http2", "httpcore.proxy",
+        "hpack", "hpack.hpack", "hpack.table",
+        "httpx", "websockets", "web3", "urllib3",
+    ]
+    for name in _noisy_loggers:
+        logging.getLogger(name).setLevel(logging.WARNING)
+
     # Add console handler
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setFormatter(console_formatter)

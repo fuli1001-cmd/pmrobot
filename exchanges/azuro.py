@@ -97,7 +97,6 @@ GAMES_QUERY = """
 query ActiveGames($sport: String, $startsAt_gt: BigInt!) {
   games(
     where: {
-      status: Created
       startsAt_gt: $startsAt_gt
       sport_: { name_contains_nocase: $sport }
     }

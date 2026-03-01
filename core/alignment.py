@@ -42,6 +42,10 @@ _LLM_TIMEOUT = 60
 # DeepSeek supports 64K context; 20 pairs ≈ 3K input tokens, well within limits.
 _LLM_BATCH_SIZE = 20
 
+# Safety cap: maximum candidate pairs to send to LLM in one alignment run.
+# Prevents runaway costs when the Cartesian product is huge.
+_MAX_LLM_CANDIDATES = 1000
+
 # Maximum gap (seconds) between event start times for a structural match.
 _TIME_TOLERANCE_SECONDS = 6 * 3600  # 6 hours
 
@@ -287,6 +291,15 @@ class MarketAligner:
 
         if not candidates:
             return pairs
+
+        # Cap candidates to prevent runaway LLM costs
+        if len(candidates) > _MAX_LLM_CANDIDATES:
+            logger.warning(
+                "LLM candidate pairs exceed safety cap – truncating",
+                total=len(candidates),
+                cap=_MAX_LLM_CANDIDATES,
+            )
+            candidates = candidates[:_MAX_LLM_CANDIDATES]
 
         logger.info(
             "LLM batch alignment starting",

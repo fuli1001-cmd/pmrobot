@@ -753,19 +753,22 @@ class ArbitrageBot:
     ) -> None:
         """Run one cross-platform alignment + detection cycle.
 
-        Args:
-            pm_raw_markets: Pre-fetched Polymarket ``Market`` objects.
-                If *None* (first-run), fetches via ``PolymarketExchange``.
+        Polymarket's markets API does not expose tags, so we always use the
+        dedicated Events-API path (``tag_slug=sports``) to obtain sports
+        markets.  The optional *pm_raw_markets* pre-fetched list is only
+        used to warm the internal cache (for pricing look-ups) — it is NOT
+        used as the source for alignment because non-sports markets would
+        dilute the results and waste LLM alignment tokens.
         """
         try:
-            # ── Polymarket sports markets ──
+            # ── Cache warm (if the refresher already pulled all markets) ──
             if pm_raw_markets is not None:
-                pm_markets = self._pm_exchange.update_cache(
-                    pm_raw_markets, sport="sports",
-                )
-            else:
-                # First-run fallback: no cached data yet
-                pm_markets = await self._pm_exchange.get_markets(sport="sports")
+                self._pm_exchange.update_cache(pm_raw_markets)
+
+            # ── Polymarket sports markets (Events API, tag_slug=soccer) ──
+            # Azuro currently fetches football (soccer), so we narrow PM
+            # to soccer to avoid wasting LLM alignment tokens on NBA/NHL/etc.
+            pm_markets = await self._pm_exchange.get_markets(sport="soccer")
 
             # ── Azuro markets (always a fresh subgraph query) ──
             az_markets = await self._az_exchange.get_markets(sport="football")

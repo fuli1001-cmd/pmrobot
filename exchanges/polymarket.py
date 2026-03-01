@@ -76,8 +76,13 @@ class PolymarketExchange(BaseExchange):
     async def get_markets(self, sport: Optional[str] = None) -> List[UnifiedMarket]:
         """Fetch active Polymarket markets.
 
+        When *sport* is provided the Events API (``tag_slug=<sport>``) is
+        used because the markets endpoint does not expose tags.
+
         Args:
-            sport: If provided, only return markets tagged with this sport.
+            sport: If provided, queries the Events API with this value as
+                   ``tag_slug`` (e.g. ``"sports"``, ``"soccer"``, ``"nba"``).
+                   If *None*, falls back to the general markets endpoint.
 
         Returns:
             List of UnifiedMarket.
@@ -85,14 +90,14 @@ class PolymarketExchange(BaseExchange):
         if not self._scanner:
             return []
 
-        raw_markets = await self._scanner.fetch_all_markets(fee_free_only=True)
+        # Use the dedicated Events-API path for sport-tagged markets
+        if sport:
+            raw_markets = await self._scanner.fetch_sports_markets(tag_slug=sport)
+        else:
+            raw_markets = await self._scanner.fetch_all_markets(fee_free_only=True)
 
         results: List[UnifiedMarket] = []
         for m in raw_markets:
-            # Optional sport filter
-            if sport and sport.lower() not in [t.lower() for t in m.tags]:
-                continue
-
             um = _to_unified_market(m)
             results.append(um)
             self._markets_cache[m.condition_id] = m
@@ -251,20 +256,18 @@ class PolymarketExchange(BaseExchange):
         """Populate internal cache from externally-fetched Market objects.
 
         Use this when another component (e.g. market refresher) has already
-        fetched the full market list and we want to avoid a redundant API call.
+        fetched the full market list and we want to warm the pricing cache.
 
         Args:
             raw_markets: Polymarket ``Market`` objects.
-            sport: If provided, only include markets whose *tags* contain
-                   this value (case-insensitive).
+            sport: Ignored (kept for API compat).  Sport filtering is now
+                   handled at the Events-API level.
 
         Returns:
             Corresponding ``UnifiedMarket`` list.
         """
         results: List[UnifiedMarket] = []
         for m in raw_markets:
-            if sport and sport.lower() not in [t.lower() for t in m.tags]:
-                continue
             self._markets_cache[m.condition_id] = m
             results.append(_to_unified_market(m))
         return results
@@ -284,12 +287,33 @@ class PolymarketExchange(BaseExchange):
 # ---------------------------------------------------------------------------
 
 
+# All tags that indicate a sports market.  When the caller passes
+# sport="sports" we match against *any* of these, not just the literal.
+SPORTS_TAGS = frozenset([
+    "sports", "football", "basketball", "baseball",
+    "hockey", "tennis", "soccer", "mma", "boxing",
+    "cricket", "rugby", "golf", "motorsport", "nfl",
+    "nba", "mlb", "nhl", "epl", "formula-1",
+])
+
+
+def _matches_sport(tags: list, sport: str) -> bool:
+    """Return True if *tags* indicate a sports market.
+
+    When ``sport`` is ``"sports"`` we match against the full SPORTS_TAGS set.
+    Otherwise we match the single requested sport exactly.
+    """
+    lower_tags = {t.lower() for t in tags}
+    if sport.lower() == "sports":
+        return bool(lower_tags & SPORTS_TAGS)
+    return sport.lower() in lower_tags
+
+
 def _to_unified_market(m: Market) -> UnifiedMarket:
     """Convert a Polymarket Market to UnifiedMarket."""
     sport = ""
     for tag in m.tags:
-        if tag.lower() in ("sports", "football", "basketball", "baseball",
-                           "hockey", "tennis", "soccer", "mma", "boxing"):
+        if tag.lower() in SPORTS_TAGS:
             sport = tag.lower()
             break
 

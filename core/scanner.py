@@ -267,6 +267,75 @@ class MarketScanner:
         # Default to free (most markets are fee-free)
         return FeeCategory.FREE
 
+    # ------------------------------------------------------------------
+    # Sports-specific fetch (Events API with tag_slug)
+    # ------------------------------------------------------------------
+
+    async def fetch_sports_markets(
+        self,
+        tag_slug: str = "sports",
+        max_events: int = 100,
+    ) -> List[Market]:
+        """Fetch active sports markets via the **Events** API.
+
+        The Gamma *markets* endpoint does not expose tags.  Tags exist only
+        at the event level, so we query ``/events?tag_slug=<tag>`` and
+        extract the markets embedded in each event.
+
+        Args:
+            tag_slug: Tag slug to filter events (default ``"sports"``).
+            max_events: Maximum events to page through.
+
+        Returns:
+            De-duplicated list of ``Market`` objects for sports events.
+        """
+        seen: Set[str] = set()
+        all_markets: List[Market] = []
+        offset = 0
+        limit = 50
+
+        while len(all_markets) < 2000 and offset < max_events:
+            await self.rate_limiter.acquire()
+            try:
+                response = await self._client.get(
+                    f"{self.base_url}/events",
+                    params={
+                        "active": "true",
+                        "closed": "false",
+                        "tag_slug": tag_slug,
+                        "limit": str(limit),
+                        "offset": str(offset),
+                    },
+                )
+                response.raise_for_status()
+                data = response.json()
+                if not data:
+                    break
+
+                for event_data in data:
+                    for mkt_data in event_data.get("markets", []):
+                        cid = mkt_data.get("conditionId", "")
+                        if cid and cid not in seen:
+                            m = self._parse_market(mkt_data)
+                            if m:
+                                seen.add(cid)
+                                all_markets.append(m)
+
+                offset += limit
+                if len(data) < limit:
+                    break
+
+            except httpx.HTTPError as e:
+                logger.error("Failed to fetch sports events", error=str(e))
+                break
+
+        logger.info(
+            "Fetched sports markets via Events API",
+            tag_slug=tag_slug,
+            total=len(all_markets),
+        )
+        return all_markets
+
     async def fetch_negative_risk_events(
         self,
         min_outcomes: int = 2,
