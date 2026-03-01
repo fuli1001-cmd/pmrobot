@@ -85,7 +85,7 @@ class PolymarketExchange(BaseExchange):
         if not self._scanner:
             return []
 
-        raw_markets = await self._scanner.fetch_all_markets(fee_free_only=False)
+        raw_markets = await self._scanner.fetch_all_markets(fee_free_only=True)
 
         results: List[UnifiedMarket] = []
         for m in raw_markets:

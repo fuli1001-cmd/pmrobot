@@ -114,7 +114,6 @@ query ActiveGames($sport: String, $startsAt_gt: BigInt!) {
     participants { name sortOrder }
     conditions(where: { isExpressForbidden: false }) {
       conditionId
-      status
       outcomes {
         outcomeId
         currentOdds
@@ -130,7 +129,6 @@ ODDS_QUERY = """
 query ConditionOdds($conditionId: BigInt!) {
   conditions(where: { conditionId: $conditionId }) {
     conditionId
-    status
     outcomes {
       outcomeId
       currentOdds
@@ -283,10 +281,11 @@ class AzuroExchange(BaseExchange):
             if not conditions:
                 return None
 
-            # Find the first active binary condition (2 outcomes)
+            # Find the first active binary condition (2 outcomes, not yet resolved)
             binary_cond = None
             for c in conditions:
-                if c.get("status") == "Created" and len(c.get("outcomes", [])) == 2:
+                won = c.get("wonOutcomeIds") or []
+                if len(won) == 0 and len(c.get("outcomes", [])) == 2:
                     binary_cond = c
                     break
 
