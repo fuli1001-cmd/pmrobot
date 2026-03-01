@@ -245,6 +245,30 @@ class PolymarketExchange(BaseExchange):
     # Internal helpers
     # ------------------------------------------------------------------
 
+    def update_cache(
+        self, raw_markets: List[Market], sport: Optional[str] = None
+    ) -> List[UnifiedMarket]:
+        """Populate internal cache from externally-fetched Market objects.
+
+        Use this when another component (e.g. market refresher) has already
+        fetched the full market list and we want to avoid a redundant API call.
+
+        Args:
+            raw_markets: Polymarket ``Market`` objects.
+            sport: If provided, only include markets whose *tags* contain
+                   this value (case-insensitive).
+
+        Returns:
+            Corresponding ``UnifiedMarket`` list.
+        """
+        results: List[UnifiedMarket] = []
+        for m in raw_markets:
+            if sport and sport.lower() not in [t.lower() for t in m.tags]:
+                continue
+            self._markets_cache[m.condition_id] = m
+            results.append(_to_unified_market(m))
+        return results
+
     @property
     def order_book_manager(self) -> OrderBookManager:
         """Expose order book manager for Monitor to update."""

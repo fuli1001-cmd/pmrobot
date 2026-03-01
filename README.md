@@ -381,7 +381,7 @@ PROFIT_THRESHOLD=0.008          # 最低利润阈值 (0.8%)
 SINGLE_TRADE_SIZE=100           # 单笔交易金额 (USDC)
 MAX_SLIPPAGE=0.002              # 最大滑点 (0.2%)
 MERGE_INTERVAL=600              # 自动合并间隔 (秒)
-MARKET_REFRESH_INTERVAL=1800    # 市场重新扫描间隔 (秒，0=禁用)
+MARKET_REFRESH_INTERVAL=1800    # 全量市场刷新 + 跨平台扫描间隔 (秒，0=禁用)
 
 # 通知 —— 两者均可配置，将同时发送
 TELEGRAM_BOT_TOKEN=123456:ABC-DEF

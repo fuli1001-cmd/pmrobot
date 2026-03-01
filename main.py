@@ -152,11 +152,10 @@ class ArbitrageBot:
                 self._run_market_refresher(),
             ]
 
-            # Add cross-platform tasks if enabled
+            # Add cross-platform executor (scanner merged into refresher)
             if self._cross_detector and self._cross_executor:
-                tasks.append(self._run_cross_platform_scanner())
                 tasks.append(self._run_cross_platform_executor())
-                logger.info("Cross-platform arbitrage tasks added")
+                logger.info("Cross-platform executor task added (scanner merged into refresher)")
 
             await asyncio.gather(*tasks)
 
@@ -619,7 +618,10 @@ class ArbitrageBot:
 
     async def _run_market_refresher(self) -> None:
         """
-        Periodically re-scan markets to capture new opportunities.
+        Periodically re-scan Polymarket markets (Binary + NegRisk) and,
+        when cross-platform mode is enabled, also run the alignment /
+        detection pipeline.  A single ``MARKET_REFRESH_INTERVAL`` controls
+        both jobs so that the Gamma API is only called **once** per cycle.
         """
         interval = self.settings.market_refresh_interval
         if interval <= 0:
@@ -628,34 +630,43 @@ class ArbitrageBot:
 
         logger.info(f"Market refresher started (interval={interval}s)")
 
+        # ── Initial cross-platform scan (runs once before the sleep loop
+        #    so that cross-platform detection starts immediately) ──
+        if self._cross_detector:
+            await self._cross_platform_scan_cycle()
+
         while self._running:
             try:
                 await asyncio.sleep(interval)
-                
+
                 logger.info("Refreshing markets...")
 
                 min_liquidity = self.settings.single_trade_size * 2
 
                 async with MarketScanner(rate_limit=self.settings.api_rate_limit) as scanner:
-                    # 1. Scan for new Binary markets
-                    new_binary = await scanner.fetch_all_markets(
-                        fee_free_only=True,
-                        max_markets=1000,
+                    # Fetch ALL active markets in one pass (including sports /
+                    # non-fee-free) so the cross-platform pipeline can reuse them.
+                    all_markets = await scanner.fetch_all_markets(
+                        fee_free_only=False,
+                        max_markets=2000,
                     )
-                    # 2. Scan for new Negative Risk events
+                    # Negative Risk events (separate endpoint)
                     new_events = await scanner.fetch_negative_risk_events(
                         min_outcomes=3,
                         max_events=100,
                     )
 
-                # --- Binary markets ---
-                tradeable_binary = [m for m in new_binary if m.liquidity >= min_liquidity]
+                # --- Binary markets (fee-free only) ---
+                tradeable_binary = [
+                    m for m in all_markets
+                    if m.is_fee_free and m.liquidity >= min_liquidity
+                ]
                 if tradeable_binary and self.monitor and hasattr(self.monitor, 'update_markets'):
                     await self.monitor.update_markets(tradeable_binary)
 
                 # --- Negative Risk events ---
                 tradeable_events = [e for e in new_events if e.liquidity >= min_liquidity]
-                
+
                 if tradeable_events and self.neg_risk_monitor and hasattr(self.neg_risk_monitor, 'update_events'):
                     await self.neg_risk_monitor.update_events(tradeable_events)
 
@@ -667,11 +678,15 @@ class ArbitrageBot:
                         self._neg_risk_events.append(event)
                         current_ids.add(event.event_id)
                         new_count += 1
-                
+
                 if new_count > 0:
-                     logger.info("Bot state updated with new events", count=new_count)
+                    logger.info("Bot state updated with new events", count=new_count)
                 else:
-                     logger.debug("Refresher: No new events found")
+                    logger.debug("Refresher: No new events found")
+
+                # --- Cross-platform scan (reuse all_markets) ---
+                if self._cross_detector and self._pm_exchange:
+                    await self._cross_platform_scan_cycle(all_markets)
 
             except asyncio.CancelledError:
                 break
@@ -729,48 +744,52 @@ class ArbitrageBot:
             trade_size=f"${self.settings.cross_trade_size:.2f}",
         )
 
-    async def _run_cross_platform_scanner(self) -> None:
-        """Periodically scan for cross-platform arbitrage opportunities."""
-        scan_interval = self.settings.cross_scan_interval
+    async def _cross_platform_scan_cycle(
+        self, pm_raw_markets: list = None,
+    ) -> None:
+        """Run one cross-platform alignment + detection cycle.
 
-        while self._running:
-            try:
-                # Fetch sports markets from both platforms
+        Args:
+            pm_raw_markets: Pre-fetched Polymarket ``Market`` objects.
+                If *None* (first-run), fetches via ``PolymarketExchange``.
+        """
+        try:
+            # ── Polymarket sports markets ──
+            if pm_raw_markets is not None:
+                pm_markets = self._pm_exchange.update_cache(
+                    pm_raw_markets, sport="sports",
+                )
+            else:
+                # First-run fallback: no cached data yet
                 pm_markets = await self._pm_exchange.get_markets(sport="sports")
-                az_markets = await self._az_exchange.get_markets(sport="football")
 
-                if not pm_markets or not az_markets:
-                    logger.debug(
-                        "Cross-scan: insufficient markets",
-                        pm=len(pm_markets),
-                        az=len(az_markets),
-                    )
-                    await asyncio.sleep(scan_interval)
-                    continue
+            # ── Azuro markets (always a fresh subgraph query) ──
+            az_markets = await self._az_exchange.get_markets(sport="football")
 
-                # Align markets
-                pairs = await self._market_aligner.align(pm_markets, az_markets)
+            if not pm_markets or not az_markets:
+                logger.debug(
+                    "Cross-scan: insufficient markets",
+                    pm=len(pm_markets) if pm_markets else 0,
+                    az=len(az_markets) if az_markets else 0,
+                )
+                return
 
-                if pairs:
-                    # Scan for opportunities
-                    opportunities = await self._cross_detector.scan(pairs)
+            # Align
+            pairs = await self._market_aligner.align(pm_markets, az_markets)
 
-                    for opp in opportunities:
-                        if self.risk_manager.can_trade():
-                            try:
-                                self._cross_opportunity_queue.put_nowait(opp)
-                            except asyncio.QueueFull:
-                                logger.warning("Cross-platform queue full")
-                        else:
-                            logger.debug("Cross opportunity rejected by risk manager")
+            if pairs:
+                opportunities = await self._cross_detector.scan(pairs)
+                for opp in opportunities:
+                    if self.risk_manager.can_trade():
+                        try:
+                            self._cross_opportunity_queue.put_nowait(opp)
+                        except asyncio.QueueFull:
+                            logger.warning("Cross-platform queue full")
+                    else:
+                        logger.debug("Cross opportunity rejected by risk manager")
 
-                await asyncio.sleep(scan_interval)
-
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error("Cross-platform scanner error", error=str(e))
-                await asyncio.sleep(scan_interval)
+        except Exception as e:
+            logger.error("Cross-platform scan cycle error", error=str(e))
 
     async def _run_cross_platform_executor(self) -> None:
         """Execute cross-platform arbitrage opportunities from the queue."""
