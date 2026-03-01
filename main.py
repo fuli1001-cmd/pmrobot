@@ -622,6 +622,10 @@ class ArbitrageBot:
         when cross-platform mode is enabled, also run the alignment /
         detection pipeline.  A single ``MARKET_REFRESH_INTERVAL`` controls
         both jobs so that the Gamma API is only called **once** per cycle.
+
+        Because *sports* is a fee-free tag (see ``FEE_FREE_TAGS``), the
+        ``fee_free_only=True`` result set already contains every sports
+        market — no extra fetch is needed for the cross-platform pipeline.
         """
         interval = self.settings.market_refresh_interval
         if interval <= 0:
@@ -644,10 +648,10 @@ class ArbitrageBot:
                 min_liquidity = self.settings.single_trade_size * 2
 
                 async with MarketScanner(rate_limit=self.settings.api_rate_limit) as scanner:
-                    # Fetch ALL active markets in one pass (including sports /
-                    # non-fee-free) so the cross-platform pipeline can reuse them.
+                    # Fetch fee-free markets (sports ⊂ fee-free, so this
+                    # single call serves both Binary monitor and cross-platform).
                     all_markets = await scanner.fetch_all_markets(
-                        fee_free_only=False,
+                        fee_free_only=True,
                         max_markets=2000,
                     )
                     # Negative Risk events (separate endpoint)
@@ -656,10 +660,10 @@ class ArbitrageBot:
                         max_events=100,
                     )
 
-                # --- Binary markets (fee-free only) ---
+                # --- Binary markets ---
                 tradeable_binary = [
                     m for m in all_markets
-                    if m.is_fee_free and m.liquidity >= min_liquidity
+                    if m.liquidity >= min_liquidity
                 ]
                 if tradeable_binary and self.monitor and hasattr(self.monitor, 'update_markets'):
                     await self.monitor.update_markets(tradeable_binary)
