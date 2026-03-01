@@ -1002,11 +1002,18 @@ class NegativeRiskMarketMonitor:
         while self._running:
             try:
                 await self._connect_and_monitor()
+            except ConnectionClosed as e:
+                logger.warning(
+                    "NegRisk WebSocket connection closed",
+                    code=e.code,
+                    reason=e.reason,
+                )
             except Exception as e:
                 logger.error("Negative Risk monitor error", error=str(e))
-                if self._running:
-                    await asyncio.sleep(self._reconnect_delay)
-                    self._reconnect_delay = min(self._reconnect_delay * 2, 60)
+
+            if self._running:
+                await asyncio.sleep(self._reconnect_delay)
+                self._reconnect_delay = min(self._reconnect_delay * 2, 60)
 
     async def stop(self) -> None:
         """Stop monitoring."""
