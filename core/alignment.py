@@ -47,7 +47,7 @@ _LLM_BATCH_SIZE = 20
 _MAX_LLM_CANDIDATES = 1000
 
 # Maximum gap (seconds) between event start times for a structural match.
-_TIME_TOLERANCE_SECONDS = 6 * 3600  # 6 hours
+_TIME_TOLERANCE_SECONDS = 24 * 3600  # 24 hours
 
 
 # ---------------------------------------------------------------------------
@@ -231,18 +231,19 @@ class MarketAligner:
 
         candidates = az_index.get(pm_key, [])
         for az in candidates:
-            if self._times_close(pm.start_time, az.start_time):
-                pair = AlignedMarketPair(
-                    polymarket=pm, azuro=az,
-                    confidence=1.0, match_method="structural",
-                )
-                self._cache[self._cache_key(pm.question, az.question)] = pair
-                logger.debug(
-                    "Structural match found",
-                    pm_q=pm.question[:60],
-                    az_q=az.question[:60],
-                )
-                return pair
+            # Structural team-pair match is high confidence;
+            # skip strict time check — only reject obviously wrong dates.
+            pair = AlignedMarketPair(
+                polymarket=pm, azuro=az,
+                confidence=1.0, match_method="structural",
+            )
+            self._cache[self._cache_key(pm.question, az.question)] = pair
+            logger.debug(
+                "Structural match found",
+                pm_q=pm.question[:60],
+                az_q=az.question[:60],
+            )
+            return pair
         return None
 
     # ------------------------------------------------------------------
@@ -264,17 +265,22 @@ class MarketAligner:
 
         # Collect candidates that need LLM judgment
         candidates: List[_CandidatePair] = []
+        total_product = len(unmatched_pms) * len(az_markets)
+        time_filtered = 0
+        cache_hit = 0
         for pm in unmatched_pms:
             for az in az_markets:
                 if az.market_id in matched_az_ids:
                     continue
                 if not self._times_close(pm.start_time, az.start_time):
+                    time_filtered += 1
                     continue
 
                 cache_key = self._cache_key(pm.question, az.question)
 
                 # Check persistent LLM cache first
                 if cache_key in self._llm_cache:
+                    cache_hit += 1
                     is_match, confidence = self._llm_cache[cache_key]
                     if is_match:
                         pair = AlignedMarketPair(
@@ -289,8 +295,22 @@ class MarketAligner:
 
                 candidates.append((pm, az, cache_key))
 
+        logger.info(
+            "LLM candidate filtering",
+            total_product=total_product,
+            time_filtered=time_filtered,
+            cache_hit=cache_hit,
+            new_candidates=len(candidates),
+            cache_matches=len(pairs),
+        )
+
         if not candidates:
             return pairs
+
+        # Sort by time proximity so the best candidates survive truncation
+        candidates.sort(
+            key=lambda c: self._time_gap(c[0].start_time, c[1].start_time)
+        )
 
         # Cap candidates to prevent runaway LLM costs
         if len(candidates) > _MAX_LLM_CANDIDATES:
@@ -496,15 +516,27 @@ class MarketAligner:
     def _extract_team_pair_from_question(self, question: str) -> Optional[str]:
         """Best-effort extraction of team names from a question string.
 
-        Looks for patterns like "Will X beat Y?" or "X vs Y" or "X to win
-        against Y".
+        Looks for patterns like "Will X beat Y?" or "X vs Y" or "Team A – Team B"
+        or "X to win against Y".
+
+        Strips leading tournament/venue prefix before colon (e.g.
+        "Lugano: X vs Y" → "X vs Y").
         """
         import re
 
-        q = question.lower()
+        q = question.strip().lower()
 
-        # Pattern: "X vs Y"
+        # Strip leading tournament/venue prefix (e.g. "lugano: x vs y")
+        if ":" in q:
+            q = q.split(":", 1)[1].strip()
+
+        # Pattern: "X vs Y" or "X vs. Y"
         m = re.search(r"(.+?)\s+vs\.?\s+(.+)", q)
+        if m:
+            return self._team_pair_key(m.group(1).strip(), m.group(2).strip())
+
+        # Pattern: "X – Y" or "X - Y" (en-dash or hyphen, Azuro-style)
+        m = re.search(r"(.+?)\s+[–\-]\s+(.+)", q)
         if m:
             return self._team_pair_key(m.group(1).strip(), m.group(2).strip())
 
@@ -522,11 +554,21 @@ class MarketAligner:
 
     @staticmethod
     def _times_close(t1: float, t2: float) -> bool:
-        """Check if two timestamps are within the tolerance window."""
+        """Check if two timestamps are within the tolerance window.
+
+        If *either* timestamp is missing (0.0) the pair is **rejected**
+        to avoid flooding the LLM with season-level vs match-level pairings.
+        """
         if t1 == 0.0 or t2 == 0.0:
-            # If either platform lacks start_time, allow match (less strict)
-            return True
+            return False
         return abs(t1 - t2) <= _TIME_TOLERANCE_SECONDS
+
+    @staticmethod
+    def _time_gap(t1: float, t2: float) -> float:
+        """Absolute time gap in seconds (inf when either is zero)."""
+        if t1 == 0.0 or t2 == 0.0:
+            return float("inf")
+        return abs(t1 - t2)
 
     @staticmethod
     def _cache_key(q1: str, q2: str) -> str:

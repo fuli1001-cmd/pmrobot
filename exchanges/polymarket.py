@@ -309,6 +309,62 @@ def _matches_sport(tags: list, sport: str) -> bool:
     return sport.lower() in lower_tags
 
 
+def _parse_end_date(iso: str) -> float:
+    """Convert an ISO-8601 date string to a Unix timestamp.
+
+    Returns 0.0 on failure or empty input.
+    """
+    if not iso:
+        return 0.0
+    try:
+        from datetime import datetime, timezone
+        # Handle trailing 'Z' and optional fractional seconds
+        cleaned = iso.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(cleaned)
+        return dt.timestamp()
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def _extract_teams_from_question(question: str) -> tuple[str, str]:
+    """Best-effort extraction of team/player names from a PM question.
+
+    Handles common patterns like:
+      - "Tournament: Team A vs Team B"
+      - "Team A vs Team B"
+      - "Will Team A beat Team B?"
+
+    Returns (team_a, team_b) or ("", "") if no match.
+    """
+    import re
+    q = question.strip()
+
+    # Strip leading tournament/venue prefix before colon
+    # e.g. "Lugano: Stricker vs Grenier" → "Stricker vs Grenier"
+    if ":" in q:
+        q = q.split(":", 1)[1].strip()
+
+    # Strip trailing '?' and common wrappers
+    q = q.rstrip("?").strip()
+
+    # Pattern: "X vs Y" or "X vs. Y"
+    m = re.search(r"^(.+?)\s+vs\.?\s+(.+)$", q, re.IGNORECASE)
+    if m:
+        return m.group(1).strip(), m.group(2).strip()
+
+    # Pattern: "Will X beat Y"
+    m = re.search(r"^will\s+(.+?)\s+beat\s+(.+)$", q, re.IGNORECASE)
+    if m:
+        return m.group(1).strip(), m.group(2).strip()
+
+    # Pattern: "X to win against Y"
+    m = re.search(r"^(.+?)\s+to\s+win\s+(?:against|vs)\s+(.+)$", q, re.IGNORECASE)
+    if m:
+        return m.group(1).strip(), m.group(2).strip()
+
+    return "", ""
+
+
 def _to_unified_market(m: Market) -> UnifiedMarket:
     """Convert a Polymarket Market to UnifiedMarket."""
     sport = ""
@@ -317,12 +373,17 @@ def _to_unified_market(m: Market) -> UnifiedMarket:
             sport = tag.lower()
             break
 
+    team_a, team_b = _extract_teams_from_question(m.question)
+
     return UnifiedMarket(
         platform=Platform.POLYMARKET,
         market_id=m.condition_id,
         question=m.question,
         sport=sport,
         event_name=m.question,  # Polymarket doesn't separate event name
+        team_a=team_a,
+        team_b=team_b,
+        start_time=_parse_end_date(m.end_date),  # use market endDate as proxy for event time
         active=m.active and not m.closed,
         metadata={
             "slug": m.slug,

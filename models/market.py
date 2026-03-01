@@ -46,6 +46,7 @@ class Market:
     tags: List[str] = field(default_factory=list)
     volume_24h: float = 0.0
     liquidity: float = 0.0
+    end_date: str = ""  # ISO-8601 event end / resolution time from API
     
     # Status
     active: bool = True

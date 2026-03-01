@@ -235,6 +235,7 @@ class MarketScanner:
                 tags=tags,
                 volume_24h=float(data.get("volume24hr", 0) or 0),
                 liquidity=liquidity,
+                end_date=data.get("endDate", "") or "",
                 active=data.get("active", True),
                 closed=data.get("closed", False),
                 enable_order_book=enable_order_book,

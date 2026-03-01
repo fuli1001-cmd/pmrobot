@@ -90,3 +90,17 @@ DEFAULT_AZURO_MIN_ODDS_SLIPPAGE = 0.02  # 2%
 # Estimated gas cost per Azuro bet on Polygon (USDC)
 ESTIMATED_AZURO_GAS_COST_USD = 0.02
 
+# Cross-platform sport mapping: (PM Events-API tag_slug, Azuro sport name)
+# Each tuple is scanned independently to keep Cartesian products small.
+CROSS_SPORT_MAP: list[tuple[str, str]] = [
+    ("soccer", "football"),
+    ("basketball", "basketball"),
+    ("mma", "mma"),
+    ("tennis", "tennis"),
+    ("baseball", "baseball"),
+    ("hockey", "ice hockey"),
+    ("nfl", "american football"),
+    ("boxing", "boxing"),
+    ("cricket", "cricket"),
+]
+

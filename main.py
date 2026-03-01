@@ -753,39 +753,66 @@ class ArbitrageBot:
     ) -> None:
         """Run one cross-platform alignment + detection cycle.
 
-        Polymarket's markets API does not expose tags, so we always use the
-        dedicated Events-API path (``tag_slug=sports``) to obtain sports
-        markets.  The optional *pm_raw_markets* pre-fetched list is only
-        used to warm the internal cache (for pricing look-ups) — it is NOT
-        used as the source for alignment because non-sports markets would
-        dilute the results and waste LLM alignment tokens.
+        Iterates over every sport in ``CROSS_SPORT_MAP`` so each sport's
+        Cartesian product (PM × Azuro) stays small.  The optional
+        *pm_raw_markets* pre-fetched list is used only to warm the
+        internal pricing cache—it is NOT used for alignment.
         """
+        from config.constants import CROSS_SPORT_MAP
+
         try:
             # ── Cache warm (if the refresher already pulled all markets) ──
             if pm_raw_markets is not None:
                 self._pm_exchange.update_cache(pm_raw_markets)
 
-            # ── Polymarket sports markets (Events API, tag_slug=soccer) ──
-            # Azuro currently fetches football (soccer), so we narrow PM
-            # to soccer to avoid wasting LLM alignment tokens on NBA/NHL/etc.
-            pm_markets = await self._pm_exchange.get_markets(sport="soccer")
+            all_pairs = []
+            total_pm = 0
+            total_az = 0
 
-            # ── Azuro markets (always a fresh subgraph query) ──
-            az_markets = await self._az_exchange.get_markets(sport="football")
-
-            if not pm_markets or not az_markets:
-                logger.debug(
-                    "Cross-scan: insufficient markets",
-                    pm=len(pm_markets) if pm_markets else 0,
-                    az=len(az_markets) if az_markets else 0,
+            for pm_tag, az_sport in CROSS_SPORT_MAP:
+                # Fetch both sides concurrently for this sport
+                pm_markets, az_markets = await asyncio.gather(
+                    self._pm_exchange.get_markets(sport=pm_tag),
+                    self._az_exchange.get_markets(sport=az_sport),
                 )
-                return
 
-            # Align
-            pairs = await self._market_aligner.align(pm_markets, az_markets)
+                if not pm_markets or not az_markets:
+                    logger.debug(
+                        "Cross-scan: no markets for sport",
+                        pm_tag=pm_tag,
+                        az_sport=az_sport,
+                        pm=len(pm_markets) if pm_markets else 0,
+                        az=len(az_markets) if az_markets else 0,
+                    )
+                    continue
 
-            if pairs:
-                opportunities = await self._cross_detector.scan(pairs)
+                total_pm += len(pm_markets)
+                total_az += len(az_markets)
+
+                # Align per sport (keeps Cartesian products small)
+                pairs = await self._market_aligner.align(
+                    pm_markets, az_markets,
+                )
+                if pairs:
+                    logger.info(
+                        "Cross-scan sport matched",
+                        sport=pm_tag,
+                        pairs=len(pairs),
+                        pm=len(pm_markets),
+                        az=len(az_markets),
+                    )
+                    all_pairs.extend(pairs)
+
+            logger.info(
+                "Cross-scan cycle complete",
+                sports=len(CROSS_SPORT_MAP),
+                total_pm=total_pm,
+                total_az=total_az,
+                total_pairs=len(all_pairs),
+            )
+
+            if all_pairs:
+                opportunities = await self._cross_detector.scan(all_pairs)
                 for opp in opportunities:
                     if self.risk_manager.can_trade():
                         logger.info(
