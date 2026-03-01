@@ -9,6 +9,7 @@ import argparse
 import asyncio
 import signal
 import sys
+import traceback
 from typing import Optional
 
 from config.settings import get_settings, Settings
@@ -841,7 +842,11 @@ class ArbitrageBot:
                         )
 
         except Exception as e:
-            logger.error("Cross-platform scan cycle error", error=str(e))
+            logger.error(
+                "Cross-platform scan cycle error",
+                error=repr(e),
+                traceback=traceback.format_exc(),
+            )
 
     async def _run_cross_platform_executor(self) -> None:
         """Execute cross-platform arbitrage opportunities from the queue."""

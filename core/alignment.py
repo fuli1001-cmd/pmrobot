@@ -19,6 +19,7 @@ results survive restarts.
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import time
 from dataclasses import dataclass, field
@@ -267,8 +268,12 @@ class MarketAligner:
         candidates: List[_CandidatePair] = []
         total_product = len(unmatched_pms) * len(az_markets)
         time_filtered = 0
+        bet_type_filtered = 0
         cache_hit = 0
         for pm in unmatched_pms:
+            if self._is_non_moneyline_question(pm.question):
+                bet_type_filtered += 1
+                continue
             for az in az_markets:
                 if az.market_id in matched_az_ids:
                     continue
@@ -299,6 +304,7 @@ class MarketAligner:
             "LLM candidate filtering",
             total_product=total_product,
             time_filtered=time_filtered,
+            bet_type_filtered=bet_type_filtered,
             cache_hit=cache_hit,
             new_candidates=len(candidates),
             cache_matches=len(pairs),
@@ -400,6 +406,12 @@ class MarketAligner:
             "of questions from different platforms, determine for EACH pair "
             "whether they refer to the SAME real-world event and the SAME "
             "outcome direction.\n\n"
+            "IMPORTANT: Two markets must share the same BET TYPE to match.\n"
+            "- Moneyline / match-winner bets match ONLY with other moneyline bets.\n"
+            "- Over/Under (O/U), totals, spread, handicap, and prop bets are "
+            "DIFFERENT bet types and must NEVER match a moneyline market.\n"
+            "- If one question is about a team winning and the other is about "
+            "a total score, they do NOT match even if the game is the same.\n\n"
             "Respond with ONLY a JSON array (no markdown fences):\n"
             '[{"pair":1,"match":true/false,"confidence":0.0-1.0,"reason":"..."},...]'
         )
@@ -413,8 +425,9 @@ class MarketAligner:
             "Authorization": f"Bearer {self.llm_api_key}",
             "Content-Type": "application/json",
         }
-        # ~60 tokens per pair result
-        max_tokens = max(200, n * 80)
+        # ~80 tokens per pair result; 120 per pair gives headroom for
+        # long team names and verbose reasons, avoiding JSON truncation.
+        max_tokens = max(300, n * 120)
         payload = {
             "model": self.llm_model,
             "messages": [
@@ -522,8 +535,6 @@ class MarketAligner:
         Strips leading tournament/venue prefix before colon (e.g.
         "Lugano: X vs Y" → "X vs Y").
         """
-        import re
-
         q = question.strip().lower()
 
         # Strip leading tournament/venue prefix (e.g. "lugano: x vs y")
@@ -569,6 +580,33 @@ class MarketAligner:
         if t1 == 0.0 or t2 == 0.0:
             return float("inf")
         return abs(t1 - t2)
+
+    @staticmethod
+    def _is_non_moneyline_question(question: str) -> bool:
+        """Detect questions that are NOT moneyline/winner bets.
+
+        Filters out over/under, spread, handicap, total, and prop bets
+        so they are not sent to the LLM for cross-platform alignment
+        (only moneyline-vs-moneyline matching makes economic sense).
+        """
+        q = question.lower()
+        # Over/Under patterns ("O/U 7.5", "Over/Under")
+        if re.search(r'\bo/u\b', q):
+            return True
+        if re.search(r'\bover[/ ]under\b', q):
+            return True
+        # Spread / handicap
+        if re.search(r'\bspread\b', q):
+            return True
+        if re.search(r'\bhandicap\b', q):
+            return True
+        # Total points/goals/runs/etc.
+        if re.search(r'\btotal\s+(points|goals|runs|sets|games|score)\b', q):
+            return True
+        # Point spread notation: +3.5, -3.5
+        if re.search(r'[+-]\d+\.5\b', q):
+            return True
+        return False
 
     @staticmethod
     def _cache_key(q1: str, q2: str) -> str:
