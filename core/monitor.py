@@ -1080,7 +1080,8 @@ class NegativeRiskMarketMonitor:
         if new_tokens_to_sub:
             logger.info("Monitor found new events", new_events=count, new_tokens=len(new_tokens_to_sub))
             # If connected, subscribe immediately
-            if self._ws and not self._ws.closed:
+            # websockets >=14: ClientConnection has no .closed; use .close_code
+            if self._ws and getattr(self._ws, 'close_code', None) is None:
                 await self._subscribe(new_tokens_to_sub)
         else:
             logger.debug("Monitor update called but no new events found")

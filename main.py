@@ -696,7 +696,7 @@ class ArbitrageBot:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error("Market refresher error", error=str(e))
+                logger.error("Market refresher error", error=repr(e), traceback=traceback.format_exc())
 
 
     # ------------------------------------------------------------------
