@@ -64,6 +64,7 @@ class AlignedMarketPair:
     confidence: float = 1.0  # 1.0 for structural, <1.0 for LLM
     match_method: str = "structural"
     matched_at: float = field(default_factory=time.time)
+    teams_reversed: bool = False  # True when PM team_a ≈ AZ team_b (opposite order)
 
 
 # Internal type for an LLM candidate pair.
@@ -232,17 +233,25 @@ class MarketAligner:
 
         candidates = az_index.get(pm_key, [])
         for az in candidates:
+            # Detect whether PM team_a maps to AZ team_b (i.e. reversed).
+            # The sorted key is identical either way, so we check raw order.
+            pm_norm_a = normalize_team_name(pm.team_a)
+            az_norm_a = normalize_team_name(az.team_a)
+            reversed_ = pm_norm_a != "" and az_norm_a != "" and pm_norm_a != az_norm_a
+
             # Structural team-pair match is high confidence;
             # skip strict time check — only reject obviously wrong dates.
             pair = AlignedMarketPair(
                 polymarket=pm, azuro=az,
                 confidence=1.0, match_method="structural",
+                teams_reversed=reversed_,
             )
             self._cache[self._cache_key(pm.question, az.question)] = pair
             logger.debug(
                 "Structural match found",
                 pm_q=pm.question[:60],
                 az_q=az.question[:60],
+                reversed=reversed_,
             )
             return pair
         return None

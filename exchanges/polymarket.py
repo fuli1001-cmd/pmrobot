@@ -138,6 +138,13 @@ class PolymarketExchange(BaseExchange):
         depth_yes = book_yes.get_available_depth("ask") if book_yes else 0.0
         depth_no = book_no.get_available_depth("ask") if book_no else 0.0
 
+        # Fallback: if order book is empty (no WebSocket feed), use cached
+        # outcome prices from the Gamma / Events API last scan.
+        if price_yes <= 0 and market.outcome_price_yes > 0:
+            price_yes = market.outcome_price_yes
+        if price_no <= 0 and market.outcome_price_no > 0:
+            price_no = market.outcome_price_no
+
         return UnifiedOdds(
             platform=Platform.POLYMARKET,
             market_id=market_id,
@@ -383,7 +390,11 @@ def _to_unified_market(m: Market) -> UnifiedMarket:
         event_name=m.question,  # Polymarket doesn't separate event name
         team_a=team_a,
         team_b=team_b,
-        start_time=_parse_end_date(m.end_date),  # use market endDate as proxy for event time
+        start_time=(
+            _parse_end_date(m.game_start_time)
+            if m.game_start_time
+            else _parse_end_date(m.end_date)
+        ),
         active=m.active and not m.closed,
         metadata={
             "slug": m.slug,

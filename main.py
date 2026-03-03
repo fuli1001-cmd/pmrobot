@@ -949,8 +949,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--log-level",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-        default="INFO",
-        help="Logging level",
+        default=None,
+        help="Logging level (default: from .env LOG_LEVEL, else INFO)",
     )
 
     parser.add_argument(
@@ -969,15 +969,16 @@ async def main() -> None:
     # Setup logging
     import os
     os.makedirs("logs", exist_ok=True)
-    
+
+    # Load settings first so LOG_LEVEL from .env is available as a fallback
+    settings = get_settings()
+
+    log_level = args.log_level or settings.log_level or "INFO"
     setup_logging(
-        level=args.log_level,
+        level=log_level,
         json_format=args.log_json,
         log_file=os.path.join("logs", "pmrobot.log"),
     )
-
-    # Load settings
-    settings = get_settings()
 
     # Override settings from args
     if args.env:

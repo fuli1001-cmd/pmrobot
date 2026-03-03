@@ -11,6 +11,7 @@ Example:
 """
 
 import re
+import unicodedata
 from typing import Optional
 
 
@@ -225,6 +226,12 @@ for canonical, aliases in {
 # Public API
 # ---------------------------------------------------------------------------
 
+def _strip_diacritics(text: str) -> str:
+    """Remove accents / diacritical marks (e.g. ú → u, ñ → n)."""
+    nfkd = unicodedata.normalize("NFKD", text)
+    return "".join(ch for ch in nfkd if not unicodedata.combining(ch))
+
+
 def normalize_team_name(name: str) -> str:
     """Normalise a team / player name to its canonical key.
 
@@ -246,13 +253,25 @@ def normalize_team_name(name: str) -> str:
     if lower in _REVERSE_MAP:
         return _REVERSE_MAP[lower]
 
-    # Strip common suffixes and retry
-    cleaned = re.sub(r"\b(fc|sc|cf|afc|ssc|sl|as|bsc)\b", "", lower).strip()
+    # Strip diacritics and retry (Criciúma → criciuma)
+    ascii_lower = _strip_diacritics(lower)
+    if ascii_lower != lower and ascii_lower in _REVERSE_MAP:
+        return _REVERSE_MAP[ascii_lower]
+
+    # Strip common prefixes/suffixes that vary across platforms, and retry.
+    # Covers: FC, SC, CF, AFC, SSC, SL, AS, BSC, CA, CD, FK, RB, SK, IF,
+    #         SV, TSG, VfL, VfB, RC, US, OGC, AJ, LOSC, Sporting, Real,
+    #         Deportivo, Athletic, Atlético …
+    cleaned = re.sub(
+        r"\b(fc|sc|cf|afc|ssc|sl|as|bsc|ca|cd|fk|rb|sk|if|sv|tsg|vfl|vfb|"
+        r"rc|us|ogc|aj|losc|ac|ss|og|se|ec|cr|cs|pk|nk|gd)\b",
+        "", ascii_lower,
+    ).strip()
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     if cleaned in _REVERSE_MAP:
         return _REVERSE_MAP[cleaned]
 
-    # Best-effort: lowercase + underscore
+    # Best-effort: lowercase, ascii, underscore-joined
     return re.sub(r"\s+", "_", cleaned)
 
 

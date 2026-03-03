@@ -47,7 +47,12 @@ class Market:
     volume_24h: float = 0.0
     liquidity: float = 0.0
     end_date: str = ""  # ISO-8601 event end / resolution time from API
-    
+    game_start_time: str = ""  # ISO-8601 actual event start time (from Events API)
+
+    # Cached outcome prices from API (used as fallback when order book is empty)
+    outcome_price_yes: float = 0.0
+    outcome_price_no: float = 0.0
+
     # Status
     active: bool = True
     closed: bool = False

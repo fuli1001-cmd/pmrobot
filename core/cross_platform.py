@@ -105,7 +105,27 @@ class CrossPlatformDetector:
             )
 
             if not pm_odds or not az_odds:
+                logger.debug(
+                    "Pair skipped: missing odds",
+                    pm_q=pair.polymarket.question[:40],
+                    pm_odds=pm_odds is not None,
+                    az_odds=az_odds is not None,
+                )
                 return None
+
+            # When teams are in reversed order across platforms,
+            # Azuro YES (team_a wins) == PM NO (team_b wins) and vice versa.
+            # Swap Azuro YES/NO prices so they align with PM's perspective.
+            if pair.teams_reversed:
+                az_odds = UnifiedOdds(
+                    platform=az_odds.platform,
+                    market_id=az_odds.market_id,
+                    price_yes=az_odds.price_no,
+                    price_no=az_odds.price_yes,
+                    max_size_yes=az_odds.max_size_no,
+                    max_size_no=az_odds.max_size_yes,
+                    timestamp=az_odds.timestamp,
+                )
 
             # Direction 1: YES on PM, NO on Azuro
             combo1 = self._compute_combo(
@@ -129,6 +149,28 @@ class CrossPlatformDetector:
                 best = combo1
             elif combo2:
                 best = combo2
+
+            # Log evaluation result for diagnostics (even when rejected)
+            if best:
+                logger.debug(
+                    "Pair evaluated",
+                    pm_q=pair.polymarket.question[:40],
+                    total_cost=f"{best.total_cost:.4f}",
+                    net_profit=f"{best.net_profit_pct:.4f}",
+                    threshold=f"{self.profit_threshold:.4f}",
+                    reversed=pair.teams_reversed,
+                )
+            else:
+                # Log raw prices for debugging total_cost >= 1.0 cases
+                logger.debug(
+                    "Pair no arbitrage",
+                    pm_q=pair.polymarket.question[:40],
+                    pm_yes=f"{pm_odds.price_yes:.4f}",
+                    pm_no=f"{pm_odds.price_no:.4f}",
+                    az_yes=f"{az_odds.price_yes:.4f}",
+                    az_no=f"{az_odds.price_no:.4f}",
+                    reversed=pair.teams_reversed,
+                )
 
             if best:
                 # Fill in market IDs and questions

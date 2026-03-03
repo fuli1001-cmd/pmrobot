@@ -223,6 +223,19 @@ class MarketScanner:
             else:
                 liquidity = float(liquidity) if liquidity else 0.0
 
+            # Parse outcome prices (from Gamma / Events API)
+            outcome_price_yes = 0.0
+            outcome_price_no = 0.0
+            raw_prices = data.get("outcomePrices", "")
+            if raw_prices:
+                try:
+                    prices_list = json_module.loads(raw_prices) if isinstance(raw_prices, str) else raw_prices
+                    if isinstance(prices_list, list) and len(prices_list) >= 2:
+                        outcome_price_yes = float(prices_list[0])
+                        outcome_price_no = float(prices_list[1])
+                except (json_module.JSONDecodeError, ValueError, TypeError):
+                    pass
+
             return Market(
                 condition_id=condition_id,
                 token_id_yes=token_id_yes,
@@ -236,6 +249,9 @@ class MarketScanner:
                 volume_24h=float(data.get("volume24hr", 0) or 0),
                 liquidity=liquidity,
                 end_date=data.get("endDate", "") or "",
+                game_start_time=data.get("_gameStartTime", "") or "",
+                outcome_price_yes=outcome_price_yes,
+                outcome_price_no=outcome_price_no,
                 active=data.get("active", True),
                 closed=data.get("closed", False),
                 enable_order_book=enable_order_book,
@@ -314,9 +330,18 @@ class MarketScanner:
                     break
 
                 for event_data in data:
+                    # Extract event-level start time and inject into each
+                    # market dict so _parse_market can store it.
+                    event_start = (
+                        event_data.get("startDate")
+                        or event_data.get("startTime")
+                        or ""
+                    )
                     for mkt_data in event_data.get("markets", []):
                         cid = mkt_data.get("conditionId", "")
                         if cid and cid not in seen:
+                            if event_start:
+                                mkt_data["_gameStartTime"] = event_start
                             m = self._parse_market(mkt_data)
                             if m:
                                 seen.add(cid)
