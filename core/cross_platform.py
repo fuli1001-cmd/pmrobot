@@ -144,7 +144,7 @@ class CrossPlatformDetector:
             logger.error(
                 "Failed to evaluate pair",
                 pm=pair.polymarket.question[:40],
-                error=str(e),
+                error=repr(e),
             )
             return None
 
@@ -332,11 +332,11 @@ class CrossPlatformExecutor:
 
         except Exception as e:
             elapsed = (time.time() - start) * 1000
-            logger.error("Cross execution failed", error=str(e))
+            logger.error("Cross execution failed", error=repr(e))
             return CrossExecutionReport(
                 result=CrossExecutionReport.Result.FAILED,
                 opportunity=opportunity,
-                error_message=str(e),
+                error_message=repr(e),
                 execution_time_ms=elapsed,
             )
 

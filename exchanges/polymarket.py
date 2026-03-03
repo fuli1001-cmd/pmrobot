@@ -57,7 +57,7 @@ class PolymarketExchange(BaseExchange):
         except Exception as e:
             logger.warning(
                 "Polymarket executor init failed (non-fatal in dry-run)",
-                error=str(e),
+                error=repr(e),
             )
             if not self.dry_run:
                 raise

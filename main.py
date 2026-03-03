@@ -163,9 +163,9 @@ class ArbitrageBot:
         except asyncio.CancelledError:
             logger.info("Bot cancelled")
         except Exception as e:
-            logger.error("Bot error", error=str(e))
+            logger.error("Bot error", error=repr(e))
             # Handled by main loop too, but good to have here
-            await self.notifier.send_alert("Bot Error", str(e))
+            await self.notifier.send_alert("Bot Error", repr(e))
             raise # Re-raise to let main() handle the crash notification
         finally:
             await self.stop()
@@ -433,7 +433,7 @@ class ArbitrageBot:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error("Neg Risk executor error", error=str(e))
+                logger.error("Neg Risk executor error", error=repr(e))
 
     async def _run_executor(self) -> None:
         """Run the execution loop."""
@@ -516,7 +516,7 @@ class ArbitrageBot:
                         return
 
             except Exception as e:
-                logger.error("Executor loop error", error=str(e))
+                logger.error("Executor loop error", error=repr(e))
 
     async def _run_short_executor(self) -> None:
         """
@@ -603,7 +603,7 @@ class ArbitrageBot:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error("Short executor loop error", error=str(e))
+                logger.error("Short executor loop error", error=repr(e))
 
     async def _run_settler(self) -> None:
         """Run the settlement loop."""
@@ -923,7 +923,7 @@ class ArbitrageBot:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error("Cross executor loop error", error=str(e))
+                logger.error("Cross executor loop error", error=repr(e))
 
 
 def parse_args() -> argparse.Namespace:
@@ -1007,12 +1007,12 @@ async def main() -> None:
         logger.info("Keyboard interrupt received, stopping...")
         await bot.notifier.send_alert("Bot Stopped", "Keyboard Interrupt")
     except Exception as e:
-        logger.critical("Bot crashed with unhandled exception", error=str(e), exc_info=True)
+        logger.critical("Bot crashed with unhandled exception", error=repr(e), exc_info=True)
         # Attempt to notify about crash
         try:
-             await bot.notifier.send_alert("⚠️ Bot Crashed", f"Unhandled Exception:\n{str(e)}")
+             await bot.notifier.send_alert("⚠️ Bot Crashed", f"Unhandled Exception:\n{repr(e)}")
         except Exception as notify_err:
-             logger.error("Failed to send crash notification", error=str(notify_err))
+             logger.error("Failed to send crash notification", error=repr(notify_err))
         raise
     finally:
         await bot.stop()

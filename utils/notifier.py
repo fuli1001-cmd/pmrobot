@@ -60,7 +60,7 @@ class TelegramNotifier:
                 logger.debug("Telegram message sent", chat_id=self.chat_id)
                 return True
         except httpx.HTTPError as e:
-            logger.error("Failed to send Telegram message", error=str(e))
+            logger.error("Failed to send Telegram message", error=repr(e))
             return False
 
     async def send_alert(self, title: str, details: str) -> bool:
@@ -150,7 +150,7 @@ class WeChatNotifier:
                     logger.error("WeChat API error", response=res_json)
                     return False
         except Exception as e:
-            logger.error("Failed to send WeChat message", error=str(e))
+            logger.error("Failed to send WeChat message", error=repr(e))
             return False
 
     async def send_alert(self, title: str, details: str) -> bool:

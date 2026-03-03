@@ -151,7 +151,7 @@ class MarketAligner:
             con.commit()
             con.close()
         except Exception as e:
-            logger.warning("Failed to persist LLM cache", error=str(e))
+            logger.warning("Failed to persist LLM cache", error=repr(e))
 
     # ------------------------------------------------------------------
     # Public API
@@ -491,10 +491,10 @@ class MarketAligner:
             )
             return fail_results
         except (json.JSONDecodeError, KeyError, ValueError) as e:
-            logger.warning("LLM batch response parse error", error=str(e))
+            logger.warning("LLM batch response parse error", error=repr(e))
             return fail_results
         except Exception as e:
-            logger.warning("LLM batch call failed", error=str(e))
+            logger.warning("LLM batch call failed", error=repr(e))
             return fail_results
 
     # ------------------------------------------------------------------

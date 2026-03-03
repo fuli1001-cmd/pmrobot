@@ -724,7 +724,7 @@ class MarketMonitor:
                     reason=e.reason,
                 )
             except Exception as e:
-                logger.error("WebSocket error", error=str(e))
+                logger.error("WebSocket error", error=repr(e))
 
             if self._running:
                 logger.info(
@@ -854,9 +854,9 @@ class MarketMonitor:
         except json.JSONDecodeError as e:
             # Transient parse errors are normal during reconnections
             if message and not message.isspace():
-                logger.debug("Failed to parse WebSocket message", error=str(e), msg_preview=message[:100])
+                logger.debug("Failed to parse WebSocket message", error=repr(e), msg_preview=message[:100])
         except Exception as e:
-            logger.debug("Error handling message", error=str(e))
+            logger.debug("Error handling message", error=repr(e))
 
     async def _process_single_message(self, data: dict) -> None:
         """Process a single message dict."""
@@ -1009,7 +1009,7 @@ class NegativeRiskMarketMonitor:
                     reason=e.reason,
                 )
             except Exception as e:
-                logger.error("Negative Risk monitor error", error=str(e))
+                logger.error("Negative Risk monitor error", error=repr(e))
 
             if self._running:
                 await asyncio.sleep(self._reconnect_delay)
@@ -1172,7 +1172,7 @@ class NegativeRiskMarketMonitor:
                 else:
                     logger.warning("NegRisk: Non-JSON message received", msg_preview=message[:100])
         except Exception as e:
-            logger.error("Error handling NegRisk message", error=str(e), traceback=True)
+            logger.error("Error handling NegRisk message", error=repr(e))
 
     async def _process_single_message(self, data: dict) -> None:
         """Process a single WebSocket message."""

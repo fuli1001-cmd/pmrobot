@@ -206,7 +206,7 @@ class PositionSettler:
                 "Install with: pip install py-builder-relayer-client py-builder-signing-sdk"
             )
         except Exception as e:
-            logger.warning("Relayer init failed, falling back to EOA", error=str(e))
+            logger.warning("Relayer init failed, falling back to EOA", error=repr(e))
 
     def _init_eoa(self, rpc_url: str, private_key: Optional[str]) -> None:
         """Initialise Web3 + account for direct on-chain signing."""
@@ -217,7 +217,7 @@ class PositionSettler:
             try:
                 self.account = self.w3.eth.account.from_key(private_key)
             except Exception as e:
-                logger.error("Invalid private key, merging disabled", error=str(e))
+                logger.error("Invalid private key, merging disabled", error=repr(e))
                 self._enabled = False
 
         # CTF contract bound to provider (needed for build_transaction)
@@ -251,7 +251,7 @@ class PositionSettler:
             try:
                 await self._check_and_merge(account_state)
             except Exception as e:
-                logger.error("Merge loop error", error=str(e))
+                logger.error("Merge loop error", error=repr(e))
 
             await asyncio.sleep(self.merge_interval)
 
@@ -385,7 +385,7 @@ class PositionSettler:
         except Exception as e:
             logger.error(
                 "Relayer merge error",
-                error=str(e),
+                error=repr(e),
                 condition_id=position.condition_id,
             )
             return False
@@ -436,7 +436,7 @@ class PositionSettler:
                 return False
 
         except Exception as e:
-            logger.error("EOA merge error", error=str(e), condition_id=position.condition_id)
+            logger.error("EOA merge error", error=repr(e), condition_id=position.condition_id)
             return False
 
     async def force_merge_all(self, account_state: AccountState) -> float:

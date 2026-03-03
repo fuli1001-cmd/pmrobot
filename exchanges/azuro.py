@@ -329,7 +329,7 @@ class AzuroExchange(BaseExchange):
                 },
             )
         except (KeyError, IndexError) as e:
-            logger.debug("Failed to parse Azuro game", error=str(e))
+            logger.debug("Failed to parse Azuro game", error=repr(e))
             return None
 
     # ------------------------------------------------------------------
@@ -399,7 +399,7 @@ class AzuroExchange(BaseExchange):
             )
 
         except Exception as e:
-            logger.error("Failed to fetch Azuro odds", error=str(e), market_id=market_id)
+            logger.error("Failed to fetch Azuro odds", error=repr(e), market_id=market_id)
             return None
 
     # ------------------------------------------------------------------
@@ -491,7 +491,7 @@ class AzuroExchange(BaseExchange):
 
         except Exception as e:
             elapsed = (time.time() - start) * 1000
-            logger.error("Azuro bet failed", error=str(e))
+            logger.error("Azuro bet failed", error=repr(e))
             return BetResult(
                 status=BetResult.Status.FAILED,
                 platform=Platform.AZURO,
@@ -588,5 +588,5 @@ class AzuroExchange(BaseExchange):
         try:
             return await asyncio.to_thread(_check)
         except Exception as e:
-            logger.error("Azuro balance check failed", error=str(e))
+            logger.error("Azuro balance check failed", error=repr(e))
             return 0.0

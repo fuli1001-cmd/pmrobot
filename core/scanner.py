@@ -92,7 +92,7 @@ class MarketScanner:
             return markets
 
         except httpx.HTTPError as e:
-            logger.error("Failed to fetch markets", error=str(e))
+            logger.error("Failed to fetch markets", error=repr(e))
             return []
 
     async def fetch_all_markets(
@@ -159,7 +159,7 @@ class MarketScanner:
             return None
 
         except httpx.HTTPError as e:
-            logger.error("Failed to fetch market by slug", slug=slug, error=str(e))
+            logger.error("Failed to fetch market by slug", slug=slug, error=repr(e))
             return None
 
     def _parse_market(self, data: dict) -> Optional[Market]:
@@ -242,7 +242,7 @@ class MarketScanner:
             )
 
         except (KeyError, ValueError, TypeError) as e:
-            logger.debug("Failed to parse market", error=str(e), slug=data.get("slug"))
+            logger.debug("Failed to parse market", error=repr(e), slug=data.get("slug"))
             return None
 
     def _determine_fee_category(self, tags: List[str]) -> FeeCategory:
@@ -327,7 +327,7 @@ class MarketScanner:
                     break
 
             except httpx.HTTPError as e:
-                logger.error("Failed to fetch sports events", error=str(e))
+                logger.error("Failed to fetch sports events", error=repr(e))
                 break
 
         logger.info(
@@ -389,7 +389,7 @@ class MarketScanner:
                     break
                     
             except httpx.HTTPError as e:
-                logger.error("Failed to fetch events", error=str(e))
+                logger.error("Failed to fetch events", error=repr(e))
                 break
         
         logger.info(
@@ -448,7 +448,7 @@ class MarketScanner:
         except (KeyError, ValueError, TypeError) as e:
             logger.debug(
                 "Failed to parse negative risk event",
-                error=str(e),
+                error=repr(e),
                 slug=data.get("slug"),
             )
             return None

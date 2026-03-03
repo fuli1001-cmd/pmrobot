@@ -292,12 +292,12 @@ class CTFContract:
             
         except Exception as e:
             execution_time = (time.time() - start_time) * 1000
-            logger.error("Mint failed", error=str(e))
+            logger.error("Mint failed", error=repr(e))
             return MintReport(
                 result=MintResult.FAILED,
                 condition_id=condition_id,
                 amount_usdc=amount_usdc,
-                error_message=str(e),
+                error_message=repr(e),
                 execution_time_ms=execution_time,
             )
     
@@ -390,11 +390,11 @@ class CTFContract:
 
         except Exception as e:
             execution_time = (time.time() - start_time) * 1000
-            logger.error("Merge failed", error=str(e))
+            logger.error("Merge failed", error=repr(e))
             return MintReport(
                 result=MintResult.FAILED,
                 condition_id=condition_id,
                 amount_usdc=amount_tokens,
-                error_message=str(e),
+                error_message=repr(e),
                 execution_time_ms=execution_time,
             )

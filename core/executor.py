@@ -119,7 +119,7 @@ class OrderExecutor:
                 self.client.set_api_creds(creds)
                 logger.info("Successfully derived API credentials")
             except Exception as e:
-                logger.error("Failed to derive API credentials", error=str(e))
+                logger.error("Failed to derive API credentials", error=repr(e))
                 raise ValueError(f"Could not derive API credentials: {e}")
 
         logger.info(
@@ -154,7 +154,7 @@ class OrderExecutor:
             raw_bal = resp.get("balance", "0")
             api_balance = float(raw_bal)
         except Exception as e:
-            logger.error("Failed to fetch API balance", error=str(e))
+            logger.error("Failed to fetch API balance", error=repr(e))
         
         # If API returns > 0, trust it (it matches the token the API expects)
         if api_balance > 0:
@@ -314,11 +314,11 @@ class OrderExecutor:
 
         except Exception as e:
             execution_time = (time.time() - start_time) * 1000
-            logger.error("Execution failed", error=str(e))
+            logger.error("Execution failed", error=repr(e))
             return ExecutionReport(
                 result=ExecutionResult.FAILED,
                 opportunity=opportunity,
-                error_message=str(e),
+                error_message=repr(e),
                 execution_time_ms=execution_time,
             )
 
@@ -459,7 +459,7 @@ class OrderExecutor:
             except Exception as e:
                 logger.error(
                     "Emergency exit failed for order",
-                    error=str(e),
+                    error=repr(e),
                     attempt=attempt,
                 )
             if attempt < max_retries:
@@ -519,7 +519,7 @@ class OrderExecutor:
 
         except Exception as e:
             order.status = OrderStatus.FAILED
-            logger.error("Order submission failed", error=str(e))
+            logger.error("Order submission failed", error=repr(e))
 
         return order
 
@@ -582,7 +582,7 @@ class OrderExecutor:
             except Exception as e:
                 logger.error(
                     "Emergency exit exception",
-                    error=str(e),
+                    error=repr(e),
                     attempt=attempt,
                 )
 
@@ -795,11 +795,11 @@ class OrderExecutor:
 
         except Exception as e:
             execution_time = (time.time() - start_time) * 1000
-            logger.error("Short arb execution failed", error=str(e))
+            logger.error("Short arb execution failed", error=repr(e))
             return ExecutionReport(
                 result=ExecutionResult.FAILED,
                 opportunity=opportunity,
-                error_message=str(e),
+                error_message=repr(e),
                 execution_time_ms=execution_time,
             )
 
