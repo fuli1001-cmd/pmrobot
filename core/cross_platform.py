@@ -29,6 +29,11 @@ logger = get_logger(__name__)
 # Estimated gas cost per Azuro bet on Polygon (in USDC terms)
 _AZURO_GAS_COST_USD = 0.02
 
+# Maximum credible net profit percentage.  Anything above this is almost
+# certainly caused by stale pricing (e.g. PM outcomePrices snapshot vs
+# fresh Azuro subgraph odds) rather than real arbitrage.
+_MAX_SANE_PROFIT_PCT = 0.20  # 20%
+
 
 class CrossPlatformDetector:
     """Scans aligned market pairs for cross-platform arbitrage.
@@ -69,6 +74,16 @@ class CrossPlatformDetector:
             opp = await self._evaluate_pair(pair)
             if opp and opp.is_profitable(self.profit_threshold):
                 opportunities.append(opp)
+
+        # De-duplicate: keep only the best opportunity per AZ market.
+        # The same real-world event can be matched to multiple PM markets
+        # (e.g. "Match Winner" AND "Set 1 Winner").  Only one can be bet.
+        best_by_az: dict[str, CrossPlatformOpportunity] = {}
+        for opp in opportunities:
+            existing = best_by_az.get(opp.az_market_id)
+            if existing is None or opp.net_profit_pct > existing.net_profit_pct:
+                best_by_az[opp.az_market_id] = opp
+        opportunities = list(best_by_az.values())
 
         # Sort by profit (best first)
         opportunities.sort(key=lambda o: o.net_profit_pct, reverse=True)
@@ -171,6 +186,22 @@ class CrossPlatformDetector:
                     az_no=f"{az_odds.price_no:.4f}",
                     reversed=pair.teams_reversed,
                 )
+
+            # Sanity check: reject implausibly high profits that are
+            # almost certainly caused by stale PM snapshot prices vs
+            # fresh Azuro subgraph odds.
+            if best and best.net_profit_pct > _MAX_SANE_PROFIT_PCT:
+                logger.warning(
+                    "Rejecting opportunity: profit exceeds sanity cap "
+                    "(likely stale pricing)",
+                    pm_q=pair.polymarket.question[:60],
+                    az_q=pair.azuro.question[:60],
+                    net_profit=f"{best.net_profit_pct:.2%}",
+                    cap=f"{_MAX_SANE_PROFIT_PCT:.0%}",
+                    price_yes=f"{best.price_yes:.4f}",
+                    price_no=f"{best.price_no:.4f}",
+                )
+                return None
 
             if best:
                 # Fill in market IDs and questions

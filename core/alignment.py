@@ -183,16 +183,21 @@ class MarketAligner:
 
         # ── Phase 1: Structural matching ──
         unmatched_pms: List[UnifiedMarket] = []
+        structural_az_ids: set = set()
         for pm in pm_markets:
             pair = self._structural_match(pm, az_markets, az_index)
             if pair:
                 pairs.append(pair)
+                structural_az_ids.add(pair.azuro.market_id)
             else:
                 unmatched_pms.append(pm)
 
         # ── Phase 2: LLM batch fallback ──
         if self.use_llm and self.llm_api_key and unmatched_pms:
-            llm_pairs = await self._llm_batch_match(unmatched_pms, az_markets)
+            llm_pairs = await self._llm_batch_match(
+                unmatched_pms, az_markets,
+                already_matched_az_ids=structural_az_ids,
+            )
             pairs.extend(llm_pairs)
 
         logger.info(
@@ -264,6 +269,7 @@ class MarketAligner:
         self,
         unmatched_pms: List[UnifiedMarket],
         az_markets: List[UnifiedMarket],
+        already_matched_az_ids: set = None,
     ) -> List[AlignedMarketPair]:
         """Collect candidate pairs, check persistent cache, then batch-call LLM.
 
@@ -271,7 +277,7 @@ class MarketAligner:
         """
         pairs: List[AlignedMarketPair] = []
         # Already matched AZ market_ids (avoid double-matching)
-        matched_az_ids: set = set()
+        matched_az_ids: set = set(already_matched_az_ids) if already_matched_az_ids else set()
 
         # Collect candidates that need LLM judgment
         candidates: List[_CandidatePair] = []
@@ -614,6 +620,24 @@ class MarketAligner:
             return True
         # Point spread notation: +3.5, -3.5
         if re.search(r'[+-]\d+\.5\b', q):
+            return True
+        # Sub-event/prop bets: set winner, half winner, period, etc.
+        # e.g. "Set 1 Winner: Tabur vs Nishikori", "1st Half Winner"
+        if re.search(r'\bset\s+\d+\s+winner\b', q):
+            return True
+        if re.search(r'\b\d+(st|nd|rd|th)\s+(set|half|quarter|period|map|round|game)\b', q):
+            return True
+        if re.search(r'\b(first|second|1st|2nd)\s+half\s+winner\b', q):
+            return True
+        if re.search(r'\bset\s+\d+\s+games?\b', q):
+            return True
+        # Total sets / total games (match-level props)
+        if re.search(r'\btotal\s+sets\b', q):
+            return True
+        if re.search(r'\bmatch\s+o/u\b', q):
+            return True
+        # Draw market (rugby 3-way): "Will the match end in a draw?"
+        if re.search(r'\bdraw\b', q):
             return True
         return False
 
