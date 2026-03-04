@@ -337,7 +337,7 @@ class AzuroExchange(BaseExchange):
     # ------------------------------------------------------------------
 
     async def get_odds(
-        self, market_id: str, trade_size: float = 50.0
+        self, market_id: str, trade_size: float = 50.0, *, live: bool = False,
     ) -> Optional[UnifiedOdds]:
         """Get current odds for an Azuro market.
 

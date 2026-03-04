@@ -191,14 +191,48 @@ def test_structural_match_filters_props():
     return True
 
 
+def test_live_odds_parameter():
+    """Test Bug 11 fix: get_odds accepts live kwarg; base class signature compatible."""
+    from exchanges.base import BaseExchange, UnifiedOdds
+    from exchanges.polymarket import PolymarketExchange
+    from exchanges.azuro import AzuroExchange
+    import inspect
+
+    # Verify base class signature accepts live kwarg
+    sig = inspect.signature(BaseExchange.get_odds)
+    params = list(sig.parameters.keys())
+    assert "live" in params, f"BaseExchange.get_odds missing 'live' param: {params}"
+
+    # Verify PM override signature
+    sig_pm = inspect.signature(PolymarketExchange.get_odds)
+    assert "live" in list(sig_pm.parameters.keys()), "PolymarketExchange.get_odds missing 'live'"
+
+    # Verify AZ override signature 
+    sig_az = inspect.signature(AzuroExchange.get_odds)
+    assert "live" in list(sig_az.parameters.keys()), "AzuroExchange.get_odds missing 'live'"
+
+    # Verify PM has _fetch_clob_book and _fetch_live_odds methods
+    assert hasattr(PolymarketExchange, '_fetch_clob_book'), "Missing _fetch_clob_book"
+    assert hasattr(PolymarketExchange, '_fetch_live_odds'), "Missing _fetch_live_odds"
+
+    # Verify CLOB_API_BASE_URL is imported in polymarket module
+    from exchanges.polymarket import CLOB_API_BASE_URL
+    assert "clob.polymarket.com" in CLOB_API_BASE_URL
+
+    print("PASS: get_odds(live=True) parameter available on all exchanges")
+    print("PASS: _fetch_clob_book and _fetch_live_odds methods exist")
+    return True
+
+
 if __name__ == "__main__":
     r1 = test_non_moneyline_filter()
     r2 = test_cross_sport_map()
     r3 = test_sanity_cap_constant()
     r4 = test_new_categories()
     r5 = test_structural_match_filters_props()
+    r6 = test_live_odds_parameter()
     print()
-    if r1 and r2 and r3 and r4 and r5:
+    if r1 and r2 and r3 and r4 and r5 and r6:
         print("=== ALL VALIDATIONS PASSED ===")
     else:
         print("=== SOME VALIDATIONS FAILED ===")

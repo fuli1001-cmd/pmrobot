@@ -8,6 +8,9 @@ acts purely as a delegate adapter.
 import time
 from typing import List, Optional
 
+import httpx
+
+from config.constants import CLOB_API_BASE_URL
 from exchanges.base import (
     BaseExchange,
     BetResult,
@@ -40,6 +43,7 @@ class PolymarketExchange(BaseExchange):
         self.dry_run = dry_run
         self._scanner: Optional[MarketScanner] = None
         self._executor: Optional[OrderExecutor] = None
+        self._http: Optional[httpx.AsyncClient] = None
         self._order_book_mgr = OrderBookManager()
         # Cache: condition_id -> Market (original model)
         self._markets_cache: dict[str, Market] = {}
@@ -52,6 +56,7 @@ class PolymarketExchange(BaseExchange):
         """Initialise scanner and executor."""
         self._scanner = MarketScanner()
         await self._scanner.__aenter__()
+        self._http = httpx.AsyncClient(timeout=15.0)
         try:
             self._executor = create_executor(dry_run=self.dry_run)
         except Exception as e:
@@ -65,6 +70,8 @@ class PolymarketExchange(BaseExchange):
 
     async def disconnect(self) -> None:
         """Clean up scanner HTTP client."""
+        if self._http:
+            await self._http.aclose()
         if self._scanner:
             await self._scanner.__aexit__(None, None, None)
         logger.info("PolymarketExchange disconnected")
@@ -115,20 +122,26 @@ class PolymarketExchange(BaseExchange):
     # ------------------------------------------------------------------
 
     async def get_odds(
-        self, market_id: str, trade_size: float = 50.0
+        self, market_id: str, trade_size: float = 50.0, *, live: bool = False,
     ) -> Optional[UnifiedOdds]:
-        """Get current best prices from cached order books.
+        """Get current best prices.
 
         For Polymarket the ``market_id`` is the ``condition_id``.
         Prices are best-ask (buy side) which is what we pay.
 
-        Note: In the full pipeline, the MarketMonitor continuously updates
-        order books via WebSocket.  This adapter reads whatever is currently
-        cached in the OrderBookManager.
+        Args:
+            market_id: Polymarket condition ID.
+            trade_size: Intended trade size (for depth check).
+            live: If *True*, fetch the order book directly from the CLOB
+                  REST API instead of relying on the (potentially stale)
+                  cached data.  Use this for cross-platform evaluation.
         """
         market = self._markets_cache.get(market_id)
         if not market:
             return None
+
+        if live:
+            return await self._fetch_live_odds(market)
 
         book_yes = self._order_book_mgr.get(market.token_id_yes)
         book_no = self._order_book_mgr.get(market.token_id_no)
@@ -148,6 +161,69 @@ class PolymarketExchange(BaseExchange):
         return UnifiedOdds(
             platform=Platform.POLYMARKET,
             market_id=market_id,
+            price_yes=price_yes,
+            price_no=price_no,
+            max_size_yes=depth_yes,
+            max_size_no=depth_no,
+            timestamp=time.time(),
+        )
+
+    # ------------------------------------------------------------------
+    # Live CLOB book fetch
+    # ------------------------------------------------------------------
+
+    async def _fetch_clob_book(self, token_id: str) -> tuple[float, float]:
+        """Fetch the current order book for *token_id* from CLOB REST API.
+
+        Returns:
+            ``(best_ask_price, ask_depth)``.
+            ``(0.0, 0.0)`` on failure.
+        """
+        if not self._http:
+            return 0.0, 0.0
+        try:
+            resp = await self._http.get(
+                f"{CLOB_API_BASE_URL}/book",
+                params={"token_id": token_id},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+            asks = data.get("asks", [])
+            if not asks:
+                return 0.0, 0.0
+
+            # asks are sorted best (lowest) first by the API
+            best_ask = float(asks[0]["price"])
+            depth = sum(float(a["size"]) for a in asks)
+            return best_ask, depth
+
+        except Exception as e:
+            logger.debug(
+                "CLOB book fetch failed",
+                token_id=token_id[:16],
+                error=repr(e),
+            )
+            return 0.0, 0.0
+
+    async def _fetch_live_odds(self, market: "Market") -> Optional[UnifiedOdds]:
+        """Fetch fresh prices from the CLOB REST API for both sides."""
+        import asyncio
+
+        (price_yes, depth_yes), (price_no, depth_no) = await asyncio.gather(
+            self._fetch_clob_book(market.token_id_yes),
+            self._fetch_clob_book(market.token_id_no),
+        )
+
+        # If CLOB returned nothing, fall back to cached snapshot
+        if price_yes <= 0 and market.outcome_price_yes > 0:
+            price_yes = market.outcome_price_yes
+        if price_no <= 0 and market.outcome_price_no > 0:
+            price_no = market.outcome_price_no
+
+        return UnifiedOdds(
+            platform=Platform.POLYMARKET,
+            market_id=market.condition_id,
             price_yes=price_yes,
             price_no=price_no,
             max_size_yes=depth_yes,

@@ -125,7 +125,7 @@ class BaseExchange(ABC):
 
     @abstractmethod
     async def get_odds(
-        self, market_id: str, trade_size: float = 50.0
+        self, market_id: str, trade_size: float = 50.0, *, live: bool = False,
     ) -> Optional[UnifiedOdds]:
         """Get current odds for a market.
 
@@ -135,6 +135,8 @@ class BaseExchange(ABC):
         Args:
             market_id: Platform-specific market identifier.
             trade_size: Intended bet size in USDC (for slippage calc).
+            live: If *True*, fetch fresh prices from the exchange API
+                  instead of relying on cached / snapshot data.
 
         Returns:
             UnifiedOdds, or None if market not found / inactive.
