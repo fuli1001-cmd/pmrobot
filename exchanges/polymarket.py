@@ -10,7 +10,7 @@ from typing import List, Optional
 
 import httpx
 
-from config.constants import CLOB_API_BASE_URL
+from config.constants import GAMMA_API_BASE_URL
 from exchanges.base import (
     BaseExchange,
     BetResult,
@@ -132,9 +132,14 @@ class PolymarketExchange(BaseExchange):
         Args:
             market_id: Polymarket condition ID.
             trade_size: Intended trade size (for depth check).
-            live: If *True*, fetch the order book directly from the CLOB
-                  REST API instead of relying on the (potentially stale)
-                  cached data.  Use this for cross-platform evaluation.
+            live: If *True*, re-fetch ``outcomePrices`` from the Gamma API
+                  so prices reflect the current market state rather than the
+                  (potentially stale) scan-cycle cache.  Use this for
+                  cross-platform evaluation.
+
+                  Note: Polymarket **sports** markets have no CLOB order book.
+                  ``outcomePrices`` from the Gamma REST API is the only
+                  reliable price signal for these markets.
         """
         market = self._markets_cache.get(market_id)
         if not market:
@@ -169,66 +174,81 @@ class PolymarketExchange(BaseExchange):
         )
 
     # ------------------------------------------------------------------
-    # Live CLOB book fetch
+    # Live price fetch (Gamma API)
     # ------------------------------------------------------------------
 
-    async def _fetch_clob_book(self, token_id: str) -> tuple[float, float]:
-        """Fetch the current order book for *token_id* from CLOB REST API.
+    async def _fetch_live_odds(self, market: "Market") -> Optional[UnifiedOdds]:
+        """Re-fetch ``outcomePrices`` from the Gamma REST API.
 
-        Returns:
-            ``(best_ask_price, ask_depth)``.
-            ``(0.0, 0.0)`` on failure.
+        Sports markets on Polymarket do **not** have a CLOB order book.
+        The ``outcomePrices`` field from the Gamma ``/markets`` endpoint is
+        the canonical price.  This method fetches it fresh (bypassing the
+        600-second scan-cycle cache) so cross-platform evaluation uses
+        up-to-date prices.
         """
         if not self._http:
-            return 0.0, 0.0
+            # Fallback to cached prices
+            return self._cached_odds(market)
+
         try:
             resp = await self._http.get(
-                f"{CLOB_API_BASE_URL}/book",
-                params={"token_id": token_id},
+                f"{GAMMA_API_BASE_URL}/markets",
+                params={"condition_ids": market.condition_id},
             )
             resp.raise_for_status()
             data = resp.json()
 
-            asks = data.get("asks", [])
-            if not asks:
-                return 0.0, 0.0
+            if not data or not isinstance(data, list) or len(data) == 0:
+                logger.debug(
+                    "Gamma /markets returned empty for condition_id",
+                    condition_id=market.condition_id[:20],
+                )
+                return self._cached_odds(market)
 
-            # asks are sorted best (lowest) first by the API
-            best_ask = float(asks[0]["price"])
-            depth = sum(float(a["size"]) for a in asks)
-            return best_ask, depth
+            mk = data[0]
+            raw_prices = mk.get("outcomePrices", "")
+
+            # outcomePrices is a JSON-encoded list: '["0.465", "0.535"]'
+            import json
+            try:
+                prices = json.loads(raw_prices) if isinstance(raw_prices, str) else raw_prices
+            except (json.JSONDecodeError, TypeError):
+                prices = []
+
+            if len(prices) >= 2:
+                price_yes = float(prices[0])
+                price_no = float(prices[1])
+            else:
+                return self._cached_odds(market)
+
+            return UnifiedOdds(
+                platform=Platform.POLYMARKET,
+                market_id=market.condition_id,
+                price_yes=price_yes,
+                price_no=price_no,
+                max_size_yes=0.0,  # No CLOB depth for sports markets
+                max_size_no=0.0,
+                timestamp=time.time(),
+            )
 
         except Exception as e:
             logger.debug(
-                "CLOB book fetch failed",
-                token_id=token_id[:16],
+                "Gamma live price fetch failed, using cache",
+                condition_id=market.condition_id[:20],
                 error=repr(e),
             )
-            return 0.0, 0.0
+            return self._cached_odds(market)
 
-    async def _fetch_live_odds(self, market: "Market") -> Optional[UnifiedOdds]:
-        """Fetch fresh prices from the CLOB REST API for both sides."""
-        import asyncio
-
-        (price_yes, depth_yes), (price_no, depth_no) = await asyncio.gather(
-            self._fetch_clob_book(market.token_id_yes),
-            self._fetch_clob_book(market.token_id_no),
-        )
-
-        # If CLOB returned nothing, fall back to cached snapshot
-        if price_yes <= 0 and market.outcome_price_yes > 0:
-            price_yes = market.outcome_price_yes
-        if price_no <= 0 and market.outcome_price_no > 0:
-            price_no = market.outcome_price_no
-
+    def _cached_odds(self, market: "Market") -> UnifiedOdds:
+        """Build UnifiedOdds from the cached ``outcome_price_*`` fields."""
         return UnifiedOdds(
             platform=Platform.POLYMARKET,
             market_id=market.condition_id,
-            price_yes=price_yes,
-            price_no=price_no,
-            max_size_yes=depth_yes,
-            max_size_no=depth_no,
-            timestamp=time.time(),
+            price_yes=market.outcome_price_yes,
+            price_no=market.outcome_price_no,
+            max_size_yes=0.0,
+            max_size_no=0.0,
+            timestamp=0.0,  # sentinel: data is stale
         )
 
     # ------------------------------------------------------------------

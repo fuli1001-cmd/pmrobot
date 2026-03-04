@@ -211,16 +211,16 @@ def test_live_odds_parameter():
     sig_az = inspect.signature(AzuroExchange.get_odds)
     assert "live" in list(sig_az.parameters.keys()), "AzuroExchange.get_odds missing 'live'"
 
-    # Verify PM has _fetch_clob_book and _fetch_live_odds methods
-    assert hasattr(PolymarketExchange, '_fetch_clob_book'), "Missing _fetch_clob_book"
+    # Verify PM has _fetch_live_odds and _cached_odds methods
     assert hasattr(PolymarketExchange, '_fetch_live_odds'), "Missing _fetch_live_odds"
+    assert hasattr(PolymarketExchange, '_cached_odds'), "Missing _cached_odds"
 
-    # Verify CLOB_API_BASE_URL is imported in polymarket module
-    from exchanges.polymarket import CLOB_API_BASE_URL
-    assert "clob.polymarket.com" in CLOB_API_BASE_URL
+    # Verify GAMMA_API_BASE_URL is imported in polymarket module
+    from exchanges.polymarket import GAMMA_API_BASE_URL
+    assert "gamma-api.polymarket.com" in GAMMA_API_BASE_URL
 
     print("PASS: get_odds(live=True) parameter available on all exchanges")
-    print("PASS: _fetch_clob_book and _fetch_live_odds methods exist")
+    print("PASS: _fetch_live_odds uses Gamma API for fresh outcomePrices")
     return True
 
 

@@ -114,9 +114,12 @@ class CrossPlatformDetector:
         """
         try:
             # Fetch odds concurrently.
-            # PM uses live=True to hit the CLOB REST API for fresh prices
-            # instead of relying on the (potentially stale) Events-API
-            # snapshot.  AZ already fetches fresh subgraph data each call.
+            # PM uses live=True to re-fetch outcomePrices from the Gamma
+            # REST API instead of relying on the (potentially stale)
+            # Events-API snapshot cached at scan time.
+            # Note: PM sports markets have NO CLOB order book; the
+            # AMM-based outcomePrices is the only available price source.
+            # AZ already fetches fresh subgraph data each call.
             pm_odds, az_odds = await asyncio.gather(
                 self.pm.get_odds(pair.polymarket.market_id, self.trade_size, live=True),
                 self.az.get_odds(pair.azuro.market_id, self.trade_size),
