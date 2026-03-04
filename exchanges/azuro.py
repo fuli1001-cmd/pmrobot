@@ -111,7 +111,7 @@ query ActiveGames($sport: String, $startsAt_gt: BigInt!) {
     sport { name slug }
     league { name slug country { name } }
     participants { name sortOrder }
-    conditions(where: { isExpressForbidden: false }) {
+    conditions {
       conditionId
       outcomes {
         outcomeId

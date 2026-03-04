@@ -92,9 +92,14 @@ ESTIMATED_AZURO_GAS_COST_USD = 0.02
 
 # Cross-platform sport mapping: (PM Events-API tag_slug, Azuro sport name)
 # Each tuple is scanned independently to keep Cartesian products small.
+#
+# NOTE: soccer and basketball are excluded because Polymarket only offers
+# season/tournament-level markets for these sports (e.g. "2026 NBA Champion",
+# "EPL Winner"), NOT individual match outcomes.  Azuro only has match-level
+# markets, so no cross-platform pairing is possible.
 CROSS_SPORT_MAP: list[tuple[str, str]] = [
-    ("soccer", "football"),
-    ("basketball", "basketball"),
+    # ("soccer", "football"),       # PM = season only, no matches
+    # ("basketball", "basketball"), # PM = season only, no matches
     ("mma", "mma"),
     ("tennis", "tennis"),
     ("baseball", "baseball"),
@@ -102,5 +107,9 @@ CROSS_SPORT_MAP: list[tuple[str, str]] = [
     ("nfl", "american football"),
     ("boxing", "boxing"),
     ("cricket", "cricket"),
+    # ── New categories (added after cross-platform research) ──
+    ("rugby", "rugby"),                         # PM 49 match events, AZ 12 games (league+union)
+    ("counter-strike", "Counter-Strike"),        # PM 46 match events, AZ 39 games (esport)
+    ("league-of-legends", "League of Legends"),  # PM 45 match events, AZ 3 games  (esport)
 ]
 

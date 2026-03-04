@@ -301,6 +301,8 @@ SPORTS_TAGS = frozenset([
     "hockey", "tennis", "soccer", "mma", "boxing",
     "cricket", "rugby", "golf", "motorsport", "nfl",
     "nba", "mlb", "nhl", "epl", "formula-1",
+    # Esports
+    "esports", "counter-strike", "league-of-legends", "valorant",
 ])
 
 
@@ -382,12 +384,18 @@ def _to_unified_market(m: Market) -> UnifiedMarket:
 
     team_a, team_b = _extract_teams_from_question(m.question)
 
+    # Fallback: if the market question didn't yield team names
+    # (e.g. rugby "Will X win?") try the parent event title
+    # which often has the "X vs Y" pattern.
+    if (not team_a or not team_b) and m.event_title:
+        team_a, team_b = _extract_teams_from_question(m.event_title)
+
     return UnifiedMarket(
         platform=Platform.POLYMARKET,
         market_id=m.condition_id,
         question=m.question,
         sport=sport,
-        event_name=m.question,  # Polymarket doesn't separate event name
+        event_name=m.event_title or m.question,
         team_a=team_a,
         team_b=team_b,
         start_time=(

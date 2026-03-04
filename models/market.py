@@ -48,6 +48,7 @@ class Market:
     liquidity: float = 0.0
     end_date: str = ""  # ISO-8601 event end / resolution time from API
     game_start_time: str = ""  # ISO-8601 actual event start time (from Events API)
+    event_title: str = ""  # Parent event title (e.g. "Top 14: Racing 92 vs Lyon")
 
     # Cached outcome prices from API (used as fallback when order book is empty)
     outcome_price_yes: float = 0.0

@@ -250,6 +250,7 @@ class MarketScanner:
                 liquidity=liquidity,
                 end_date=data.get("endDate", "") or "",
                 game_start_time=data.get("_gameStartTime", "") or "",
+                event_title=data.get("_eventTitle", "") or "",
                 outcome_price_yes=outcome_price_yes,
                 outcome_price_no=outcome_price_no,
                 active=data.get("active", True),
@@ -332,16 +333,32 @@ class MarketScanner:
                 for event_data in data:
                     # Extract event-level start time and inject into each
                     # market dict so _parse_market can store it.
+                    # Prefer startTime (actual game kick-off) over startDate
+                    # (event creation timestamp).  Fall back to endDate if
+                    # neither is present.
                     event_start = (
-                        event_data.get("startDate")
-                        or event_data.get("startTime")
+                        event_data.get("startTime")
+                        or event_data.get("startDate")
                         or ""
                     )
+                    event_title = event_data.get("title", "")
                     for mkt_data in event_data.get("markets", []):
                         cid = mkt_data.get("conditionId", "")
                         if cid and cid not in seen:
-                            if event_start:
-                                mkt_data["_gameStartTime"] = event_start
+                            # Use market-level gameStartTime first,
+                            # then event-level startTime as fallback
+                            mkt_start = (
+                                mkt_data.get("gameStartTime")
+                                or event_start
+                                or ""
+                            )
+                            if mkt_start:
+                                mkt_data["_gameStartTime"] = mkt_start
+                            # Inject event title so team extraction can
+                            # use the "X vs Y" structure even when the
+                            # market question is "Will X win?" etc.
+                            if event_title:
+                                mkt_data["_eventTitle"] = event_title
                             m = self._parse_market(mkt_data)
                             if m:
                                 seen.add(cid)
