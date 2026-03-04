@@ -222,6 +222,12 @@ class MarketAligner:
     ) -> Optional[AlignedMarketPair]:
         """Try to match via cache hit or structural rules (no LLM)."""
 
+        # Skip prop bets (O/U, spread, handicap, set winner, draw, etc.)
+        # These share the same team-pair key as the moneyline market but
+        # represent a completely different wager.
+        if self._is_non_moneyline_question(pm.question):
+            return None
+
         # Check in-memory cache first
         for az in az_markets:
             cache_key = self._cache_key(pm.question, az.question)

@@ -131,13 +131,74 @@ def test_new_categories():
     return True
 
 
+def test_structural_match_filters_props():
+    """Test Bug 10 fix: structural matching rejects non-moneyline PM markets."""
+    from core.alignment import MarketAligner
+    from exchanges.base import UnifiedMarket, Platform
+
+    a = MarketAligner.__new__(MarketAligner)
+    a._llm_cache = {}
+    a._cache = {}
+
+    # Create a PM prop bet market that shares the same team pair as an AZ moneyline
+    pm_prop = UnifiedMarket(
+        platform=Platform.POLYMARKET,
+        market_id="pm_ou",
+        question="Navone vs. Giron: Total Sets O/U 2.5",
+        sport="tennis",
+        event_name="Navone vs Giron",
+        team_a="Navone",
+        team_b="Giron",
+        start_time=1700000000.0,
+    )
+    pm_moneyline = UnifiedMarket(
+        platform=Platform.POLYMARKET,
+        market_id="pm_ml",
+        question="Mariano Navone vs Marcos Giron",
+        sport="tennis",
+        event_name="Navone vs Giron",
+        team_a="Navone",
+        team_b="Giron",
+        start_time=1700000000.0,
+    )
+    az = UnifiedMarket(
+        platform=Platform.AZURO,
+        market_id="az_1",
+        question="Mariano Navone – Marcos Giron",
+        sport="tennis",
+        event_name="Navone vs Giron",
+        team_a="Navone",
+        team_b="Giron",
+        start_time=1700000000.0,
+    )
+
+    az_index = a._build_team_index([az])
+
+    # Prop bet should NOT structurally match
+    result_prop = a._structural_match(pm_prop, [az], az_index)
+    if result_prop is not None:
+        print("  FAIL: O/U prop bet was structurally matched (should be None)")
+        return False
+
+    # Moneyline SHOULD structurally match
+    result_ml = a._structural_match(pm_moneyline, [az], az_index)
+    if result_ml is None:
+        print("  FAIL: Moneyline was NOT structurally matched (should match)")
+        return False
+
+    print("PASS: Structural match correctly rejects O/U prop bets")
+    print("PASS: Structural match correctly accepts moneyline markets")
+    return True
+
+
 if __name__ == "__main__":
     r1 = test_non_moneyline_filter()
     r2 = test_cross_sport_map()
     r3 = test_sanity_cap_constant()
     r4 = test_new_categories()
+    r5 = test_structural_match_filters_props()
     print()
-    if r1 and r2 and r3 and r4:
+    if r1 and r2 and r3 and r4 and r5:
         print("=== ALL VALIDATIONS PASSED ===")
     else:
         print("=== SOME VALIDATIONS FAILED ===")
