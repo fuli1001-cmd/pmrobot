@@ -199,14 +199,18 @@ class PolymarketExchange(BaseExchange):
             data = resp.json()
             asks = data.get("asks", [])
             bids = data.get("bids", [])
-            ask_depth = sum(float(a.get("size", 0)) for a in asks)
-            bid_depth = sum(float(b.get("size", 0)) for b in bids)
-            best_ask = float(asks[0]["price"]) if asks else 0.0
-            best_bid = float(bids[0]["price"]) if bids else 0.0
+            # CLOB /book sorts asks DESCENDING (worst first) and bids
+            # ASCENDING (worst first).  Best ask = asks[-1] (lowest),
+            # best bid = bids[-1] (highest).
+            best_ask = float(asks[-1]["price"]) if asks else 0.0
+            best_bid = float(bids[-1]["price"]) if bids else 0.0
+            # Depth in USDC: sum(size * price) per level
+            ask_depth_usd = sum(float(a.get("size", 0)) * float(a.get("price", 0)) for a in asks)
+            bid_depth_usd = sum(float(b.get("size", 0)) * float(b.get("price", 0)) for b in bids)
             return dict(
                 best_ask=best_ask, best_bid=best_bid,
                 ask_count=len(asks), bid_count=len(bids),
-                ask_depth=ask_depth, bid_depth=bid_depth,
+                ask_depth=ask_depth_usd, bid_depth=bid_depth_usd,
             )
         except Exception as e:
             logger.debug("CLOB book fetch failed", token_id=token_id[:20], error=repr(e))
@@ -294,10 +298,9 @@ class PolymarketExchange(BaseExchange):
             price_no = book_no["best_ask"] if book_no["best_ask"] > 0 else gamma_no
 
             # ── Step 4: Depth reporting ──
-            # ask_depth is in shares; convert to approximate USDC by
-            # multiplying by the ask price.
-            max_size_yes = book_yes["ask_depth"] * book_yes["best_ask"] if book_yes["ask_depth"] > 0 else 0.0
-            max_size_no = book_no["ask_depth"] * book_no["best_ask"] if book_no["ask_depth"] > 0 else 0.0
+            # ask_depth is already in USDC (sum of size * price per level)
+            max_size_yes = book_yes["ask_depth"]
+            max_size_no = book_no["ask_depth"]
 
             logger.debug(
                 "Live odds fetched",
