@@ -29,6 +29,7 @@ from utils.notifier import create_notifier
 from exchanges.base import BaseExchange
 from exchanges.polymarket import PolymarketExchange
 from exchanges.azuro import AzuroExchange
+from exchanges.sxbet import SxBetExchange
 from core.alignment import MarketAligner
 from core.cross_platform import CrossPlatformDetector, CrossPlatformExecutor
 from models.cross_models import CrossPlatformOpportunity, CrossExecutionReport
@@ -84,6 +85,8 @@ class ArbitrageBot:
         # Cross-platform components (initialised in start() if enabled)
         self._pm_exchange: Optional[PolymarketExchange] = None
         self._az_exchange: Optional[AzuroExchange] = None
+        self._sx_exchange: Optional[SxBetExchange] = None
+        self._alt_exchange: Optional[BaseExchange] = None  # Active alt platform
         self._market_aligner: Optional[MarketAligner] = None
         self._cross_detector: Optional[CrossPlatformDetector] = None
         self._cross_executor: Optional[CrossPlatformExecutor] = None
@@ -138,7 +141,11 @@ class ArbitrageBot:
             logger.info(f"Found {len(neg_risk_events)} Negative Risk events")
 
             # Phase 1c: Initialise cross-platform (if enabled)
-            if self.settings.cross_platform_enabled and self.settings.azuro_enabled:
+            cross_alt_enabled = (
+                self.settings.cross_platform_enabled
+                and (self.settings.sxbet_enabled or self.settings.azuro_enabled)
+            )
+            if cross_alt_enabled:
                 await self._init_cross_platform()
 
             # Phase 2: Start monitoring and execution loops
@@ -704,23 +711,45 @@ class ArbitrageBot:
     # ------------------------------------------------------------------
 
     async def _init_cross_platform(self) -> None:
-        """Initialise cross-platform exchange adapters and components."""
+        """Initialise cross-platform exchange adapters and components.
+
+        Prefers SX Bet over Azuro when both are enabled.
+        """
         logger.info("Initialising cross-platform arbitrage...")
 
         # Polymarket exchange adapter
         self._pm_exchange = PolymarketExchange(dry_run=self.dry_run)
         await self._pm_exchange.connect()
 
-        # Azuro exchange adapter
-        self._az_exchange = AzuroExchange(
-            subgraph_url=self.settings.azuro_subgraph_url,
-            lp_address=self.settings.azuro_lp_address or "",
-            core_address=self.settings.azuro_core_address or "",
-            rpc_url=self.settings.rpc_url,
-            private_key=self.settings.private_key or "",
-            dry_run=self.dry_run,
-        )
-        await self._az_exchange.connect()
+        # Alternative platform — prefer SX Bet over Azuro
+        if self.settings.sxbet_enabled:
+            self._sx_exchange = SxBetExchange(
+                api_key=self.settings.sxbet_api_key or "",
+                api_url=self.settings.sxbet_api_url,
+                rpc_url=self.settings.sxbet_rpc_url,
+                chain_id=self.settings.sxbet_chain_id,
+                usdc_address=self.settings.sxbet_usdc_address,
+                private_key=self.settings.private_key or "",
+                dry_run=self.dry_run,
+            )
+            await self._sx_exchange.connect()
+            self._alt_exchange = self._sx_exchange
+            logger.info("Cross-platform: using SX Bet as alternative platform")
+        elif self.settings.azuro_enabled:
+            self._az_exchange = AzuroExchange(
+                subgraph_url=self.settings.azuro_subgraph_url,
+                lp_address=self.settings.azuro_lp_address or "",
+                core_address=self.settings.azuro_core_address or "",
+                rpc_url=self.settings.rpc_url,
+                private_key=self.settings.private_key or "",
+                dry_run=self.dry_run,
+            )
+            await self._az_exchange.connect()
+            self._alt_exchange = self._az_exchange
+            logger.info("Cross-platform: using Azuro as alternative platform (deprecated)")
+        else:
+            logger.error("No alternative platform enabled for cross-platform")
+            return
 
         # Market aligner
         self._market_aligner = MarketAligner(
@@ -733,13 +762,13 @@ class ArbitrageBot:
         # Detector and executor
         self._cross_detector = CrossPlatformDetector(
             pm_exchange=self._pm_exchange,
-            az_exchange=self._az_exchange,
+            alt_exchange=self._alt_exchange,
             profit_threshold=self.settings.cross_profit_threshold,
             trade_size=self.settings.cross_trade_size,
         )
         self._cross_executor = CrossPlatformExecutor(
             pm_exchange=self._pm_exchange,
-            az_exchange=self._az_exchange,
+            alt_exchange=self._alt_exchange,
             dry_run=self.dry_run,
         )
 
@@ -768,31 +797,31 @@ class ArbitrageBot:
 
             all_pairs = []
             total_pm = 0
-            total_az = 0
+            total_alt = 0
 
-            for pm_tag, az_sport in CROSS_SPORT_MAP:
+            for pm_tag, alt_sport in CROSS_SPORT_MAP:
                 # Fetch both sides concurrently for this sport
-                pm_markets, az_markets = await asyncio.gather(
+                pm_markets, alt_markets = await asyncio.gather(
                     self._pm_exchange.get_markets(sport=pm_tag),
-                    self._az_exchange.get_markets(sport=az_sport),
+                    self._alt_exchange.get_markets(sport=alt_sport),
                 )
 
-                if not pm_markets or not az_markets:
+                if not pm_markets or not alt_markets:
                     logger.debug(
                         "Cross-scan: no markets for sport",
                         pm_tag=pm_tag,
-                        az_sport=az_sport,
+                        alt_sport=alt_sport,
                         pm=len(pm_markets) if pm_markets else 0,
-                        az=len(az_markets) if az_markets else 0,
+                        alt=len(alt_markets) if alt_markets else 0,
                     )
                     continue
 
                 total_pm += len(pm_markets)
-                total_az += len(az_markets)
+                total_alt += len(alt_markets)
 
                 # Align per sport (keeps Cartesian products small)
                 pairs = await self._market_aligner.align(
-                    pm_markets, az_markets,
+                    pm_markets, alt_markets,
                 )
                 if pairs:
                     logger.info(
@@ -800,7 +829,7 @@ class ArbitrageBot:
                         sport=pm_tag,
                         pairs=len(pairs),
                         pm=len(pm_markets),
-                        az=len(az_markets),
+                        alt=len(alt_markets),
                     )
                     all_pairs.extend(pairs)
 
@@ -808,7 +837,7 @@ class ArbitrageBot:
                 "Cross-scan cycle complete",
                 sports=len(CROSS_SPORT_MAP),
                 total_pm=total_pm,
-                total_az=total_az,
+                total_alt=total_alt,
                 total_pairs=len(all_pairs),
             )
 
@@ -819,7 +848,7 @@ class ArbitrageBot:
                         logger.info(
                             "Cross opportunity detected - queuing for execution",
                             pm_market=opp.pm_question[:60],
-                            az_market=opp.az_question[:60],
+                            alt_market=opp.az_question[:60],
                             strategy=opp.strategy.value,
                             yes_on=opp.yes_platform.value,
                             price_yes=f"{opp.price_yes:.4f}",
@@ -891,7 +920,7 @@ class ArbitrageBot:
                     await self.notifier.send_alert(
                         "🚨 Cross-Platform Partial Fill",
                         f"PM: {opportunity.pm_question[:50]}\n"
-                        f"AZ: {opportunity.az_question[:50]}\n"
+                        f"ALT: {opportunity.az_question[:50]}\n"
                         f"Error: {report.error_message}\n"
                         f"Estimated Loss: ${loss:.2f}",
                     )
@@ -903,7 +932,7 @@ class ArbitrageBot:
                     logger.info(
                         "DRY RUN: Simulated cross-platform arb",
                         pm_market=opportunity.pm_question[:60],
-                        az_market=opportunity.az_question[:60],
+                        alt_market=opportunity.az_question[:60],
                         strategy=opportunity.strategy.value,
                         yes_on=opportunity.yes_platform.value,
                         price_yes=f"{opportunity.price_yes:.4f}",

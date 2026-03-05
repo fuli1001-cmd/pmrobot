@@ -19,6 +19,7 @@ class Platform(Enum):
     """Supported trading platforms."""
     POLYMARKET = "polymarket"
     AZURO = "azuro"
+    SXBET = "sxbet"
 
 
 class OutcomeSide(Enum):

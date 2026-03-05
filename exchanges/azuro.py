@@ -1,5 +1,11 @@
 """Azuro exchange adapter.
 
+⚠️  STATUS: DISABLED — Development suspended in favour of SX Bet.
+    Azuro's AMM overround (6-14%, mean ~9%) makes cross-platform
+    arbitrage structurally non-viable against Polymarket's 1% CLOB
+    spreads.  The code is retained for reference but should NOT be
+    enabled in production.
+
 Integrates with Azuro Protocol on Polygon via:
   - GraphQL (data-feed subgraph) for market/odds discovery
   - web3.py for on-chain betting (LP contract)
@@ -7,6 +13,39 @@ Integrates with Azuro Protocol on Polygon via:
 Azuro uses an AMM (Automated Market Maker) with a singleton liquidity
 pool.  Bets are placed on-chain and result in NFT (ERC-721) bet slips
 that pay out upon event resolution.
+
+──────────────────────────────────────────────────────────────────────
+KNOWN UNFIXED BUGS (as of 2025-01 suspension)
+──────────────────────────────────────────────────────────────────────
+
+Bug 14 🔴 CRITICAL — ABI missing ``minOdds`` parameter
+    ``AZURO_LP_ABI`` defines ``bet()`` with 4 params (core, amount,
+    expiresAt, betData) but the actual on-chain LP contract requires
+    a 5th param ``minOdds`` (uint64).  Without it, bets have ZERO
+    slippage protection and will execute at any price.
+
+Bug 15 🔴 CRITICAL — No auto-unwind for partial fills
+    ``CrossPlatformExecutor.execute()`` detects partial fills (one leg
+    filled, other failed) but does NOT attempt any recovery.  If the
+    Polymarket leg fills but the Azuro leg reverts, the bot is left
+    with a naked directional position.
+
+Bug 16 🟡 MEDIUM — Redundant ERC-20 ``approve()`` per trade
+    ``place_bet()`` calls ``USDC.approve(lp_address, amount)`` before
+    every bet.  Should use ``approve(lp_address, MAX_UINT256)`` once
+    during ``connect()`` to save gas and reduce transaction count.
+
+Bug 17 🟡 MEDIUM — Equal leg sizing instead of odds-weighted
+    Both legs are sized at ``trade_size / 2`` regardless of odds.
+    Optimal hedging requires sizing inversely proportional to the
+    price of each leg: ``amount_yes = trade_size * price_no`` and
+    ``amount_no = trade_size * price_yes``.
+
+Bug 18 🟡 MEDIUM — No gas price cap
+    ``_execute_on_chain_bet()`` uses default gas pricing with no upper
+    bound.  During Polygon gas spikes, a single bet could consume
+    several dollars in gas, exceeding the expected arbitrage profit.
+──────────────────────────────────────────────────────────────────────
 """
 
 import asyncio

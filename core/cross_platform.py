@@ -1,14 +1,18 @@
 """Cross-platform arbitrage detection and execution.
 
-Compares aligned market pairs (Polymarket vs Azuro) to discover
-synthetic arbitrage opportunities and execute them concurrently.
+Compares aligned market pairs (Polymarket vs alternative platform) to
+discover synthetic arbitrage opportunities and execute them concurrently.
+
+Supported alternative platforms:
+  - SX Bet (CLOB, 0% taker fee, 5% oracle fee on profit)
+  - Azuro  (AMM, disabled — see exchanges/azuro.py for details)
 
 Arbitrage condition (binary hedge):
-    price_yes(A) + price_no(B) < 1.0 - fees - gas_cost
+    price_yes(A) + price_no(B) < 1.0 - fees - execution_cost
 
 Both legs are fired concurrently with slippage protection:
   - Polymarket: FOK limit order
-  - Azuro: lp.bet() with strict minOdds
+  - SX Bet: fill/v2 with desiredOdds + oddsSlippage
 """
 
 import asyncio
@@ -26,20 +30,25 @@ from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# Estimated gas cost per Azuro bet on Polygon (in USDC terms)
-_AZURO_GAS_COST_USD = 0.02
+# Estimated execution cost per alternative-platform bet (in USDC terms).
+# SX Bet on SX Network: very low gas (~$0.001), but we budget $0.01.
+# Azuro on Polygon: ~$0.02 gas per bet.
+_ALT_EXECUTION_COST_USD = 0.01
 
 # Maximum credible net profit percentage.  Anything above this is almost
 # certainly caused by stale pricing (e.g. PM outcomePrices snapshot vs
-# fresh Azuro subgraph odds) rather than real arbitrage.
+# fresh alternative prices) rather than real arbitrage.
 _MAX_SANE_PROFIT_PCT = 0.10  # 10%
 
-# Azuro AMM slippage buffer.  The subgraph ``currentOdds`` is the
-# instantaneous (marginal) price; a real bet of $50-100 against the
-# AMM will move the price and result in worse average execution.
-# We add this percentage to the Azuro leg price to approximate the
-# expected slippage for our trade size.
-_AZURO_SLIPPAGE_BUFFER = 0.03  # 3%
+# SX Bet CLOB slippage buffer.  Unlike Azuro's AMM (which needed 3% buffer
+# for price impact), SX Bet's CLOB has deterministic best-ask prices.
+# We add a small buffer for order-book movement between quote and fill.
+_ALT_SLIPPAGE_BUFFER = 0.005  # 0.5% (was 3% for Azuro AMM)
+
+# SX Bet oracle fee: 5% on winning profit only.  Since we hedge both
+# sides, one side always wins.  Effective fee on trade = ~2.5% of profit.
+# We conservatively model this as a flat cost percentage on the trade.
+_SXBET_ORACLE_FEE_PCT = 0.025  # 2.5% effective on trade profit
 
 # Minimum CLOB depth (USDC) required on the Polymarket side before we
 # consider a cross-platform opportunity executable.  Markets with thin
@@ -61,12 +70,12 @@ class CrossPlatformDetector:
     def __init__(
         self,
         pm_exchange: BaseExchange,
-        az_exchange: BaseExchange,
+        alt_exchange: BaseExchange,
         profit_threshold: float = 0.03,
         trade_size: float = 50.0,
     ):
         self.pm = pm_exchange
-        self.az = az_exchange
+        self.alt = alt_exchange
         self.profit_threshold = profit_threshold
         self.trade_size = trade_size
 
@@ -151,25 +160,25 @@ class CrossPlatformDetector:
             # AND CLOB order-book depth.  CLOB best_ask is preferred
             # over Gamma outcomePrices when available (it is the actual
             # fill price for a FOK order).
-            # AZ already fetches fresh subgraph data each call.
-            pm_odds, az_odds = await asyncio.gather(
+            # Alt platform (SX Bet) uses live=True for depth data.
+            pm_odds, alt_odds = await asyncio.gather(
                 self.pm.get_odds(pair.polymarket.market_id, self.trade_size, live=True),
-                self.az.get_odds(pair.azuro.market_id, self.trade_size),
+                self.alt.get_odds(pair.azuro.market_id, self.trade_size, live=True),
             )
 
-            if not pm_odds or not az_odds:
+            if not pm_odds or not alt_odds:
                 logger.debug(
                     "Pair skipped: missing odds",
                     pm_q=pair.polymarket.question[:40],
                     pm_odds=pm_odds is not None,
-                    az_odds=az_odds is not None,
+                    alt_odds=alt_odds is not None,
                 )
                 return None
 
             # ── CLOB depth gate ──
             # If BOTH YES and NO sides on PM have no CLOB depth, the
             # market cannot be traded via FOK.  Skip to avoid a naked
-            # Azuro position from partial fills.
+            # alt-platform position from partial fills.
             if pm_odds.max_size_yes < _MIN_PM_CLOB_DEPTH_USD and pm_odds.max_size_no < _MIN_PM_CLOB_DEPTH_USD:
                 logger.debug(
                     "Pair skipped: no PM CLOB depth",
@@ -181,30 +190,33 @@ class CrossPlatformDetector:
                 return None
 
             # When teams are in reversed order across platforms,
-            # Azuro YES (team_a wins) == PM NO (team_b wins) and vice versa.
-            # Swap Azuro YES/NO prices so they align with PM's perspective.
+            # alt YES (team_a wins) == PM NO (team_b wins) and vice versa.
+            # Swap alt YES/NO prices so they align with PM's perspective.
             if pair.teams_reversed:
-                az_odds = UnifiedOdds(
-                    platform=az_odds.platform,
-                    market_id=az_odds.market_id,
-                    price_yes=az_odds.price_no,
-                    price_no=az_odds.price_yes,
-                    max_size_yes=az_odds.max_size_no,
-                    max_size_no=az_odds.max_size_yes,
-                    timestamp=az_odds.timestamp,
+                alt_odds = UnifiedOdds(
+                    platform=alt_odds.platform,
+                    market_id=alt_odds.market_id,
+                    price_yes=alt_odds.price_no,
+                    price_no=alt_odds.price_yes,
+                    max_size_yes=alt_odds.max_size_no,
+                    max_size_no=alt_odds.max_size_yes,
+                    timestamp=alt_odds.timestamp,
                 )
 
-            # Direction 1: YES on PM, NO on Azuro
+            # Determine the alt platform enum for combo computation
+            alt_platform = self.alt.platform
+
+            # Direction 1: YES on PM, NO on alt
             combo1 = self._compute_combo(
-                pm_odds, az_odds,
+                pm_odds, alt_odds,
                 yes_platform=Platform.POLYMARKET,
-                no_platform=Platform.AZURO,
+                no_platform=alt_platform,
             )
 
-            # Direction 2: YES on Azuro, NO on PM
+            # Direction 2: YES on alt, NO on PM
             combo2 = self._compute_combo(
-                pm_odds, az_odds,
-                yes_platform=Platform.AZURO,
+                pm_odds, alt_odds,
+                yes_platform=alt_platform,
                 no_platform=Platform.POLYMARKET,
             )
 
@@ -234,8 +246,8 @@ class CrossPlatformDetector:
                     pm_q=pair.polymarket.question[:40],
                     pm_yes=f"{pm_odds.price_yes:.4f}",
                     pm_no=f"{pm_odds.price_no:.4f}",
-                    az_yes=f"{az_odds.price_yes:.4f}",
-                    az_no=f"{az_odds.price_no:.4f}",
+                    alt_yes=f"{alt_odds.price_yes:.4f}",
+                    alt_no=f"{alt_odds.price_no:.4f}",
                     reversed=pair.teams_reversed,
                 )
 
@@ -276,7 +288,7 @@ class CrossPlatformDetector:
     def _compute_combo(
         self,
         pm_odds: UnifiedOdds,
-        az_odds: UnifiedOdds,
+        alt_odds: UnifiedOdds,
         yes_platform: Platform,
         no_platform: Platform,
     ) -> Optional[CrossPlatformOpportunity]:
@@ -288,10 +300,10 @@ class CrossPlatformDetector:
 
         if yes_platform == Platform.POLYMARKET:
             price_yes = pm_odds.price_yes
-            price_no = az_odds.price_no
+            price_no = alt_odds.price_no
             pm_depth = pm_odds.max_size_yes  # We'd buy YES on PM
         else:
-            price_yes = az_odds.price_yes
+            price_yes = alt_odds.price_yes
             price_no = pm_odds.price_no
             pm_depth = pm_odds.max_size_no  # We'd buy NO on PM
 
@@ -303,20 +315,28 @@ class CrossPlatformDetector:
         if pm_depth < max(_MIN_PM_CLOB_DEPTH_USD, self.trade_size):
             return None
 
-        # Apply AMM slippage buffer to the Azuro leg.
-        # The subgraph ``currentOdds`` is the marginal price; a
-        # real bet of self.trade_size will execute at a worse average.
-        if yes_platform == Platform.AZURO:
-            price_yes *= (1.0 + _AZURO_SLIPPAGE_BUFFER)
-        if no_platform == Platform.AZURO:
-            price_no *= (1.0 + _AZURO_SLIPPAGE_BUFFER)
+        # Apply CLOB slippage buffer to the alternative platform leg.
+        # For SX Bet (CLOB) this is a small buffer for order-book
+        # movement between quote and fill (~0.5%).
+        # For Azuro (AMM) this was 3% — but Azuro is now disabled.
+        if yes_platform != Platform.POLYMARKET:
+            price_yes *= (1.0 + _ALT_SLIPPAGE_BUFFER)
+        if no_platform != Platform.POLYMARKET:
+            price_no *= (1.0 + _ALT_SLIPPAGE_BUFFER)
 
         total_cost = price_yes + price_no
         if total_cost >= 1.0:
             return None  # No arbitrage
 
         gross_profit_pct = (1.0 - total_cost) / total_cost
-        estimated_fees = _AZURO_GAS_COST_USD / self.trade_size  # As fraction
+
+        # Fee estimation:
+        # - Execution cost (gas) as fraction of trade
+        # - SX Bet oracle fee (5% on profit, ~2.5% effective)
+        execution_fee = _ALT_EXECUTION_COST_USD / self.trade_size
+        # Oracle fee applies to the gross profit, not the full trade
+        oracle_fee = gross_profit_pct * _SXBET_ORACLE_FEE_PCT
+        estimated_fees = execution_fee + oracle_fee
         net_profit_pct = gross_profit_pct - estimated_fees
 
         if net_profit_pct <= 0:
@@ -350,12 +370,12 @@ class CrossPlatformExecutor:
     def __init__(
         self,
         pm_exchange: BaseExchange,
-        az_exchange: BaseExchange,
+        alt_exchange: BaseExchange,
         min_odds_slippage: float = 0.02,
         dry_run: bool = False,
     ):
         self.pm = pm_exchange
-        self.az = az_exchange
+        self.alt = alt_exchange
         self.min_odds_slippage = min_odds_slippage
         self.dry_run = dry_run
 
@@ -454,7 +474,7 @@ class CrossPlatformExecutor:
                     failed=failed_side,
                 )
                 # TODO: If Polymarket side filled, attempt market-sell unwind
-                # Azuro side cannot be unwound — held to settlement
+                # SX Bet side: could attempt cancel/reverse if not yet settled
                 return CrossExecutionReport(
                     result=CrossExecutionReport.Result.PARTIAL,
                     opportunity=opportunity,
@@ -487,6 +507,6 @@ class CrossPlatformExecutor:
     def _resolve_sides(self, opp: CrossPlatformOpportunity):
         """Map opportunity sides to exchange instances + market IDs."""
         if opp.yes_platform == Platform.POLYMARKET:
-            return (self.pm, opp.pm_market_id, self.az, opp.az_market_id)
+            return (self.pm, opp.pm_market_id, self.alt, opp.az_market_id)
         else:
-            return (self.az, opp.az_market_id, self.pm, opp.pm_market_id)
+            return (self.alt, opp.az_market_id, self.pm, opp.pm_market_id)

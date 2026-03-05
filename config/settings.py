@@ -88,6 +88,21 @@ class Settings(BaseSettings):
         description="Azuro data-feed subgraph URL",
     )
 
+    # ═══ SX Bet Configuration ═══
+    sxbet_enabled: bool = Field(False, description="Enable SX Bet exchange adapter")
+    sxbet_api_key: Optional[str] = Field(None, description="SX Bet API key")
+    sxbet_api_url: str = Field(
+        "https://api.sx.bet", description="SX Bet REST API base URL"
+    )
+    sxbet_rpc_url: str = Field(
+        "https://rpc-rollup.sx.technology", description="SX Network rollup RPC URL"
+    )
+    sxbet_chain_id: int = Field(4162, description="SX Network chain ID")
+    sxbet_usdc_address: str = Field(
+        "0x6629Ce1Cf35Cc1329ebB4F63202F3f197b3F050B",
+        description="USDC contract address on SX Network (6 decimals)",
+    )
+
     # ═══ Cross-Platform Arbitrage ═══
     cross_platform_enabled: bool = Field(False, description="Enable cross-platform arbitrage")
     cross_profit_threshold: float = Field(

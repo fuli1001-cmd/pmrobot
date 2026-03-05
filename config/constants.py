@@ -95,21 +95,32 @@ ESTIMATED_AZURO_GAS_COST_USD = 0.02
 #
 # NOTE: soccer and basketball are excluded because Polymarket only offers
 # season/tournament-level markets for these sports (e.g. "2026 NBA Champion",
-# "EPL Winner"), NOT individual match outcomes.  Azuro only has match-level
+# "EPL Winner"), NOT individual match outcomes.  SX Bet only has match-level
 # markets, so no cross-platform pairing is possible.
+#
+# Azuro mapping (DEPRECATED — Azuro disabled):
+#   CROSS_SPORT_MAP was (pm_tag, azuro_sport_name) tuples.
+#
+# SX Bet mapping: (pm_tag_slug, sx_sport_slug)
+# The sx_sport_slug is used by SxBetExchange.get_markets(sport=...) which
+# looks up the numeric sportId via SXBET_SPORT_IDS.
 CROSS_SPORT_MAP: list[tuple[str, str]] = [
-    # ("soccer", "football"),       # PM = season only, no matches
-    # ("basketball", "basketball"), # PM = season only, no matches
+    # ("soccer", "soccer"),          # PM = season only, no matches
+    # ("basketball", "basketball"),  # PM = season only, no matches
     ("mma", "mma"),
     ("tennis", "tennis"),
     ("baseball", "baseball"),
-    ("hockey", "ice hockey"),
-    ("nfl", "american football"),
+    ("hockey", "hockey"),
+    ("nfl", "nfl"),
     ("boxing", "boxing"),
     ("cricket", "cricket"),
     # ── New categories (added after cross-platform research) ──
-    ("rugby", "rugby"),                         # PM 49 match events, AZ 12 games (league+union)
-    ("counter-strike", "Counter-Strike"),        # PM 46 match events, AZ 39 games (esport)
-    ("league-of-legends", "League of Legends"),  # PM 45 match events, AZ 3 games  (esport)
+    ("rugby", "rugby"),
+    ("counter-strike", "counter-strike"),        # Esport
+    ("league-of-legends", "league-of-legends"),  # Esport
+    # ── SX Bet unique categories ──
+    ("politics", "politics"),                    # SX sportId=17
+    ("crypto", "crypto"),                        # SX sportId=14
+    ("entertainment", "entertainment"),           # SX sportId=18
 ]
 

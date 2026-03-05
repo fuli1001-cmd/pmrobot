@@ -12,7 +12,7 @@ class CrossPlatformStrategy(Enum):
     """Cross-platform arbitrage strategy type."""
     BINARY_HEDGE = "binary_hedge"       # Buy YES on one, NO on the other
     NEG_RISK_CROSS = "neg_risk_cross"   # Multi-outcome best-price picking
-    SHORT_CROSS = "short_cross"         # Mint+sell on PM, hedge on Azuro
+    SHORT_CROSS = "short_cross"         # Mint+sell on PM, hedge on alt platform
 
 
 @dataclass
@@ -21,20 +21,24 @@ class CrossPlatformOpportunity:
 
     The opportunity pairs a YES buy on one platform with a NO buy on
     the other, such that total cost < 1.0 (guaranteed profit).
+
+    NOTE: Field names ``az_market_id`` / ``az_question`` are kept for
+    backward compatibility but represent the *alternative* platform
+    (SX Bet or Azuro), not necessarily Azuro.
     """
 
     # Aligned market identifiers
     pm_market_id: str
-    az_market_id: str
+    az_market_id: str       # Alt platform market ID (SX Bet marketHash or Azuro conditionId)
     pm_question: str
-    az_question: str
+    az_question: str        # Alt platform question / event name
 
     # Strategy
     strategy: CrossPlatformStrategy = CrossPlatformStrategy.BINARY_HEDGE
 
     # Which platform to buy YES on, which to buy NO on
     yes_platform: Platform = Platform.POLYMARKET
-    no_platform: Platform = Platform.AZURO
+    no_platform: Platform = Platform.SXBET
 
     # Prices (probability / price-per-share)
     price_yes: float = 0.0   # Price to buy YES on yes_platform
