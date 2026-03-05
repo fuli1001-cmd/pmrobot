@@ -5,12 +5,13 @@ unified BaseExchange interface.  Does NOT modify existing core modules —
 acts purely as a delegate adapter.
 """
 
+import asyncio
 import time
 from typing import List, Optional
 
 import httpx
 
-from config.constants import GAMMA_API_BASE_URL
+from config.constants import CLOB_API_BASE_URL, GAMMA_API_BASE_URL
 from exchanges.base import (
     BaseExchange,
     BetResult,
@@ -132,14 +133,11 @@ class PolymarketExchange(BaseExchange):
         Args:
             market_id: Polymarket condition ID.
             trade_size: Intended trade size (for depth check).
-            live: If *True*, re-fetch ``outcomePrices`` from the Gamma API
-                  so prices reflect the current market state rather than the
-                  (potentially stale) scan-cycle cache.  Use this for
-                  cross-platform evaluation.
-
-                  Note: Polymarket **sports** markets have no CLOB order book.
-                  ``outcomePrices`` from the Gamma REST API is the only
-                  reliable price signal for these markets.
+            live: If *True*, re-fetch prices from Gamma API baseline
+                  **and** CLOB order-book depth.  When the CLOB book has
+                  liquidity, the ``best_ask`` is used as the price signal
+                  (it is the actual FOK fill price).  Falls back to Gamma
+                  ``outcomePrices`` when CLOB is empty.
         """
         market = self._markets_cache.get(market_id)
         if not market:
@@ -174,29 +172,92 @@ class PolymarketExchange(BaseExchange):
         )
 
     # ------------------------------------------------------------------
-    # Live price fetch (Gamma API)
+    # CLOB order-book helpers
     # ------------------------------------------------------------------
 
-    async def _fetch_live_odds(self, market: "Market") -> Optional[UnifiedOdds]:
-        """Re-fetch ``outcomePrices`` from the Gamma REST API.
+    async def _fetch_clob_book(self, token_id: str) -> dict:
+        """Fetch the CLOB order book for a single token.
 
-        Sports markets on Polymarket do **not** have a CLOB order book.
-        The ``outcomePrices`` field from the Gamma ``/markets`` endpoint is
-        the canonical price.  This method fetches it fresh (bypassing the
-        600-second scan-cycle cache) so cross-platform evaluation uses
-        up-to-date prices.
+        Returns a dict with keys:
+          - ``best_ask``: float (lowest ask price, 0.0 if empty)
+          - ``best_bid``: float (highest bid price, 0.0 if empty)
+          - ``ask_count``: int (number of ask levels)
+          - ``bid_count``: int (number of bid levels)
+          - ``ask_depth``: float (total ask size in shares)
+          - ``bid_depth``: float (total bid size in shares)
         """
+        empty = dict(best_ask=0.0, best_bid=0.0, ask_count=0,
+                     bid_count=0, ask_depth=0.0, bid_depth=0.0)
         if not self._http:
-            # Fallback to cached prices
-            return self._cached_odds(market)
-
+            return empty
         try:
             resp = await self._http.get(
-                f"{GAMMA_API_BASE_URL}/markets",
-                params={"condition_ids": market.condition_id},
+                f"{CLOB_API_BASE_URL}/book",
+                params={"token_id": token_id},
             )
             resp.raise_for_status()
             data = resp.json()
+            asks = data.get("asks", [])
+            bids = data.get("bids", [])
+            ask_depth = sum(float(a.get("size", 0)) for a in asks)
+            bid_depth = sum(float(b.get("size", 0)) for b in bids)
+            best_ask = float(asks[0]["price"]) if asks else 0.0
+            best_bid = float(bids[0]["price"]) if bids else 0.0
+            return dict(
+                best_ask=best_ask, best_bid=best_bid,
+                ask_count=len(asks), bid_count=len(bids),
+                ask_depth=ask_depth, bid_depth=bid_depth,
+            )
+        except Exception as e:
+            logger.debug("CLOB book fetch failed", token_id=token_id[:20], error=repr(e))
+            return empty
+
+    async def _fetch_clob_midpoint(self, token_id: str) -> float:
+        """Fetch the CLOB midpoint price for a token.
+
+        Returns the midpoint (average of best bid and best ask) or 0.0
+        if unavailable.
+        """
+        if not self._http:
+            return 0.0
+        try:
+            resp = await self._http.get(
+                f"{CLOB_API_BASE_URL}/midpoint",
+                params={"token_id": token_id},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            return float(data.get("mid", 0.0))
+        except Exception:
+            return 0.0
+
+    # ------------------------------------------------------------------
+    # Live price fetch (Gamma API + CLOB depth)
+    # ------------------------------------------------------------------
+
+    async def _fetch_live_odds(self, market: "Market") -> Optional[UnifiedOdds]:
+        """Re-fetch prices using Gamma API + CLOB order-book depth.
+
+        Strategy:
+        1. Fetch Gamma ``outcomePrices`` as baseline price signal.
+        2. Concurrently fetch CLOB order books for both YES and NO tokens.
+        3. If a CLOB book has depth, prefer its ``best_ask`` as the price
+           (this is the actual fill price for a FOK order, more accurate
+           than the Gamma AMM snapshot).
+        4. Return ``max_size_yes`` / ``max_size_no`` from CLOB depth so
+           downstream code can skip markets with empty order books.
+        """
+        if not self._http:
+            return self._cached_odds(market)
+
+        try:
+            # ── Step 1: Gamma baseline prices ──
+            gamma_resp = await self._http.get(
+                f"{GAMMA_API_BASE_URL}/markets",
+                params={"condition_ids": market.condition_id},
+            )
+            gamma_resp.raise_for_status()
+            data = gamma_resp.json()
 
             if not data or not isinstance(data, list) or len(data) == 0:
                 logger.debug(
@@ -208,7 +269,6 @@ class PolymarketExchange(BaseExchange):
             mk = data[0]
             raw_prices = mk.get("outcomePrices", "")
 
-            # outcomePrices is a JSON-encoded list: '["0.465", "0.535"]'
             import json
             try:
                 prices = json.loads(raw_prices) if isinstance(raw_prices, str) else raw_prices
@@ -216,18 +276,46 @@ class PolymarketExchange(BaseExchange):
                 prices = []
 
             if len(prices) >= 2:
-                price_yes = float(prices[0])
-                price_no = float(prices[1])
+                gamma_yes = float(prices[0])
+                gamma_no = float(prices[1])
             else:
                 return self._cached_odds(market)
+
+            # ── Step 2: CLOB order-book depth (concurrent) ──
+            book_yes, book_no = await asyncio.gather(
+                self._fetch_clob_book(market.token_id_yes),
+                self._fetch_clob_book(market.token_id_no),
+            )
+
+            # ── Step 3: Price selection ──
+            # Prefer CLOB best_ask when available — it is the actual price
+            # the FOK order would fill at.  Fall back to Gamma outcomePrices.
+            price_yes = book_yes["best_ask"] if book_yes["best_ask"] > 0 else gamma_yes
+            price_no = book_no["best_ask"] if book_no["best_ask"] > 0 else gamma_no
+
+            # ── Step 4: Depth reporting ──
+            # ask_depth is in shares; convert to approximate USDC by
+            # multiplying by the ask price.
+            max_size_yes = book_yes["ask_depth"] * book_yes["best_ask"] if book_yes["ask_depth"] > 0 else 0.0
+            max_size_no = book_no["ask_depth"] * book_no["best_ask"] if book_no["ask_depth"] > 0 else 0.0
+
+            logger.debug(
+                "Live odds fetched",
+                cid=market.condition_id[:16],
+                gamma_y=f"{gamma_yes:.3f}", gamma_n=f"{gamma_no:.3f}",
+                clob_y=f"{book_yes['best_ask']:.3f}" if book_yes["best_ask"] else "none",
+                clob_n=f"{book_no['best_ask']:.3f}" if book_no["best_ask"] else "none",
+                depth_y=f"${max_size_yes:.0f}", depth_n=f"${max_size_no:.0f}",
+                asks_y=book_yes["ask_count"], asks_n=book_no["ask_count"],
+            )
 
             return UnifiedOdds(
                 platform=Platform.POLYMARKET,
                 market_id=market.condition_id,
                 price_yes=price_yes,
                 price_no=price_no,
-                max_size_yes=0.0,  # No CLOB depth for sports markets
-                max_size_no=0.0,
+                max_size_yes=max_size_yes,
+                max_size_no=max_size_no,
                 timestamp=time.time(),
             )
 

@@ -34,6 +34,12 @@ _AZURO_GAS_COST_USD = 0.02
 # fresh Azuro subgraph odds) rather than real arbitrage.
 _MAX_SANE_PROFIT_PCT = 0.20  # 20%
 
+# Minimum CLOB depth (USDC) required on the Polymarket side before we
+# consider a cross-platform opportunity executable.  Markets with empty
+# or near-empty order books cannot be filled via FOK and would result
+# in a naked Azuro position.
+_MIN_PM_CLOB_DEPTH_USD = 20.0
+
 
 class CrossPlatformDetector:
     """Scans aligned market pairs for cross-platform arbitrage.
@@ -114,11 +120,10 @@ class CrossPlatformDetector:
         """
         try:
             # Fetch odds concurrently.
-            # PM uses live=True to re-fetch outcomePrices from the Gamma
-            # REST API instead of relying on the (potentially stale)
-            # Events-API snapshot cached at scan time.
-            # Note: PM sports markets have NO CLOB order book; the
-            # AMM-based outcomePrices is the only available price source.
+            # PM uses live=True to re-fetch prices from the Gamma API
+            # AND CLOB order-book depth.  CLOB best_ask is preferred
+            # over Gamma outcomePrices when available (it is the actual
+            # fill price for a FOK order).
             # AZ already fetches fresh subgraph data each call.
             pm_odds, az_odds = await asyncio.gather(
                 self.pm.get_odds(pair.polymarket.market_id, self.trade_size, live=True),
@@ -131,6 +136,20 @@ class CrossPlatformDetector:
                     pm_q=pair.polymarket.question[:40],
                     pm_odds=pm_odds is not None,
                     az_odds=az_odds is not None,
+                )
+                return None
+
+            # ── CLOB depth gate ──
+            # If BOTH YES and NO sides on PM have no CLOB depth, the
+            # market cannot be traded via FOK.  Skip to avoid a naked
+            # Azuro position from partial fills.
+            if pm_odds.max_size_yes < _MIN_PM_CLOB_DEPTH_USD and pm_odds.max_size_no < _MIN_PM_CLOB_DEPTH_USD:
+                logger.debug(
+                    "Pair skipped: no PM CLOB depth",
+                    pm_q=pair.polymarket.question[:40],
+                    depth_yes=f"${pm_odds.max_size_yes:.0f}",
+                    depth_no=f"${pm_odds.max_size_no:.0f}",
+                    min_required=f"${_MIN_PM_CLOB_DEPTH_USD:.0f}",
                 )
                 return None
 
@@ -234,16 +253,26 @@ class CrossPlatformDetector:
         yes_platform: Platform,
         no_platform: Platform,
     ) -> Optional[CrossPlatformOpportunity]:
-        """Compute profit for a specific YES/NO platform assignment."""
+        """Compute profit for a specific YES/NO platform assignment.
+
+        Also validates that the Polymarket side has sufficient CLOB depth
+        for the specific outcome (YES or NO) that would be traded.
+        """
 
         if yes_platform == Platform.POLYMARKET:
             price_yes = pm_odds.price_yes
             price_no = az_odds.price_no
+            pm_depth = pm_odds.max_size_yes  # We'd buy YES on PM
         else:
             price_yes = az_odds.price_yes
             price_no = pm_odds.price_no
+            pm_depth = pm_odds.max_size_no  # We'd buy NO on PM
 
         if price_yes <= 0 or price_no <= 0:
+            return None
+
+        # Reject if PM side lacks CLOB depth for this direction
+        if pm_depth < _MIN_PM_CLOB_DEPTH_USD:
             return None
 
         total_cost = price_yes + price_no
