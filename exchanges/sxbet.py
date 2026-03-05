@@ -70,6 +70,12 @@ SXBET_SPORT_IDS: Dict[str, int] = {
 # USDC has 6 decimals on SX Network (same as Polygon/Polymarket)
 USDC_DECIMALS = 6
 
+# Moneyline market types on SX Bet (only these are suitable for arb)
+# 1  = generic moneyline, 52 = H2H moneyline, 226 = W moneyline (team sports)
+# All other types (28/29 = totals, 165 = sets, 202/203 = period,
+#                  342/866 = spreads) are excluded.
+SXBET_MONEYLINE_TYPES: set = {1, 52, 226}
+
 # Minimum taker bet size on SX Bet (1 USDC = 1_000_000 raw)
 TAKER_MIN_USDC = 1.0
 
@@ -283,11 +289,16 @@ class SxBetExchange(BaseExchange):
     def _to_unified_market(self, m: Dict) -> Optional[UnifiedMarket]:
         """Convert a raw SX Bet market dict to UnifiedMarket.
 
-        Only two-outcome markets (outcomeOneName + outcomeTwoName) are
-        supported for binary hedge arbitrage.
+        Only two-outcome **moneyline** markets (type ∈ SXBET_MONEYLINE_TYPES)
+        are supported for binary hedge arbitrage.
         """
         market_hash = m.get("marketHash", "")
         if not market_hash:
+            return None
+
+        # Filter: only moneyline types
+        market_type = m.get("type", 0)
+        if market_type not in SXBET_MONEYLINE_TYPES:
             return None
 
         # SX Bet markets have outcomeOneName / outcomeTwoName

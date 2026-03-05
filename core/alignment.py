@@ -45,7 +45,7 @@ _LLM_BATCH_SIZE = 20
 
 # Safety cap: maximum candidate pairs to send to LLM in one alignment run.
 # Prevents runaway costs when the Cartesian product is huge.
-_MAX_LLM_CANDIDATES = 1000
+_MAX_LLM_CANDIDATES = 200
 
 # Maximum gap (seconds) between event start times for a structural match.
 _TIME_TOLERANCE_SECONDS = 24 * 3600  # 24 hours
@@ -290,16 +290,22 @@ class MarketAligner:
         total_product = len(unmatched_pms) * len(az_markets)
         time_filtered = 0
         bet_type_filtered = 0
+        name_filtered = 0
         cache_hit = 0
         for pm in unmatched_pms:
             if self._is_non_moneyline_question(pm.question):
                 bet_type_filtered += 1
                 continue
+            pm_words = self._name_words(pm.team_a, pm.team_b)
             for az in az_markets:
                 if az.market_id in matched_az_ids:
                     continue
                 if not self._times_close(pm.start_time, az.start_time):
                     time_filtered += 1
+                    continue
+                # Fast pre-filter: require at least one team-name word overlap
+                if pm_words and not pm_words & self._name_words(az.team_a, az.team_b):
+                    name_filtered += 1
                     continue
 
                 cache_key = self._cache_key(pm.question, az.question)
@@ -326,6 +332,7 @@ class MarketAligner:
             total_product=total_product,
             time_filtered=time_filtered,
             bet_type_filtered=bet_type_filtered,
+            name_filtered=name_filtered,
             cache_hit=cache_hit,
             new_candidates=len(candidates),
             cache_matches=len(pairs),
@@ -646,6 +653,12 @@ class MarketAligner:
         if re.search(r'\bdraw\b', q):
             return True
         return False
+
+    @staticmethod
+    def _name_words(team_a: str, team_b: str) -> set:
+        """Extract significant words (≥3 chars) from team names for fast overlap check."""
+        raw = f"{team_a} {team_b}".lower()
+        return {w for w in re.findall(r'[a-z]+', raw) if len(w) >= 3}
 
     @staticmethod
     def _cache_key(q1: str, q2: str) -> str:
