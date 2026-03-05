@@ -47,9 +47,9 @@ htmlcov/
 .nox/
 
 # Logs
-logs/
-*.log
-log.txt
+# logs/
+# *.log
+# log.txt
 
 # Data (runtime caches)
 data/

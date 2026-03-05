@@ -32,13 +32,20 @@ _AZURO_GAS_COST_USD = 0.02
 # Maximum credible net profit percentage.  Anything above this is almost
 # certainly caused by stale pricing (e.g. PM outcomePrices snapshot vs
 # fresh Azuro subgraph odds) rather than real arbitrage.
-_MAX_SANE_PROFIT_PCT = 0.20  # 20%
+_MAX_SANE_PROFIT_PCT = 0.10  # 10%
+
+# Azuro AMM slippage buffer.  The subgraph ``currentOdds`` is the
+# instantaneous (marginal) price; a real bet of $50-100 against the
+# AMM will move the price and result in worse average execution.
+# We add this percentage to the Azuro leg price to approximate the
+# expected slippage for our trade size.
+_AZURO_SLIPPAGE_BUFFER = 0.03  # 3%
 
 # Minimum CLOB depth (USDC) required on the Polymarket side before we
-# consider a cross-platform opportunity executable.  Markets with empty
-# or near-empty order books cannot be filled via FOK and would result
-# in a naked Azuro position.
-_MIN_PM_CLOB_DEPTH_USD = 20.0
+# consider a cross-platform opportunity executable.  Markets with thin
+# order books cannot be fully filled via FOK and would result in a
+# naked Azuro position.  Should be >= trade_size.
+_MIN_PM_CLOB_DEPTH_USD = 100.0
 
 
 class CrossPlatformDetector:
@@ -75,6 +82,26 @@ class CrossPlatformDetector:
             Profitable opportunities sorted by net profit descending.
         """
         opportunities: List[CrossPlatformOpportunity] = []
+
+        # De-duplicate input pairs by (PM market_id, AZ market_id).
+        # The alignment step can produce the same combination multiple
+        # times when NegRisk events overlap or the same AZ condition
+        # matches identical PM questions from different event groups.
+        seen_pair_keys: set[tuple[str, str]] = set()
+        unique_pairs: list[AlignedMarketPair] = []
+        for pair in pairs:
+            key = (pair.polymarket.market_id, pair.azuro.market_id)
+            if key not in seen_pair_keys:
+                seen_pair_keys.add(key)
+                unique_pairs.append(pair)
+        if len(unique_pairs) < len(pairs):
+            logger.info(
+                "De-duplicated input pairs",
+                original=len(pairs),
+                unique=len(unique_pairs),
+                dropped=len(pairs) - len(unique_pairs),
+            )
+        pairs = unique_pairs
 
         for pair in pairs:
             opp = await self._evaluate_pair(pair)
@@ -271,9 +298,18 @@ class CrossPlatformDetector:
         if price_yes <= 0 or price_no <= 0:
             return None
 
-        # Reject if PM side lacks CLOB depth for this direction
-        if pm_depth < _MIN_PM_CLOB_DEPTH_USD:
+        # Reject if PM side lacks CLOB depth for this direction.
+        # Depth must be >= trade_size so that a FOK order can fill.
+        if pm_depth < max(_MIN_PM_CLOB_DEPTH_USD, self.trade_size):
             return None
+
+        # Apply AMM slippage buffer to the Azuro leg.
+        # The subgraph ``currentOdds`` is the marginal price; a
+        # real bet of self.trade_size will execute at a worse average.
+        if yes_platform == Platform.AZURO:
+            price_yes *= (1.0 + _AZURO_SLIPPAGE_BUFFER)
+        if no_platform == Platform.AZURO:
+            price_no *= (1.0 + _AZURO_SLIPPAGE_BUFFER)
 
         total_cost = price_yes + price_no
         if total_cost >= 1.0:
