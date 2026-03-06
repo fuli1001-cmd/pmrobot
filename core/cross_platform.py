@@ -20,7 +20,7 @@ import time
 from typing import List, Optional
 
 from core.alignment import AlignedMarketPair
-from exchanges.base import BaseExchange, OutcomeSide, Platform, UnifiedOdds
+from exchanges.base import BaseExchange, BetResult, OutcomeSide, Platform, UnifiedOdds
 from models.cross_models import (
     CrossExecutionReport,
     CrossPlatformOpportunity,
@@ -453,27 +453,43 @@ class CrossPlatformExecutor:
                 )
 
             if yes_ok or no_ok:
-                # PARTIAL fill — dangerous state
+                # PARTIAL fill — dangerous state.
+                # Attempt to unwind the filled Polymarket leg via market
+                # sell.  SX Bet fills cannot be reversed once submitted,
+                # so if SX is the filled side we can only log the
+                # exposure (it settles at event end).
                 filled_side = "YES" if yes_ok else "NO"
                 failed_side = "NO" if yes_ok else "YES"
+                filled_bet: BetResult = yes_result if yes_ok else no_result  # type: ignore[assignment]
                 filled_platform = (
-                    opportunity.yes_platform.value if yes_ok
-                    else opportunity.no_platform.value
+                    opportunity.yes_platform if yes_ok
+                    else opportunity.no_platform
                 )
+                filled_outcome = OutcomeSide.YES if yes_ok else OutcomeSide.NO
                 logger.warning(
-                    "PARTIAL FILL — emergency handling needed",
-                    filled=f"{filled_side} on {filled_platform}",
+                    "PARTIAL FILL — attempting emergency unwind",
+                    filled=f"{filled_side} on {filled_platform.value}",
                     failed=failed_side,
                 )
-                # TODO: If Polymarket side filled, attempt market-sell unwind
-                # SX Bet side: could attempt cancel/reverse if not yet settled
+
+                unwind_result = await self._attempt_unwind(
+                    opportunity=opportunity,
+                    filled_bet=filled_bet,
+                    filled_platform=filled_platform,
+                    filled_outcome=filled_outcome,
+                )
+
+                error_msg = f"{failed_side} leg failed, {filled_side} leg filled"
+                if unwind_result:
+                    error_msg += f" | unwind {unwind_result.status.value}"
+
                 return CrossExecutionReport(
                     result=CrossExecutionReport.Result.PARTIAL,
                     opportunity=opportunity,
                     yes_bet=yes_result,
                     no_bet=no_result,
                     execution_time_ms=elapsed,
-                    error_message=f"{failed_side} leg failed, {filled_side} leg filled",
+                    error_message=error_msg,
                 )
 
             # Both failed — safe state
@@ -494,6 +510,86 @@ class CrossPlatformExecutor:
                 opportunity=opportunity,
                 error_message=repr(e),
                 execution_time_ms=elapsed,
+            )
+
+    async def _attempt_unwind(
+        self,
+        opportunity: CrossPlatformOpportunity,
+        filled_bet: BetResult,
+        filled_platform: Platform,
+        filled_outcome: OutcomeSide,
+    ) -> Optional[BetResult]:
+        """Try to unwind a filled leg after its counterpart failed.
+
+        - **Polymarket** supports instant market-sell (FOK) with progressive
+          discount.  We call ``sell_position()`` which makes 3 attempts.
+        - **SX Bet** has no instant exit mechanism — the position is held
+          until event settlement.  We log the naked exposure and return
+          a synthetic FAILED result so the caller knows no unwind happened.
+
+        Returns:
+            ``BetResult`` from the unwind attempt, or ``None`` if sell is
+            not supported on the filled platform.
+        """
+        # Determine which exchange instance corresponds to the filled side
+        if filled_platform == Platform.POLYMARKET:
+            exchange = self.pm
+            market_id = opportunity.pm_market_id
+        else:
+            exchange = self.alt
+            market_id = opportunity.az_market_id  # field name kept for compat
+
+        # SX Bet (or any alt without instant sell) — nothing we can do
+        if filled_platform != Platform.POLYMARKET:
+            logger.warning(
+                "Cannot unwind SX Bet fill — position held to settlement",
+                market_id=market_id,
+                outcome=filled_outcome.value,
+                amount=filled_bet.amount,
+            )
+            return BetResult(
+                status=BetResult.Status.FAILED,
+                platform=filled_platform,
+                market_id=market_id,
+                outcome=filled_outcome,
+                error_message="SX Bet has no instant sell — naked exposure held to settlement",
+            )
+
+        # Polymarket — attempt sell
+        try:
+            result = await exchange.sell_position(
+                market_id=market_id,
+                outcome=filled_outcome,
+                token_amount=filled_bet.amount,
+                bought_price=filled_bet.effective_odds,
+            )
+            if result.status == BetResult.Status.SUCCESS:
+                logger.info(
+                    "Polymarket unwind SUCCESS",
+                    market_id=market_id,
+                    outcome=filled_outcome.value,
+                    amount=result.amount,
+                )
+            else:
+                logger.error(
+                    "Polymarket unwind FAILED — naked exposure",
+                    market_id=market_id,
+                    outcome=filled_outcome.value,
+                    error=result.error_message,
+                )
+            return result
+        except Exception as e:
+            logger.error(
+                "Polymarket unwind exception",
+                error=repr(e),
+                market_id=market_id,
+            )
+            return BetResult(
+                status=BetResult.Status.FAILED,
+                platform=Platform.POLYMARKET,
+                market_id=market_id,
+                outcome=filled_outcome,
+                error_message=f"unwind exception: {e!r}",
             )
 
     def _resolve_sides(self, opp: CrossPlatformOpportunity):

@@ -430,6 +430,121 @@ class PolymarketExchange(BaseExchange):
                 execution_time_ms=elapsed,
             )
 
+    async def sell_position(
+        self,
+        market_id: str,
+        outcome: OutcomeSide,
+        token_amount: float,
+        bought_price: float,
+    ) -> BetResult:
+        """Emergency sell (unwind) a position on Polymarket.
+
+        Submits a FOK sell order at a discounted price.  Retries up to
+        3 times with increasing discount (10%, 15%, 20% off buy price)
+        to maximise the chance of filling.
+
+        Args:
+            market_id: condition_id of the market.
+            outcome: YES or NO — which token to sell.
+            token_amount: Number of shares to sell.
+            bought_price: Price at which the tokens were acquired.
+
+        Returns:
+            BetResult indicating success or failure of the unwind.
+        """
+        start = time.time()
+        market = self._markets_cache.get(market_id)
+        if not market:
+            return BetResult(
+                status=BetResult.Status.FAILED,
+                platform=Platform.POLYMARKET,
+                market_id=market_id,
+                outcome=outcome,
+                error_message="Market not in cache — cannot unwind",
+            )
+
+        token_id = (
+            market.token_id_yes
+            if outcome == OutcomeSide.YES
+            else market.token_id_no
+        )
+
+        if self.dry_run or not self._executor:
+            logger.info(
+                "DRY RUN: Polymarket would sell (unwind)",
+                market=market.slug,
+                outcome=outcome.value,
+                tokens=f"{token_amount:.2f}",
+                bought_at=f"{bought_price:.4f}",
+            )
+            return BetResult(
+                status=BetResult.Status.SKIPPED,
+                platform=Platform.POLYMARKET,
+                market_id=market_id,
+                outcome=outcome,
+                amount=token_amount * bought_price,
+                effective_odds=bought_price,
+                execution_time_ms=(time.time() - start) * 1000,
+            )
+
+        max_retries = 3
+        for attempt in range(1, max_retries + 1):
+            discount = 0.90 - 0.05 * (attempt - 1)  # 10%, 15%, 20% off
+            sell_price = round(bought_price * discount, 2)
+            sell_price = max(sell_price, 0.01)
+            try:
+                order = Order(
+                    token_id=token_id,
+                    side=OrderSide.SELL,
+                    price=sell_price,
+                    size=token_amount,
+                    order_type=OrderType.FOK,
+                )
+                filled_order = await self._executor._submit_order(order)
+                elapsed = (time.time() - start) * 1000
+
+                if filled_order.status == OrderStatus.FILLED:
+                    logger.info(
+                        "PM unwind sell filled",
+                        attempt=attempt,
+                        sell_price=f"{sell_price:.4f}",
+                        bought_price=f"{bought_price:.4f}",
+                        loss_pct=f"{(1 - sell_price / bought_price):.1%}",
+                    )
+                    return BetResult(
+                        status=BetResult.Status.SUCCESS,
+                        platform=Platform.POLYMARKET,
+                        market_id=market_id,
+                        outcome=outcome,
+                        amount=token_amount * sell_price,
+                        effective_odds=sell_price,
+                        execution_time_ms=elapsed,
+                    )
+                logger.warning(
+                    "PM unwind sell rejected, retrying deeper",
+                    attempt=attempt,
+                    sell_price=f"{sell_price:.4f}",
+                )
+            except Exception as e:
+                logger.error(
+                    "PM unwind sell error",
+                    attempt=attempt,
+                    error=repr(e),
+                )
+            if attempt < max_retries:
+                await asyncio.sleep(0.5 * attempt)
+
+        elapsed = (time.time() - start) * 1000
+        return BetResult(
+            status=BetResult.Status.FAILED,
+            platform=Platform.POLYMARKET,
+            market_id=market_id,
+            outcome=outcome,
+            amount=0.0,
+            error_message=f"Unwind failed after {max_retries} attempts",
+            execution_time_ms=elapsed,
+        )
+
     # ------------------------------------------------------------------
     # Balance
     # ------------------------------------------------------------------

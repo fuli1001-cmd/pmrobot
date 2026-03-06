@@ -171,7 +171,39 @@ class BaseExchange(ABC):
             Balance in USDC.
         """
 
-    # ---- optional helpers with default impls ----
+    # ---- optional methods with default impls ----
+
+    async def sell_position(
+        self,
+        market_id: str,
+        outcome: OutcomeSide,
+        token_amount: float,
+        bought_price: float,
+    ) -> BetResult:
+        """Attempt to sell (unwind) a filled position at a discount.
+
+        Used for emergency exit when one leg of a cross-platform trade
+        fails.  Not all platforms support instant selling — the default
+        implementation returns FAILED.
+
+        Args:
+            market_id: Market to sell in.
+            outcome: Which side to sell (YES or NO).
+            token_amount: Number of tokens (shares) to sell.
+            bought_price: Price at which the position was acquired
+                          (used to compute discount sell price).
+
+        Returns:
+            BetResult with execution details.
+        """
+        return BetResult(
+            status=BetResult.Status.FAILED,
+            platform=self.platform,
+            market_id=market_id,
+            outcome=outcome,
+            amount=0.0,
+            error_message="sell_position not supported on this platform",
+        )
 
     async def __aenter__(self):
         await self.connect()

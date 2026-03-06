@@ -41,6 +41,7 @@ from exchanges.base import (
     UnifiedOdds,
 )
 from utils.logger import get_logger
+from utils.rate_limiter import RateLimiter
 
 logger = get_logger(__name__)
 
@@ -82,6 +83,16 @@ TAKER_MIN_USDC = 1.0
 
 # SX Bet odds precision: percentageOdds = impliedOdds * 10^20
 ODDS_PRECISION = 10**20
+
+# Rate limiting defaults for SX Bet REST API.
+# SX Bet does not publish explicit rate limits but returns HTTP 429
+# when the caller is too aggressive.  Conservative defaults:
+_SXBET_RATE_LIMIT_RPS = 5.0     # requests per second
+_SXBET_RATE_LIMIT_BURST = 8     # burst bucket size
+
+# 429 retry: exponential backoff parameters
+_SXBET_RETRY_MAX = 3            # max retry attempts on 429
+_SXBET_RETRY_BASE_DELAY = 1.0   # base delay in seconds (doubles each retry)
 
 
 class SxBetExchange(BaseExchange):
@@ -132,6 +143,12 @@ class SxBetExchange(BaseExchange):
 
         # Market cache: marketHash -> market data (raw API response)
         self._markets_cache: Dict[str, Dict] = {}
+
+        # Rate limiter — throttles all outgoing HTTP requests
+        self._rate_limiter = RateLimiter(
+            rate=_SXBET_RATE_LIMIT_RPS,
+            burst=_SXBET_RATE_LIMIT_BURST,
+        )
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -213,6 +230,63 @@ class SxBetExchange(BaseExchange):
         logger.info("SxBetExchange disconnected")
 
     # ------------------------------------------------------------------
+    # Rate-limited HTTP helpers
+    # ------------------------------------------------------------------
+
+    async def _get(self, path: str, **kwargs) -> httpx.Response:
+        """Rate-limited GET with 429 exponential-backoff retry."""
+        return await self._request("GET", path, **kwargs)
+
+    async def _post(self, path: str, **kwargs) -> httpx.Response:
+        """Rate-limited POST with 429 exponential-backoff retry."""
+        return await self._request("POST", path, **kwargs)
+
+    async def _request(
+        self, method: str, path: str, **kwargs
+    ) -> httpx.Response:
+        """Send an HTTP request through the rate limiter.
+
+        On HTTP 429 (Too Many Requests), retries up to
+        ``_SXBET_RETRY_MAX`` times with exponential backoff.
+        All other errors are raised immediately.
+        """
+        if not self._http:
+            raise RuntimeError("SxBetExchange not connected")
+
+        last_exc: Optional[Exception] = None
+        for attempt in range(_SXBET_RETRY_MAX + 1):
+            await self._rate_limiter.acquire()
+            try:
+                resp = await self._http.request(method, path, **kwargs)
+                if resp.status_code != 429:
+                    return resp
+                # 429 — back off and retry
+                delay = _SXBET_RETRY_BASE_DELAY * (2 ** attempt)
+                logger.warning(
+                    "SX Bet 429 rate-limited, backing off",
+                    attempt=attempt + 1,
+                    delay=f"{delay:.1f}s",
+                    path=path,
+                )
+                await asyncio.sleep(delay)
+            except httpx.HTTPError as exc:
+                last_exc = exc
+                delay = _SXBET_RETRY_BASE_DELAY * (2 ** attempt)
+                logger.warning(
+                    "SX Bet HTTP error, retrying",
+                    attempt=attempt + 1,
+                    delay=f"{delay:.1f}s",
+                    error=repr(exc),
+                )
+                await asyncio.sleep(delay)
+
+        # All retries exhausted — raise last error or return last 429
+        if last_exc:
+            raise last_exc
+        # resp is from the last loop iteration (still 429)
+        return resp  # type: ignore[possibly-undefined]
+
+    # ------------------------------------------------------------------
     # Market discovery
     # ------------------------------------------------------------------
 
@@ -247,7 +321,7 @@ class SxBetExchange(BaseExchange):
 
         try:
             while pages_fetched < max_pages:
-                resp = await self._http.get("/markets/active", params=params)
+                resp = await self._get("/markets/active", params=params)
                 resp.raise_for_status()
                 body = resp.json()
 
@@ -396,7 +470,7 @@ class SxBetExchange(BaseExchange):
 
         try:
             # Fetch best odds (both outcomes at once)
-            resp = await self._http.get(
+            resp = await self._get(
                 "/orders/odds/best",
                 params={
                     "marketHashes": market_id,
@@ -504,7 +578,7 @@ class SxBetExchange(BaseExchange):
             return (0.0, 0.0, 0.0, 0.0)
 
         try:
-            resp = await self._http.get(
+            resp = await self._get(
                 "/orders",
                 params={
                     "marketHashes": market_id,
@@ -698,7 +772,7 @@ class SxBetExchange(BaseExchange):
                 "message": "N/A",
             }
 
-            resp = await self._http.post("/orders/fill/v2", json=payload)
+            resp = await self._post("/orders/fill/v2", json=payload)
             elapsed = (time.time() - start) * 1000
 
             if resp.status_code == 200:
@@ -927,7 +1001,7 @@ class SxBetExchange(BaseExchange):
             params = {}
             if sport_id is not None:
                 params["sportIds"] = sport_id
-            resp = await self._http.get("/leagues/active", params=params)
+            resp = await self._get("/leagues/active", params=params)
             resp.raise_for_status()
             body = resp.json()
             leagues = body.get("data", []) if isinstance(body, dict) else body
@@ -954,7 +1028,7 @@ class SxBetExchange(BaseExchange):
                 params["marketHashes"] = market_hash
             if self._wallet_address:
                 params["maker"] = self._wallet_address
-            resp = await self._http.get("/trades", params=params)
+            resp = await self._get("/trades", params=params)
             resp.raise_for_status()
             body = resp.json()
             trades = body.get("data", []) if isinstance(body, dict) else body
