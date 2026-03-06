@@ -4,6 +4,7 @@ py-clob-client>=0.18.0
 # Async HTTP & WebSocket
 aiohttp>=3.9.0
 websockets>=12.0
+ably>=3.0.0
 
 # Blockchain
 web3>=6.15.0

@@ -31,6 +31,8 @@ from exchanges.polymarket import PolymarketExchange
 from exchanges.sxbet import SxBetExchange
 from core.alignment import MarketAligner
 from core.cross_platform import CrossPlatformDetector, CrossPlatformExecutor
+from core.cross_monitor import CrossPlatformMonitor
+from exchanges.sxbet_ws import SxBetWebSocket
 from models.cross_models import CrossPlatformOpportunity, CrossExecutionReport
 
 logger = get_logger(__name__)
@@ -88,6 +90,8 @@ class ArbitrageBot:
         self._market_aligner: Optional[MarketAligner] = None
         self._cross_detector: Optional[CrossPlatformDetector] = None
         self._cross_executor: Optional[CrossPlatformExecutor] = None
+        self._cross_monitor: Optional[CrossPlatformMonitor] = None
+        self._sx_ws: Optional[SxBetWebSocket] = None
 
     async def start(self) -> None:
         """Start the arbitrage bot."""
@@ -158,10 +162,12 @@ class ArbitrageBot:
                 self._run_market_refresher(),
             ]
 
-            # Add cross-platform executor (scanner merged into refresher)
-            if self._cross_detector and self._cross_executor:
+            # Add cross-platform executor + WebSocket monitors
+            if self._cross_executor:
                 tasks.append(self._run_cross_platform_executor())
-                logger.info("Cross-platform executor task added (scanner merged into refresher)")
+            if self._cross_monitor:
+                tasks.append(self._cross_monitor.run_pm_ws())
+                logger.info("Cross-platform WS tasks added (PM WS + SX Ably WS)")
 
             await asyncio.gather(*tasks)
 
@@ -191,6 +197,16 @@ class ArbitrageBot:
 
         if self.settler:
             await self.settler.stop()
+
+        # Cross-platform WebSocket cleanup
+        if self._cross_monitor:
+            await self._cross_monitor.stop()
+        if self._sx_ws:
+            await self._sx_ws.close()
+        if self._sx_exchange:
+            await self._sx_exchange.disconnect()
+        if self._pm_exchange:
+            await self._pm_exchange.disconnect()
 
         # Final stats
         stats = self.risk_manager.get_stats_summary()
@@ -640,10 +656,9 @@ class ArbitrageBot:
 
         logger.info(f"Market refresher started (interval={interval}s)")
 
-        # ── Initial cross-platform scan (runs once before the sleep loop
-        #    so that cross-platform detection starts immediately) ──
-        if self._cross_detector:
-            await self._cross_platform_scan_cycle()
+        # ── Initial cross-platform alignment (populate WS subscriptions) ──
+        if self._cross_monitor:
+            await self._cross_platform_alignment_cycle()
 
         while self._running:
             try:
@@ -694,9 +709,9 @@ class ArbitrageBot:
                 else:
                     logger.debug("Refresher: No new events found")
 
-                # --- Cross-platform scan (reuse all_markets) ---
-                if self._cross_detector and self._pm_exchange:
-                    await self._cross_platform_scan_cycle(all_markets)
+                # --- Cross-platform alignment refresh (WS handles evaluation) ---
+                if self._cross_monitor and self._pm_exchange:
+                    await self._cross_platform_alignment_cycle()
 
             except asyncio.CancelledError:
                 break
@@ -755,60 +770,64 @@ class ArbitrageBot:
             dry_run=self.dry_run,
         )
 
+        # ── SX Bet WebSocket (Ably) ──
+        self._sx_ws = SxBetWebSocket(
+            api_key=self.settings.sxbet_api_key or "",
+            api_url=self.settings.sxbet_api_url,
+            base_token=self.settings.sxbet_usdc_address,
+        )
+
+        # ── Cross-platform monitor (dual WS) ──
+        self._cross_monitor = CrossPlatformMonitor(
+            sx_ws=self._sx_ws,
+            opportunity_queue=self._cross_opportunity_queue,
+            profit_threshold=self.settings.cross_profit_threshold,
+            trade_size=self.settings.cross_trade_size,
+        )
+        # Wire SX WS callbacks
+        self._sx_ws._on_book_update = self._cross_monitor.on_sx_book_update
+
+        # Connect SX Bet WebSocket
+        await self._sx_ws.connect()
+
         logger.info(
-            "Cross-platform arbitrage initialised",
+            "Cross-platform arbitrage initialised (WS mode)",
             profit_threshold=f"{self.settings.cross_profit_threshold:.2%}",
             trade_size=f"${self.settings.cross_trade_size:.2f}",
         )
 
-    async def _cross_platform_scan_cycle(
-        self, pm_raw_markets: list = None,
-    ) -> None:
-        """Run one cross-platform alignment + detection cycle.
+    async def _cross_platform_alignment_cycle(self) -> None:
+        """Run one cross-platform market alignment cycle.
 
-        Iterates over every sport in ``CROSS_SPORT_MAP`` so each sport's
-        Cartesian product (PM × Azuro) stays small.  The optional
-        *pm_raw_markets* pre-fetched list is used only to warm the
-        internal pricing cache—it is NOT used for alignment.
+        Discovers matching market pairs across PM and SX Bet, then
+        pushes them to the ``CrossPlatformMonitor`` which manages WS
+        subscriptions and real-time evaluation.
         """
         from config.constants import CROSS_SPORT_MAP
 
         try:
-            # ── Cache warm (if the refresher already pulled all markets) ──
-            if pm_raw_markets is not None:
-                self._pm_exchange.update_cache(pm_raw_markets)
-
             all_pairs = []
             total_pm = 0
             total_alt = 0
 
             for pm_tag, alt_sport in CROSS_SPORT_MAP:
-                # Fetch both sides concurrently for this sport
                 pm_markets, alt_markets = await asyncio.gather(
                     self._pm_exchange.get_markets(sport=pm_tag),
                     self._alt_exchange.get_markets(sport=alt_sport),
                 )
 
                 if not pm_markets or not alt_markets:
-                    logger.debug(
-                        "Cross-scan: no markets for sport",
-                        pm_tag=pm_tag,
-                        alt_sport=alt_sport,
-                        pm=len(pm_markets) if pm_markets else 0,
-                        alt=len(alt_markets) if alt_markets else 0,
-                    )
                     continue
 
                 total_pm += len(pm_markets)
                 total_alt += len(alt_markets)
 
-                # Align per sport (keeps Cartesian products small)
                 pairs = await self._market_aligner.align(
                     pm_markets, alt_markets,
                 )
                 if pairs:
                     logger.info(
-                        "Cross-scan sport matched",
+                        "Cross-align sport matched",
                         sport=pm_tag,
                         pairs=len(pairs),
                         pm=len(pm_markets),
@@ -817,7 +836,7 @@ class ArbitrageBot:
                     all_pairs.extend(pairs)
 
             logger.info(
-                "Cross-scan cycle complete",
+                "Cross-platform alignment complete",
                 sports=len(CROSS_SPORT_MAP),
                 total_pm=total_pm,
                 total_alt=total_alt,
@@ -825,37 +844,11 @@ class ArbitrageBot:
             )
 
             if all_pairs:
-                opportunities = await self._cross_detector.scan(all_pairs)
-                for opp in opportunities:
-                    if self.risk_manager.can_trade():
-                        logger.info(
-                            "Cross opportunity detected - queuing for execution",
-                            pm_market=opp.pm_question[:60],
-                            alt_market=opp.az_question[:60],
-                            strategy=opp.strategy.value,
-                            yes_on=opp.yes_platform.value,
-                            price_yes=f"{opp.price_yes:.4f}",
-                            price_no=f"{opp.price_no:.4f}",
-                            total_cost=f"{opp.total_cost:.4f}",
-                            net_profit_pct=f"{opp.net_profit_pct:.2%}",
-                            profit_usdc=f"${opp.net_profit_pct * opp.trade_size_usdc:.2f}",
-                            trade_size=f"${opp.trade_size_usdc:.2f}",
-                        )
-                        try:
-                            self._cross_opportunity_queue.put_nowait(opp)
-                        except asyncio.QueueFull:
-                            logger.warning("Cross-platform queue full")
-                    else:
-                        logger.warning(
-                            "Cross opportunity detected but rejected by risk manager",
-                            pm_market=opp.pm_question[:60],
-                            net_profit_pct=f"{opp.net_profit_pct:.2%}",
-                            reason="cooldown or circuit breaker",
-                        )
+                await self._cross_monitor.update_pairs(all_pairs)
 
         except Exception as e:
             logger.error(
-                "Cross-platform scan cycle error",
+                "Cross-platform alignment error",
                 error=repr(e),
                 traceback=traceback.format_exc(),
             )
