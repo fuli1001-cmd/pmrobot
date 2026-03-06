@@ -1,6 +1,6 @@
 # 预测市场套利机器人 (Prediction Market Arbitrage Bot)
 
-全自动化的多平台预测市场套利机器人。支持 **Polymarket** 和 **Azuro** 两大平台，实时监控 Binary（二元）市场和 Negative Risk（负风险）市场，利用价格无效率自动捕获无风险（或接近无风险）利润。支持平台内套利（Long / Short / NegRisk）和**跨平台合成套利**（Polymarket vs Azuro）。
+全自动化的多平台预测市场套利机器人。支持 **Polymarket** (CLOB) 平台内套利和 **Polymarket ↔ SX Bet** 跨平台合成套利，实时监控 Binary（二元）市场和 Negative Risk（负风险）市场，利用价格无效率自动捕获无风险（或接近无风险）利润。
 
 > **一句话概括**：当一组互斥结果的价格之和偏离理论值时——无论在同一平台内或跨平台——通过买入或铸造+卖出来锁定差价利润。
 
@@ -60,6 +60,17 @@
 - **Polygon**：以太坊的 Layer 2 网络，交易快、Gas 费低
 - **FOK 订单**：Fill-or-Kill，要么全部成交要么全部取消——用于保证原子性
 - **Negative Risk 市场**：一种特殊市场类型，包含多个互斥结果（>2个）
+
+### SX Bet 简介
+
+[SX Bet](https://sx.bet) 是基于 SX Network（Arbitrum Orbit L2, chain ID 4162）的去中心化预测市场。同样使用 USDC (6 decimals) 作为基础代币，通过 peer-to-peer CLOB 撮合交易。
+
+**关键属性**：
+- **0% taker fee**（5% oracle fee 仅对赢利部分收取）
+- **EIP-712 签名**：taker 下单需通过 EIP-712 typed data 签名
+- **desiredOdds + oddsSlippage**：类似 FOK 的滑点保护
+- **Taker minimum**：1 USDC
+- **Odds 精度**：`percentageOdds = impliedOdds × 10^20`
 
 ---
 
@@ -157,10 +168,6 @@ No 总成本:   $0.52 + $0.60 + $0.68 = $1.80
 净利润:      $2.00 - $1.80 = $0.20 (11.1% ROI)  ✅
 ```
 
-**为什么有效？** ——当 Sum(Yes) > $1.00 时，意味着 Sum(No) < $(N-1)（因为对同一个结果，Yes 价格 ≈ 1 - No 价格）。我们通过买入被低估的 No 合约来间接做空被高估的 Yes 市场。
-
-> 💡 这个策略的本质和 Buy-All-No 一样（都是买入全部 No），只是触发条件不同：Buy-All-No 直接看 No 价格之和是否低于 N-1，而 Short Rebalance 是通过观察 Yes 价格之和超过 1.00 来发现同样的机会。
-
 ### 3. Short Arbitrage（做空套利 — Mint+Sell）
 
 **原理**：通过 CTF 合约铸造（Mint）一组完整的 Yes+No 代币，然后在市场上卖出获利。
@@ -186,70 +193,42 @@ No 总成本:   $0.52 + $0.60 + $0.68 = $1.80
 
 ---
 
-## 🏗️ 系统架构
-
-```
-┌─────────────────────────────────────────────────────────┐
-│                   ArbitrageBot (main.py)                │
-│                   主程序 / 编排协调器                      │
-├─────────┬───────────┬───────────┬───────────┬───────────┤
-│ Scanner │  Monitor  │ Executor  │  Settler  │   Risk    │
-│  扫描器  │  监控器   │  执行器    │  结算器   │  风控器    │
-└────┬────┴─────┬─────┴─────┬─────┴─────┬─────┴─────┬─────┘
-     │          │           │           │           │
- Gamma API  WebSocket    CLOB API   CTF 合约    本地状态
- (REST)    (实时推送)   (下单/查询)  (链上合并)   (统计)
-```
-
-### 模块说明
-
-| 模块 | 文件 | 职责 |
-|------|------|------|
-| **Scanner** | `core/scanner.py` | 启动时通过 Gamma API 扫描全量市场，过滤出流动性足够的 Binary 市场和 NegRisk 事件组 |
-| **Monitor** | `core/monitor.py` | 通过 WebSocket 实时接收订单簿更新，内置 `ArbitrageDetector` 和 `NegativeRiskArbitrageDetector` 进行实时套利检测 |
-| **Executor** | `core/executor.py` | 接收套利机会队列，通过 CLOB API 并发提交 FOK 订单；处理部分成交时的紧急平仓。支持 Long Arb（买入）和 Short Arb（Mint+卖出）两种执行路径 |
-| **Settler** | `core/settler.py` | 定期扫描账户持仓，对可合并的头寸调用 CTF 合约的 `mergePositions` 函数，将代币对换回 USDC。支持 Relayer 无 Gas 模式和 EOA 直签模式 |
-| **Risk** | `core/risk.py` | 交易统计、市场冷却期、熔断器（连续失败自动暂停） |
-| **CTF** | `core/ctf.py` | CTF 合约交互，封装 `splitPosition`（铸造 Yes+No 代币）和 `mergePositions`（合并代币回 USDC）操作 |
-| **Notifier** | `utils/notifier.py` | 支持 Telegram、企业微信、或同时发送到两者（CompositeNotifier） |
-
-### 数据流
-
-```
-1. Scanner → 获取市场列表 → 传给 Monitor
-2. Monitor → WebSocket 订阅订单簿 → 检测到套利机会 → 放入队列
-   ├─ Long Arb (Ask+Ask < 1.0) → long_opportunity_queue
-   └─ Short Arb (Bid+Bid > 1.0) → short_opportunity_queue
-3. Executor → 从队列取出机会 → 校验 + 下单 → 更新 Risk 统计
-   ├─ Long Arb → 并发买入 Yes + No
-   └─ Short Arb → CTF Mint → 并发卖出 Yes + No
-4. Settler → 定期检查持仓 → 找到可合并头寸 → Relayer/EOA Merge → 收回 USDC
-5. Refresher → 定期重新扫描市场 → 动态更新 Monitor 的监控列表
-6. [跨平台] CrossScanner → 拉取两平台市场 → 对齐事件 → 比较价格 → cross_queue
-7. [跨平台] CrossExecutor → 从队列取出 → 并发双腿下单（PM FOK + Azuro LP.bet）
-```
-
----
-
 ## 🔀 跨平台套利 (Cross-Platform)
 
 ### 原理
 
-Polymarket（订单簿 CLOB）和 Azuro（AMM 流动性池）使用完全不同的定价引擎。对于同一体育赛事，两平台的价格可能存在显著差异。
+Polymarket (CLOB) 和 SX Bet (peer-to-peer CLOB) 使用独立的订单簿和不同的做市群体。对于同一体育赛事，两平台的价格可能存在显著差异。
 
 **当前已实现策略：合成二元对冲（Binary Hedge）** — 在便宜的平台买 YES，在另一个平台买 NO。
 
 ```
 事件："曼城 vs 利物浦 — 曼城胜？"
 
-Polymarket: Yes = $0.48 (Best Ask)
-Azuro:      No  = $0.46 (有效价格，含 AMM 价格冲击)
+Polymarket: Yes = $0.48 (CLOB Best Ask)
+SX Bet:     No  = $0.46 (VWAP for trade_size)
 ─────────────────────────
 总成本:     $0.94
 保证收益:   $1.00 - $0.94 = $0.06 (6.4%)
 ```
 
-> 💡 **关于其他跨平台策略**：设计文档中的"合成 NegRisk 套利"和"跨平台做空对齐"经评估后暂不实现——前者因两平台多选项市场重叠率接近零，后者因所需条件（PM Short 机会 + Azuro 同一事件低价）同时出现的概率极低，且 Azuro NFT 凭证无法即时退出带来的断腿风险过高。
+### 定价准确性
+
+传统的最优报价（best-ask）只反映订单簿顶部的价格，可能与实际成交价差异很大。本系统使用 **VWAP（Volume-Weighted Average Price）** 定价：
+
+- **SX Bet 端**：遍历整个订单簿，按 taker 价格排序，累积直到覆盖 `trade_size`，计算加权平均价格
+- **Polymarket 端**：从 CLOB `/book` 接口获取完整 ask 列表，计算深度
+- **双重深度门控**：PM 和 SX Bet 的可用深度必须 ≥ `trade_size`，否则放弃该机会
+
+这消除了因薄流动性导致的"幻影套利"——之前版本中 75-90% 的套利信号都是这类虚假信号。
+
+### 费用模型
+
+| 费用项 | 数值 | 说明 |
+|--------|------|------|
+| SX Bet taker fee | 0% | 免费 |
+| SX Bet oracle fee | 5% of winning profit | 因对冲策略只赢一侧，等效约 2.5% |
+| CLOB slippage buffer | 0.5% | 补偿报价→成交间的价格变动 |
+| SX Bet 执行成本 | ~$0.01 | SX Network gas 极低 |
 
 ### 事件对齐
 
@@ -258,13 +237,75 @@ Azuro:      No  = $0.46 (有效价格，含 AMM 价格冲击)
 1. **结构化规则（Phase 1）**：球队名标准化 + 日期 ± 6 小时 + 赛事类型 → 精确匹配（免费、快速）
 2. **LLM 语义兜底（Phase 2）**：收集所有规则未匹配的 Question 对，**批量提交**给 LLM 判定（最多 10 对/批次），结果持久化缓存到 SQLite，避免重复调用
 
+### EIP-712 签名
+
+SX Bet 要求 taker 使用 EIP-712 structured data 签名。本系统实现了完整的签名流程：
+
+- **Domain**：`{name: "SX Bet", version: domainVersion, chainId: 4162, verifyingContract: EIP712FillHasher}`
+- **类型**：嵌套 `Details` + `FillObject` 结构体
+- 使用 `eth_account.encode_typed_data` (v0.13.7+) 构造签名
+
 ### 关键特点
 
-- **滑点保护：** Polymarket 用 FOK 限价单，Azuro 用 `minOdds` 参数
-- **并发执行：** 双腿同时下单，最大化成交概率
-- **断腿处理：** Polymarket 侧可市价反向平仓；Azuro 侧为 NFT，需持有至结算
+- **VWAP 定价**：使用完整订单簿计算加权平均成交价，而非 best-ask
+- **双重深度门控**：PM 和 SX Bet 端均需足够流动性才会出手
+- **滑点保护**：PM 用 FOK 限价单，SX Bet 用 `desiredOdds` + `oddsSlippage`
+- **并发执行**：双腿同时下单，最大化成交概率
+- **EIP-712 签名**：完整实现 SX Bet fill/v2 标准
 
-> ⚠️ **风险：** Azuro bet 是 NFT 凭证，下注后无法即时退出。跨平台利润阈值默认 3%（高于平台内）以补偿此风险。
+> ⚠️ **未实现**：跨平台断腿处理（一侧成功另一侧失败时的自动平仓）尚为 TODO——初期小资金测试时此风险可接受。
+
+---
+
+## 🏗️ 系统架构
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    ArbitrageBot (main.py)                       │
+│                    主程序 / 编排协调器                             │
+├──────────┬──────────┬──────────┬──────────┬──────────┬──────────┤
+│ Scanner  │ Monitor  │ Executor │ Settler  │  Risk    │Cross-Plat│
+│ 扫描器   │ 监控器   │ 执行器   │ 结算器   │ 风控器   │ 跨平台   │
+└────┬─────┴────┬─────┴────┬─────┴────┬─────┴────┬─────┴────┬─────┘
+     │          │          │          │          │          │
+ Gamma API  WebSocket   CLOB API  CTF 合约   本地状态   SX Bet API
+ (REST)    (实时推送)  (下单/查询) (链上合并)  (统计)   (REST/EIP-712)
+```
+
+### 模块说明
+
+| 模块 | 文件 | 职责 |
+|------|------|------|
+| **Scanner** | `core/scanner.py` | 启动时通过 Gamma API 扫描全量市场，过滤出流动性足够的 Binary 市场和 NegRisk 事件组 |
+| **Monitor** | `core/monitor.py` | 通过 WebSocket 实时接收订单簿更新，内置 `ArbitrageDetector` 和 `NegativeRiskArbitrageDetector` 进行实时套利检测 |
+| **Executor** | `core/executor.py` | 接收套利机会队列，通过 CLOB API 并发提交 FOK 订单；处理部分成交时的紧急平仓。支持 Long Arb（买入）和 Short Arb（Mint+卖出） |
+| **Settler** | `core/settler.py` | 定期扫描 Polymarket 持仓，对可合并的头寸调用 CTF 合约的 `mergePositions`，将代币对换回 USDC |
+| **Risk** | `core/risk.py` | 交易统计、市场冷却期、熔断器（连续失败自动暂停） |
+| **CTF** | `core/ctf.py` | CTF 合约交互，封装 `splitPosition`（铸造 Yes+No 代币）和 `mergePositions`（合并代币回 USDC） |
+| **Cross-Platform** | `core/cross_platform.py` | 跨平台套利检测器 + 执行控制器（PM ↔ SX Bet 二元对冲） |
+| **Alignment** | `core/alignment.py` | 跨平台事件对齐（结构化规则 + LLM 兜底） |
+| **SX Bet** | `exchanges/sxbet.py` | SX Bet 适配器：市场发现、VWAP + 深度计算、EIP-712 签名、taker fill |
+| **Polymarket** | `exchanges/polymarket.py` | Polymarket 适配器：CLOB + WebSocket + Gamma API |
+| **Notifier** | `utils/notifier.py` | 支持 Telegram、企业微信、或同时发送到两者 |
+
+### 数据流
+
+```
+1. Scanner → 获取 Polymarket 市场列表 → 传给 Monitor
+2. Monitor → WebSocket 订阅订单簿 → 检测到套利机会 → 放入队列
+   ├─ Long Arb (Ask+Ask < 1.0) → long_opportunity_queue
+   └─ Short Arb (Bid+Bid > 1.0) → short_opportunity_queue
+3. Executor → 从队列取出机会 → 校验 + 下单 → 更新 Risk 统计
+   ├─ Long Arb → 并发买入 Yes + No
+   └─ Short Arb → CTF Mint → 并发卖出 Yes + No
+4. Settler → 定期检查 PM 持仓 → 找到可合并头寸 → Merge → 收回 USDC
+5. Refresher → 定期重新扫描市场 → 动态更新 Monitor 监控列表
+
+═══ 跨平台 ═══
+6. CrossScanner → 拉取 PM + SX Bet 市场 → 名称对齐 → 配对
+7. CrossDetector → 获取双平台价格 (VWAP+深度) → 计算利润 → cross_queue
+8. CrossExecutor → 从队列取出 → 并发双腿下单（PM FOK + SX fill/v2）
+```
 
 ---
 
@@ -283,14 +324,14 @@ pmrobot/
 │
 ├── exchanges/              # ★ 统一交易所适配器层
 │   ├── base.py             # BaseExchange ABC + 统一数据模型
-│   ├── polymarket.py       # Polymarket 适配器（CLOB + WebSocket）
-│   └── azuro.py            # Azuro 适配器（GraphQL + LP 合约）
+│   ├── polymarket.py       # Polymarket 适配器（CLOB + WebSocket + Gamma）
+│   └── sxbet.py            # SX Bet 适配器（REST + VWAP + EIP-712）
 │
 ├── core/
 │   ├── scanner.py          # 市场扫描（Gamma REST API）
-│   ├── monitor.py          # WebSocket 监控 + 套利检测器
-│   ├── executor.py         # 订单执行引擎（CLOB API）
-│   ├── settler.py          # 持仓结算（Relayer 无 Gas / EOA 直签）
+│   ├── monitor.py          # WebSocket 监控 + PM 套利检测器
+│   ├── executor.py         # PM 订单执行引擎（CLOB API）
+│   ├── settler.py          # PM 持仓结算（Relayer 无 Gas / EOA 直签）
 │   ├── risk.py             # 风险管理器
 │   ├── ctf.py              # CTF 合约交互（Mint/Merge）
 │   ├── alignment.py        # ★ 跨平台事件对齐（结构化规则 + LLM 兜底）
@@ -308,9 +349,11 @@ pmrobot/
 │   ├── rate_limiter.py     # API 限速器
 │   └── name_normalizer.py  # ★ 球队/选手名称标准化
 │
-├── tests/
+├── tests/                  # 测试和调试脚本
+│   ├── test_eip712.py      # EIP-712 签名验证
 │   ├── test_monitor.py     # Monitor 单元测试
-│   └── test_scanner.py     # Scanner 单元测试
+│   ├── test_scanner.py     # Scanner 单元测试
+│   └── ...                 # 其他调试脚本
 │
 ├── logs/                   # 运行日志输出目录
 └── docs/                   # 设计文档
@@ -323,8 +366,9 @@ pmrobot/
 ### 前提条件
 
 - Python 3.11+
-- 一个 Polygon 钱包（有少量 MATIC 用于 Gas）和 USDC
-- （可选）Polymarket 账户的 CLOB API 凭证
+- Polygon 钱包 (MATIC + USDC) — 用于 Polymarket
+- SX Network 钱包 (USDC) — 用于 SX Bet 跨平台套利
+- （可选）Polymarket CLOB API 凭证
 
 ### 1. 安装
 
@@ -333,12 +377,9 @@ pmrobot/
 git clone <repo-url>
 cd pmrobot
 
-# 创建并激活虚拟环境
-python -m venv venv
-# Windows:
-venv\Scripts\activate
-# macOS/Linux:
-source venv/bin/activate
+# 创建 conda 环境（推荐）
+conda create -n pmrobot python=3.11
+conda activate pmrobot
 
 # 安装依赖
 pip install -r requirements.txt
@@ -349,17 +390,15 @@ pip install -r requirements.txt
 创建 `.env` 文件：
 
 ```bash
-# Windows:
-copy .env.example .env
-# macOS/Linux:
-cp .env.example .env
+copy .env.example .env   # Windows
+cp .env.example .env     # macOS/Linux
 ```
 
-编辑 `.env`，填入以下信息：
+编辑 `.env`：
 
 ```env
 # ═══ 必填（实盘交易） ═══
-PRIVATE_KEY=0xYourWalletPrivateKey
+PRIVATE_KEY=0xYourPolygonWalletPrivateKey
 POLYGON_RPC_URL=https://polygon-mainnet.g.alchemy.com/v2/YOUR_KEY
 
 # CLOB API 凭证（可通过 gen_creds.py 从私钥派生）
@@ -370,53 +409,58 @@ POLYMARKET_PASSPHRASE=your_passphrase
 # Proxy Wallet（Gnosis Safe 地址，由 Polymarket 为你创建）
 PROXY_WALLET_ADDRESS=0xYourProxyWallet
 
+# ═══ SX Bet（跨平台套利必填） ═══
+SXBET_ENABLED=true
+SXBET_API_KEY=your_sx_bet_api_key
+SXBET_PRIVATE_KEY=0xYourSxNetworkPrivateKey   # 32 字节私钥，非地址！
+
+# ═══ 跨平台套利 ═══
+CROSS_PLATFORM_ENABLED=true
+CROSS_PROFIT_THRESHOLD=0.01      # 1%（推荐初始值）
+CROSS_TRADE_SIZE=25              # 每笔跨平台金额 (USDC)
+ALIGNMENT_USE_LLM=true
+LLM_API_KEY=your_llm_key
+LLM_BASE_URL=https://api.deepseek.com
+LLM_MODEL=deepseek-chat
+
+# ═══ 交易参数 ═══
+PROFIT_THRESHOLD=0.005           # PM 平台内利润阈值 (0.5%)
+SINGLE_TRADE_SIZE=20             # PM 平台内单笔金额 (USDC)
+MAX_SLIPPAGE=0.002               # 最大滑点 (0.2%)
+MERGE_INTERVAL=600               # 自动合并间隔 (秒)
+MARKET_REFRESH_INTERVAL=600      # 全量刷新 + 跨平台扫描间隔 (秒)
+
 # ═══ 可选 ═══
-# Builder Program 凭证（启用 Relayer 无 Gas 合并，不配时用 EOA 直签）
-BUILDER_API_KEY=
-BUILDER_SECRET=
-BUILDER_PASSPHRASE=
+WECHAT_WEBHOOK_URL=https://qyapi.weixin.qq.com/...
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_CHAT_ID=
 
-# 交易参数
-PROFIT_THRESHOLD=0.008          # 最低利润阈值 (0.8%)
-SINGLE_TRADE_SIZE=100           # 单笔交易金额 (USDC)
-MAX_SLIPPAGE=0.002              # 最大滑点 (0.2%)
-MERGE_INTERVAL=600              # 自动合并间隔 (秒)
-MARKET_REFRESH_INTERVAL=1800    # 全量市场刷新 + 跨平台扫描间隔 (秒，0=禁用)
-
-# 通知 —— 两者均可配置，将同时发送
-TELEGRAM_BOT_TOKEN=123456:ABC-DEF
-TELEGRAM_CHAT_ID=-1001234567890
-WECHAT_WEBHOOK_URL=https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxx
-
-# 其他
-DRY_RUN=false
+DRY_RUN=true                     # 强烈推荐先 dry run
 LOG_LEVEL=INFO
-ENV=production                  # production / testnet
+ENV=production
 ```
 
 #### 如何获取 CLOB API 凭证
-
-如果你有钱包私钥但没有 API 凭证，可以使用自带的派生脚本：
 
 ```bash
 python gen_creds.py
 ```
 
-该脚本使用 `py_clob_client` 从私钥派生 API Key / Secret / Passphrase，并打印到控制台。将结果填入 `.env` 即可。
+从私钥派生 API Key / Secret / Passphrase。
 
 ### 3. 运行
 
 ```bash
-# ✅ 推荐：先以 Dry Run 模式运行，观察日志
+# ✅ 推荐：先以 Dry Run 模式运行
 python main.py --dry-run
 
-# 调整日志级别查看更多细节
+# 调整日志级别
 python main.py --dry-run --log-level DEBUG
 
-# JSON 格式日志（适合管道处理或 ELK 采集）
+# JSON 格式日志
 python main.py --dry-run --log-json
 
-# ⚠️ 实盘运行（涉及真实资金！）
+# ⚠️ 实盘运行（真实资金！先确保 dry-run 稳定 24h+）
 python main.py
 ```
 
@@ -424,40 +468,58 @@ python main.py
 
 ## ⚙️ 配置参数
 
+### Polymarket 平台内参数
+
 | 参数 | 环境变量 | 默认值 | 范围 | 说明 |
 |------|----------|--------|------|------|
-| 利润阈值 | `PROFIT_THRESHOLD` | 0.008 (0.8%) | 0.001~0.1 | 只有 `净利润率 ≥ 此值` 时才触发交易。越低越激进。 |
-| 单笔金额 | `SINGLE_TRADE_SIZE` | 100.0 | 1~10000 | 每次套利投入的 USDC 总金额。NegRisk 策略会按结果数平分。 |
-| 最大滑点 | `MAX_SLIPPAGE` | 0.002 (0.2%) | 0.01%~5% | 深度穿透后的加权均价与最优价的偏差上限。 |
-| 合并间隔 | `MERGE_INTERVAL` | 600 (10分钟) | 60~3600 | Settler 自动检查持仓并合并的周期。 |
-| 刷新间隔 | `MARKET_REFRESH_INTERVAL` | 1800 (30分钟) | 0~86400 | 定期重新扫描新市场/事件。设为 0 禁用。 |
-| API 限速 | `API_RATE_LIMIT` | 10 req/s | 1~100 | Scanner 和 Executor 对 API 的请求速率上限。 |
+| 利润阈值 | `PROFIT_THRESHOLD` | 0.008 (0.8%) | 0.001~0.1 | 套利触发最低利润率 |
+| 单笔金额 | `SINGLE_TRADE_SIZE` | 100.0 | 1~10000 | USDC 金额（NegRisk 按结果数平分） |
+| 最大滑点 | `MAX_SLIPPAGE` | 0.002 (0.2%) | 0.01%~5% | 加权均价偏差上限 |
+| 合并间隔 | `MERGE_INTERVAL` | 600 (10min) | 60~3600 | Settler 自动合并周期 |
+| 刷新间隔 | `MARKET_REFRESH_INTERVAL` | 1800 (30min) | 0~86400 | 全量市场 + 跨平台扫描间隔 |
 
-### Azuro / 跨平台参数
+### 跨平台参数
 
 | 参数 | 环境变量 | 默认值 | 说明 |
 |------|----------|--------|------|
-| 启用 Azuro | `AZURO_ENABLED` | false | 启用 Azuro 交易所适配器 |
-| LP 合约地址 | `AZURO_LP_ADDRESS` | — | Azuro LP 合约地址 (Polygon) |
-| Core 合约地址 | `AZURO_CORE_ADDRESS` | — | Azuro Core 合约地址 (Polygon) |
-| Subgraph URL | `AZURO_SUBGRAPH_URL` | (data-feed-polygon) | Azuro 数据子图端点 |
-| 启用跨平台 | `CROSS_PLATFORM_ENABLED` | false | 启用跨平台套利 |
-| 跨平台利润阈值 | `CROSS_PROFIT_THRESHOLD` | 0.03 (3%) | 跨平台最低利润阈值（高于平台内，因含 Azuro 断腿风险） |
-| 跨平台金额 | `CROSS_TRADE_SIZE` | 50.0 | 跨平台单笔 USDC 金额 |
-| LLM 对齐 | `ALIGNMENT_USE_LLM` | false | 启用 LLM 事件对齐兜底 |
-| LLM Key | `LLM_API_KEY` | — | LLM API Key（支持 OpenAI/DeepSeek 等兼容 API） |
-| LLM URL | `LLM_BASE_URL` | api.openai.com/v1 | LLM API 基础 URL（DeepSeek: `api.deepseek.com/v1`） |
-| LLM 模型 | `LLM_MODEL` | gpt-4o-mini | 模型名称（DeepSeek: `deepseek-chat`） |
+| 启用跨平台 | `CROSS_PLATFORM_ENABLED` | false | 启用 PM ↔ SX Bet 跨平台套利 |
+| 利润阈值 | `CROSS_PROFIT_THRESHOLD` | 0.03 (3%) | 跨平台最低利润（含 oracle fee 后） |
+| 单笔金额 | `CROSS_TRADE_SIZE` | 50.0 | 跨平台单笔 USDC 金额 |
+| LLM 对齐 | `ALIGNMENT_USE_LLM` | false | 启用 LLM 事件名称对齐兜底 |
+| LLM Key | `LLM_API_KEY` | — | OpenAI/DeepSeek 兼容 API Key |
+| LLM URL | `LLM_BASE_URL` | api.openai.com/v1 | LLM API 基础 URL |
+| LLM 模型 | `LLM_MODEL` | gpt-4o-mini | 模型名称 |
+
+### SX Bet 参数
+
+| 参数 | 环境变量 | 默认值 | 说明 |
+|------|----------|--------|------|
+| 启用 SX Bet | `SXBET_ENABLED` | false | 启用 SX Bet 适配器 |
+| API Key | `SXBET_API_KEY` | — | SX Bet REST API key |
+| 私钥 | `SXBET_PRIVATE_KEY` | — | SX Network 钱包私钥（EIP-712 签名） |
+| API URL | `SXBET_API_URL` | api.sx.bet | SX Bet API 基础 URL |
+| Chain ID | `SXBET_CHAIN_ID` | 4162 | SX Network chain ID |
 
 ### 利润阈值调优建议
 
-- **保守偏好**：`PROFIT_THRESHOLD=0.015`（1.5%）——只抓大机会，很少交易
-- **平衡偏好**：`PROFIT_THRESHOLD=0.008`（0.8%）——默认值，适合大多数情况
-- **激进偏好**：`PROFIT_THRESHOLD=0.003`（0.3%）——频繁交易，利润薄，对延迟敏感
+**PM 平台内**：
+- 保守：`PROFIT_THRESHOLD=0.015`（1.5%）——只抓大机会
+- 平衡：`PROFIT_THRESHOLD=0.008`（0.8%）——默认值
+- 激进：`PROFIT_THRESHOLD=0.003`（0.3%）——频繁交易，利润薄
 
-> 对于 NegRisk 市场，利润阈值会根据结果数量动态调整（结果越多，阈值按比例放宽），具体逻辑见 `config/constants.py` 中的 `get_profit_threshold()`。
-> 
-> **跨平台阈值默认 3%**，显著高于平台内，因为 Azuro 下注后生成 NFT 凭证，无法像订单簿一样即时卖出——断腿场景下只能持有至结算。
+**跨平台**：
+- 推荐初始值：`CROSS_PROFIT_THRESHOLD=0.01`（1%）
+- ⚠️ 不建议低于 0.8%：扣除 SX Bet oracle fee（~2.5% of profit）+ slippage buffer（0.5%）后，低于 0.8% 的名义利润可能为负
+
+### 初始测试资金推荐
+
+| 平台 | 推荐金额 | 用途 |
+|------|---------|------|
+| Polymarket (Polygon USDC) | $300 | PM 平台内套利 + 跨平台 PM 腿 |
+| SX Bet (SX Network USDC) | $200 | 跨平台 SX 腿 |
+| **总计** | **$500** | 最小可运行配置 |
+
+推荐初始参数：`SINGLE_TRADE_SIZE=20`, `CROSS_TRADE_SIZE=25`
 
 ---
 
@@ -482,8 +544,8 @@ python main.py [选项]
 
 1. **Telegram**：配置 `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID`
 2. **企业微信**：配置 `WECHAT_WEBHOOK_URL`（详见 [企业微信消息推送配置说明.md](企业微信消息推送配置说明.md)）
-3. **双通道**：同时配置时，通知会并发发送到两个渠道（任一成功即算成功）
-4. **无通知**：均未配置时使用 DummyNotifier，仅写日志
+3. **双通道**：同时配置时，通知会并发发送到两个渠道
+4. **无通知**：均未配置时仅写日志
 
 通知内容包括：启动/关停、交易成功/失败、持仓合并、异常告警。
 
@@ -491,28 +553,33 @@ python main.py [选项]
 
 ## 📋 日志与调试
 
-日志输出到控制台和 `logs/pmrobot.log`（自动创建）。
+日志输出到控制台和 `logs/pmrobot.log`（自动创建，每日轮转）。
 
 ### 关键日志关键词
 
 | 搜索关键词 | 含义 |
 |-----------|------|
-| `opportunity detected` | 套利机会被检测到（已通过阈值） |
-| `queuing for execution` | 机会通过风控，进入执行队列 |
+| `opportunity detected` | PM 平台内套利机会被检测到 |
+| `Cross-platform opportunities found` | 跨平台套利机会被检测到 |
 | `DRY RUN` | 模拟交易记录 |
 | `Emergency exit` | 部分成交，触发紧急平仓 |
-| `Merge successful` | 持仓合并成功（USDC 回收） |
-| `NegRisk Price sample` | 定期价格采样（用于观察市场状态） |
+| `Merge successful` | PM 持仓合并成功（USDC 回收） |
+| `Pair evaluated` | 跨平台配对评估结果 |
+| `Pair skipped` | 跨平台配对被跳过（深度不足/无报价） |
 | `circuit breaker` | 熔断器触发（连续失败暂停交易） |
+| `VWAP` | SX Bet VWAP 定价日志 |
 
 ### 调试技巧
 
 ```bash
-# 查看实时机会检测
-python main.py --dry-run --log-level DEBUG 2>&1 | findstr /i "opportunity"
+# 查看实时跨平台机会
+python main.py --dry-run --log-level DEBUG 2>&1 | findstr "opportunities found"
 
-# 只看 NegRisk 价格采样
-python main.py --dry-run 2>&1 | findstr "NegRisk Price sample"
+# 查看 SX Bet 深度数据
+python main.py --dry-run --log-level DEBUG 2>&1 | findstr "Pair evaluated"
+
+# 查看 PM 平台内机会
+python main.py --dry-run --log-level DEBUG 2>&1 | findstr "opportunity"
 ```
 
 ---
@@ -521,47 +588,68 @@ python main.py --dry-run 2>&1 | findstr "NegRisk Price sample"
 
 | 风险类型 | 说明 | 缓解措施 |
 |----------|------|----------|
-| **滑点风险** | 从检测到下单存在延迟，价格可能变动 | FOK 订单 + 滑点上限 (`MAX_SLIPPAGE`) |
-| **部分成交** | 多腿交易中只有部分腿成交，产生裸头寸 | 自动紧急平仓（带重试），5%~11% 折价卖出 |
-| **API 故障** | Polymarket API 或 Polygon RPC 可能不稳定 | WebSocket 自动重连 + 指数退避 |
-| **Gas 消耗** | Settler 合并和 Short Arb 铸造需要链上 Gas | Gas 成本已纳入利润计算；可配置 Relayer 免 Gas 合并 |
-| **资金安全** | 私钥泄露 = 资金损失 | 使用环境变量存储私钥，避免硬编码 |
+| **滑点风险** | 从检测到下单存在延迟 | PM: FOK 订单 + 滑点上限; SX: desiredOdds + oddsSlippage |
+| **部分成交** | 多腿交易只有部分腿成交 | PM 平台内: 自动紧急平仓; 跨平台: TODO（初期小资金） |
+| **API 故障** | API 或 RPC 不稳定 | WebSocket 自动重连 + 指数退避 |
+| **Gas 消耗** | PM Settler merge + Short Arb mint | Gas 成本已纳入利润计算；支持 Relayer 免 Gas |
+| **跨链风险** | PM (Polygon) 和 SX (SX Network) 在不同链 | 目前需手动再平衡资金 |
+| **资金安全** | 私钥泄露 = 资金损失 | 环境变量存储，独立钱包，.gitignore 排除 .env |
 
 ### 安全建议
 
-1. **务必先运行 `--dry-run`** 至少观察 24 小时，确认策略行为符合预期
-2. 使用独立的交易钱包，不要使用存有大量资产的主钱包
-3. 设置合理的 `SINGLE_TRADE_SIZE`，从小金额开始
+1. **务必先运行 `--dry-run`** 至少观察 24 小时
+2. 使用独立的交易钱包，不要使用主钱包
+3. 从小金额开始（推荐 PM $300 + SX $200）
 4. 定期检查日志中的异常告警
-5. 确保 `.env` 文件不被提交到版本控制（已在 `.gitignore` 中排除）
+5. 确保 `.env` 文件不被提交到版本控制
+
+### 已知限制
+
+| 功能 | 状态 | 说明 |
+|------|------|------|
+| PM 平台内套利 (5 种策略) | ✅ 已实现 | Binary Long/Short, NegRisk Buy-All-Yes/No, Short Rebalance |
+| PM ↔ SX Bet 跨平台套利 | ✅ 已实现 | 二元对冲，VWAP 定价，EIP-712 签名 |
+| SX Bet 平台内套利 | ❌ 未计划 | SX Bet 流动性不足，单平台套利机会极少 |
+| 跨平台断腿处理 | ⚠️ TODO | 一侧成功另一侧失败时的自动平仓 |
+| SX Bet 持仓追踪 | ⚠️ TODO | SX Bet 侧的 P&L 跟踪 |
+| 跨平台资金再平衡 | ❌ 手动 | PM/SX 在不同链，需手动桥接 |
+| SX Bet API 限速 | ⚠️ TODO | 无 429 退避重试 |
 
 ---
 
 ## ❓ 常见问题
 
 ### Q: Dry Run 模式下会消耗资金吗？
-**A**: 不会。Dry Run 模拟所有交易和合并操作——Executor 的订单会被跳过（`SKIPPED`），Settler 的链上合并也会被跳过（仅记录日志），余额显示为虚拟的 $10,000。
+**A**: 不会。Dry Run 模拟所有交易和合并操作，余额显示为虚拟的 $10,000。
 
 ### Q: 套利真的是"无风险"吗？
-**A**: 理论上是——只要所有腿同时成交。实际中最大的风险是**部分成交**（只有部分订单填满），此时机器人会以折扣价紧急卖出已成交的部分以止损。
+**A**: 理论上是——只要所有腿同时成交。实际中最大风险是**部分成交**（只有部分订单填满），此时 PM 端会以折扣价紧急卖出止损。
 
-### Q: 为什么使用 FOK 订单？
-**A**: FOK（Fill-or-Kill）确保每一腿要么完全成交，要么完全取消。这极大降低了多腿策略中出现"一只腿挂了"的概率。
+### Q: 为什么跨平台利润阈值设得比平台内高？
+**A**: 因为 SX Bet 有 5% oracle fee（等效 ~2.5%） + VWAP 滑点缓冲 0.5%，加上跨链结算时间更长。建议 `CROSS_PROFIT_THRESHOLD >= 0.01`（1%）。
+
+### Q: SXBET_PRIVATE_KEY 怎么填？
+**A**: 填 SX Network 上的钱包**私钥**（64 位十六进制, 0x 前缀），不是钱包地址（40 位）。私钥用于 EIP-712 签名下单。
+
+### Q: 两个平台的资金需要在同一个钱包吗？
+**A**: 不需要。PM 使用 Polygon 上的钱包（`PRIVATE_KEY`），SX Bet 使用 SX Network 上的钱包（`SXBET_PRIVATE_KEY`），可以是不同地址。
+
+### Q: 如何获取 SX Bet API Key？
+**A**: 访问 [SX Bet Developer Portal](https://api.docs.sx.bet) 注册获取。
 
 ### Q: 观察了很久都没有机会出现？
-**A**: 套利机会是短暂的且竞争激烈。建议：
-- 降低 `PROFIT_THRESHOLD`（如 0.003）
-- 增大扫描范围（确保 `MARKET_REFRESH_INTERVAL > 0`）
-- 使用 `--log-level DEBUG` 查看价格采样，确认市场数据正常
-- 关注 NegRisk 事件（结果越多，定价低效的概率越高）
-
-### Q: 如何获取 Proxy Wallet 地址？
-**A**: 在 Polymarket 网站注册并连接钱包后，系统会为你创建一个 Gnosis Safe 代理钱包。可以在钱包设置页面找到它。这是 CLOB API 实际操作的地址。
+**A**: 建议：
+- 适当降低 `PROFIT_THRESHOLD`
+- 确保 `MARKET_REFRESH_INTERVAL > 0`
+- 使用 `--log-level DEBUG` 查看 `Pair evaluated` 日志
+- 跨平台机会通常出现在体育赛事密集时段
 
 ### Q: 机器人使用哪些 API？
 **A**:
-- **Gamma REST API** — 获取市场列表和元数据
-- **CLOB WebSocket** — 实时订单簿推送
-- **CLOB REST API** — 下单、查余额
-- **Polygon RPC** — 调用 CTF 合约进行链上铸造（Mint）和合并（Merge）
-- **Relayer API**（可选）— 无 Gas meta-transaction 合并
+- **Gamma REST API** — PM 市场列表和元数据
+- **CLOB WebSocket** — PM 实时订单簿推送
+- **CLOB REST API** — PM 下单、查余额
+- **Polygon RPC** — CTF 合约铸造/合并
+- **SX Bet REST API** — SX 市场发现、报价、下单
+- **SX Network RPC** — SX USDC 余额查询
+- **LLM API**（可选）— 事件名称语义对齐
