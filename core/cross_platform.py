@@ -35,14 +35,11 @@ logger = get_logger(__name__)
 # Azuro on Polygon: ~$0.02 gas per bet.
 _ALT_EXECUTION_COST_USD = 0.01
 
-# Maximum credible net profit percentage.  Anything above this is almost
-# certainly caused by stale pricing (e.g. PM outcomePrices snapshot vs
-# fresh alternative prices) rather than real arbitrage.
-_MAX_SANE_PROFIT_PCT = 0.10  # 10%
-
 # SX Bet CLOB slippage buffer.  Unlike Azuro's AMM (which needed 3% buffer
 # for price impact), SX Bet's CLOB has deterministic best-ask prices.
 # We add a small buffer for order-book movement between quote and fill.
+# NOTE: With VWAP pricing the fill cost is already realistic; this buffer
+# covers book changes between the quote timestamp and execution.
 _ALT_SLIPPAGE_BUFFER = 0.005  # 0.5% (was 3% for Azuro AMM)
 
 # SX Bet oracle fee: 5% on winning profit only.  Since we hedge both
@@ -251,22 +248,6 @@ class CrossPlatformDetector:
                     reversed=pair.teams_reversed,
                 )
 
-            # Sanity check: reject implausibly high profits that are
-            # almost certainly caused by stale PM snapshot prices vs
-            # fresh Azuro subgraph odds.
-            if best and best.net_profit_pct > _MAX_SANE_PROFIT_PCT:
-                logger.warning(
-                    "Rejecting opportunity: profit exceeds sanity cap "
-                    "(likely stale pricing)",
-                    pm_q=pair.polymarket.question[:60],
-                    az_q=pair.azuro.question[:60],
-                    net_profit=f"{best.net_profit_pct:.2%}",
-                    cap=f"{_MAX_SANE_PROFIT_PCT:.0%}",
-                    price_yes=f"{best.price_yes:.4f}",
-                    price_no=f"{best.price_no:.4f}",
-                )
-                return None
-
             if best:
                 # Fill in market IDs and questions
                 best.pm_market_id = pair.polymarket.market_id
@@ -313,6 +294,17 @@ class CrossPlatformDetector:
         # Reject if PM side lacks CLOB depth for this direction.
         # Depth must be >= trade_size so that a FOK order can fill.
         if pm_depth < max(_MIN_PM_CLOB_DEPTH_USD, self.trade_size):
+            return None
+
+        # Reject if alt platform lacks depth for the traded direction.
+        # With VWAP pricing, price will already be 0.0 when depth is
+        # insufficient (leading to early return above), but an explicit
+        # depth gate is safer and gives cleaner logging.
+        if yes_platform != Platform.POLYMARKET:
+            alt_depth = alt_odds.max_size_yes
+        else:
+            alt_depth = alt_odds.max_size_no
+        if alt_depth < self.trade_size:
             return None
 
         # Apply CLOB slippage buffer to the alternative platform leg.

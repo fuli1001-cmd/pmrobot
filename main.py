@@ -28,7 +28,6 @@ from utils.notifier import create_notifier
 # Cross-platform imports (lazy-loaded when enabled)
 from exchanges.base import BaseExchange
 from exchanges.polymarket import PolymarketExchange
-from exchanges.azuro import AzuroExchange
 from exchanges.sxbet import SxBetExchange
 from core.alignment import MarketAligner
 from core.cross_platform import CrossPlatformDetector, CrossPlatformExecutor
@@ -84,7 +83,6 @@ class ArbitrageBot:
 
         # Cross-platform components (initialised in start() if enabled)
         self._pm_exchange: Optional[PolymarketExchange] = None
-        self._az_exchange: Optional[AzuroExchange] = None
         self._sx_exchange: Optional[SxBetExchange] = None
         self._alt_exchange: Optional[BaseExchange] = None  # Active alt platform
         self._market_aligner: Optional[MarketAligner] = None
@@ -143,7 +141,7 @@ class ArbitrageBot:
             # Phase 1c: Initialise cross-platform (if enabled)
             cross_alt_enabled = (
                 self.settings.cross_platform_enabled
-                and (self.settings.sxbet_enabled or self.settings.azuro_enabled)
+                and self.settings.sxbet_enabled
             )
             if cross_alt_enabled:
                 await self._init_cross_platform()
@@ -721,35 +719,20 @@ class ArbitrageBot:
         self._pm_exchange = PolymarketExchange(dry_run=self.dry_run)
         await self._pm_exchange.connect()
 
-        # Alternative platform — prefer SX Bet over Azuro
-        if self.settings.sxbet_enabled:
-            self._sx_exchange = SxBetExchange(
-                api_key=self.settings.sxbet_api_key or "",
-                api_url=self.settings.sxbet_api_url,
-                rpc_url=self.settings.sxbet_rpc_url,
-                chain_id=self.settings.sxbet_chain_id,
-                usdc_address=self.settings.sxbet_usdc_address,
-                private_key=self.settings.private_key or "",
-                dry_run=self.dry_run,
-            )
-            await self._sx_exchange.connect()
-            self._alt_exchange = self._sx_exchange
-            logger.info("Cross-platform: using SX Bet as alternative platform")
-        elif self.settings.azuro_enabled:
-            self._az_exchange = AzuroExchange(
-                subgraph_url=self.settings.azuro_subgraph_url,
-                lp_address=self.settings.azuro_lp_address or "",
-                core_address=self.settings.azuro_core_address or "",
-                rpc_url=self.settings.rpc_url,
-                private_key=self.settings.private_key or "",
-                dry_run=self.dry_run,
-            )
-            await self._az_exchange.connect()
-            self._alt_exchange = self._az_exchange
-            logger.info("Cross-platform: using Azuro as alternative platform (deprecated)")
-        else:
-            logger.error("No alternative platform enabled for cross-platform")
-            return
+        # Alternative platform — SX Bet
+        # (Azuro has been retired; see exchanges/azuro.py Bug 14-18 notes)
+        self._sx_exchange = SxBetExchange(
+            api_key=self.settings.sxbet_api_key or "",
+            api_url=self.settings.sxbet_api_url,
+            rpc_url=self.settings.sxbet_rpc_url,
+            chain_id=self.settings.sxbet_chain_id,
+            usdc_address=self.settings.sxbet_usdc_address,
+            private_key=self.settings.sxbet_private_key or self.settings.private_key or "",
+            dry_run=self.dry_run,
+        )
+        await self._sx_exchange.connect()
+        self._alt_exchange = self._sx_exchange
+        logger.info("Cross-platform: using SX Bet as alternative platform")
 
         # Market aligner
         self._market_aligner = MarketAligner(

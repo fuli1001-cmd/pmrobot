@@ -102,6 +102,9 @@ class Settings(BaseSettings):
         "0x6629Ce1Cf35Cc1329ebB4F63202F3f197b3F050B",
         description="USDC contract address on SX Network (6 decimals)",
     )
+    sxbet_private_key: Optional[str] = Field(
+        None, description="SX Bet wallet private key for EIP-712 signing"
+    )
 
     # ═══ Cross-Platform Arbitrage ═══
     cross_platform_enabled: bool = Field(False, description="Enable cross-platform arbitrage")

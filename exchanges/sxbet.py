@@ -23,12 +23,13 @@ API reference: https://api.docs.sx.bet
 """
 
 import asyncio
+import os
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 from eth_account import Account
-from eth_account.messages import encode_defunct
+from eth_account.messages import encode_typed_data
 from web3 import Web3
 
 from exchanges.base import (
@@ -122,6 +123,7 @@ class SxBetExchange(BaseExchange):
         self._executor_address: Optional[str] = None
         self._token_transfer_proxy: Optional[str] = None
         self._eip712_fill_hasher: Optional[str] = None
+        self._domain_version: str = "6.0"
 
         # Sport lookup cache: sportId -> sport name
         self._sports: Dict[int, str] = {}
@@ -167,11 +169,13 @@ class SxBetExchange(BaseExchange):
             self._executor_address = meta_data.get("executorAddress")
             self._token_transfer_proxy = meta_data.get("TokenTransferProxy")
             self._eip712_fill_hasher = meta_data.get("EIP712FillHasher")
+            self._domain_version = meta_data.get("domainVersion", "6.0")
             logger.info(
                 "SX Bet metadata loaded",
                 executor=self._executor_address,
                 proxy=self._token_transfer_proxy,
                 fill_hasher=self._eip712_fill_hasher,
+                domain_version=self._domain_version,
             )
         except Exception as e:
             logger.warning("Failed to fetch SX Bet metadata", error=repr(e))
@@ -419,11 +423,19 @@ class SxBetExchange(BaseExchange):
                 price_yes = self._extract_best_price(odds_entry, outcome="1")
                 price_no = self._extract_best_price(odds_entry, outcome="2")
 
-            # Fetch depth if live mode requested
+            # Fetch depth + VWAP if live mode requested
             depth_yes = 0.0
             depth_no = 0.0
             if live and (price_yes > 0 or price_no > 0):
-                depth_yes, depth_no = await self._fetch_order_depth(market_id, trade_size)
+                depth_yes, depth_no, vwap_yes, vwap_no = (
+                    await self._fetch_order_depth_and_vwap(market_id, trade_size)
+                )
+                # Use VWAP as price when available (more realistic than
+                # best-ask since it accounts for full trade_size fill).
+                if vwap_yes > 0:
+                    price_yes = vwap_yes
+                if vwap_no > 0:
+                    price_no = vwap_no
 
             return UnifiedOdds(
                 platform=Platform.SXBET,
@@ -468,15 +480,28 @@ class SxBetExchange(BaseExchange):
 
         return 0.0
 
-    async def _fetch_order_depth(
+    async def _fetch_order_depth_and_vwap(
         self, market_id: str, trade_size: float
-    ) -> tuple[float, float]:
-        """Fetch order-book depth for both outcomes.
+    ) -> Tuple[float, float, float, float]:
+        """Fetch order-book depth and VWAP for both outcomes.
 
-        Returns (depth_yes_usdc, depth_no_usdc).
+        Walks the order book to compute the volume-weighted average taker
+        price to fill ``trade_size`` USDC.  This is more realistic than
+        best-ask because it accounts for depth at each price level.
+
+        Taker capacity formula (from SX Bet docs):
+            remainingTakerSpace = (totalBetSize - fillAmount)
+                                  * 10^20 / percentageOdds
+                                  - (totalBetSize - fillAmount)
+
+        Returns:
+            (depth_yes_usdc, depth_no_usdc, vwap_yes, vwap_no)
+            depth = total taker capacity in USDC
+            vwap  = volume-weighted avg taker price to fill trade_size
+                    (0.0 if depth < trade_size → unfillable)
         """
         if not self._http:
-            return (0.0, 0.0)
+            return (0.0, 0.0, 0.0, 0.0)
 
         try:
             resp = await self._http.get(
@@ -494,30 +519,75 @@ class SxBetExchange(BaseExchange):
             if not isinstance(orders, list):
                 orders = []
 
-            depth_yes = 0.0  # Depth available to buy outcome 1 (YES)
-            depth_no = 0.0   # Depth available to buy outcome 2 (NO)
+            # Separate orders by which outcome the TAKER can buy.
+            # isMakerBettingOutcomeOne=True  → taker buys outcome 2 (NO)
+            # isMakerBettingOutcomeOne=False → taker buys outcome 1 (YES)
+            yes_levels: List[Tuple[float, float]] = []  # (taker_price, taker_usdc)
+            no_levels: List[Tuple[float, float]] = []
 
             for order in orders:
-                # totalBetSize and fillAmount are in raw USDC (6 decimals)
                 total_size = int(order.get("totalBetSize", 0))
                 fill_amount = int(order.get("fillAmount", 0))
-                remaining_raw = total_size - fill_amount
-                remaining_usdc = remaining_raw / (10 ** USDC_DECIMALS)
+                remaining_maker = total_size - fill_amount
+                if remaining_maker <= 0:
+                    continue
+
+                pct_odds = int(order.get("percentageOdds", 0))
+                if pct_odds <= 0 or pct_odds >= ODDS_PRECISION:
+                    continue
+
+                # Taker price = 1 - makerOdds
+                taker_price = 1.0 - pct_odds / ODDS_PRECISION
+
+                # Remaining taker capacity in raw USDC units
+                remaining_taker_raw = (
+                    remaining_maker * ODDS_PRECISION // pct_odds
+                    - remaining_maker
+                )
+                remaining_taker_usdc = remaining_taker_raw / (10 ** USDC_DECIMALS)
+                if remaining_taker_usdc < 0.01:
+                    continue
 
                 maker_betting_one = order.get("isMakerBettingOutcomeOne")
-
                 if maker_betting_one is True:
-                    # Maker bets outcome 1 → taker can buy outcome 2 (NO)
-                    depth_no += remaining_usdc
+                    # Maker bets 1 → taker can buy 2 (NO)
+                    no_levels.append((taker_price, remaining_taker_usdc))
                 elif maker_betting_one is False:
-                    # Maker bets outcome 2 → taker can buy outcome 1 (YES)
-                    depth_yes += remaining_usdc
+                    # Maker bets 2 → taker can buy 1 (YES)
+                    yes_levels.append((taker_price, remaining_taker_usdc))
 
-            return (depth_yes, depth_no)
+            def _depth_and_vwap(
+                levels: List[Tuple[float, float]], size: float
+            ) -> Tuple[float, float]:
+                """Compute total depth and VWAP for price levels."""
+                # Sort by taker price ascending (cheapest first)
+                levels.sort(key=lambda x: x[0])
+                total_depth = sum(cap for _, cap in levels)
+                if total_depth < 0.01:
+                    return (0.0, 0.0)
+                # Only compute VWAP if depth >= size (fully fillable)
+                if total_depth < size:
+                    return (total_depth, 0.0)
+                remaining = size
+                weighted_sum = 0.0
+                filled = 0.0
+                for price, cap in levels:
+                    take = min(remaining, cap)
+                    weighted_sum += price * take
+                    filled += take
+                    remaining -= take
+                    if remaining <= 0:
+                        break
+                vwap = weighted_sum / filled if filled > 0 else 0.0
+                return (total_depth, vwap)
+
+            depth_yes, vwap_yes = _depth_and_vwap(yes_levels, trade_size)
+            depth_no, vwap_no = _depth_and_vwap(no_levels, trade_size)
+            return (depth_yes, depth_no, vwap_yes, vwap_no)
 
         except Exception as e:
-            logger.debug("SX Bet depth fetch failed", error=repr(e))
-            return (0.0, 0.0)
+            logger.debug("SX Bet depth/VWAP fetch failed", error=repr(e))
+            return (0.0, 0.0, 0.0, 0.0)
 
     # ------------------------------------------------------------------
     # Execution
@@ -587,23 +657,46 @@ class SxBetExchange(BaseExchange):
             desired_odds = str(int(desired_maker_implied * ODDS_PRECISION))
 
             # Convert amount to raw USDC (6 decimals)
-            raw_amount = str(int(amount * (10 ** USDC_DECIMALS)))
+            stake_wei = str(int(amount * (10 ** USDC_DECIMALS)))
 
-            # Build fill payload
-            payload = {
-                "marketHash": market_id,
-                "takerAmount": raw_amount,
-                "isBettingOutcomeOne": betting_outcome_one,
-                "desiredOdds": desired_odds,
-                "oddsSlippage": 50,  # 0.50% slippage tolerance
-                "baseToken": self.usdc_address,
-            }
+            # Random fill salt (32 bytes as uint256)
+            fill_salt = int.from_bytes(os.urandom(32), "big")
+
+            # Odds slippage: 0-100 integer (percentage points)
+            odds_slippage = 5  # 5% slippage tolerance
 
             # Sign the fill (EIP-712 signature required by SX Bet)
-            if self.private_key:
-                signature = self._sign_fill_order(payload)
-                payload["signature"] = signature
-                payload["maker"] = self._wallet_address
+            signature = self._sign_fill_order(
+                market_hash=market_id,
+                stake_wei=stake_wei,
+                desired_odds=desired_odds,
+                odds_slippage=odds_slippage,
+                betting_outcome_one=betting_outcome_one,
+                fill_salt=fill_salt,
+            )
+            if not signature:
+                return BetResult(
+                    status=BetResult.Status.FAILED,
+                    platform=Platform.SXBET,
+                    market_id=market_id,
+                    outcome=outcome,
+                    amount=amount,
+                    error_message="EIP-712 signing failed",
+                )
+
+            # Build fill payload matching SX Bet fill/v2 API spec
+            payload = {
+                "market": market_id,
+                "baseToken": self.usdc_address,
+                "isTakerBettingOutcomeOne": betting_outcome_one,
+                "stakeWei": stake_wei,
+                "desiredOdds": desired_odds,
+                "oddsSlippage": odds_slippage,
+                "fillSalt": str(fill_salt),
+                "taker": self._wallet_address,
+                "takerSig": signature,
+                "message": "N/A",
+            }
 
             resp = await self._http.post("/orders/fill/v2", json=payload)
             elapsed = (time.time() - start) * 1000
@@ -673,33 +766,107 @@ class SxBetExchange(BaseExchange):
                 execution_time_ms=elapsed,
             )
 
-    def _sign_fill_order(self, payload: Dict) -> str:
+    def _sign_fill_order(
+        self,
+        market_hash: str,
+        stake_wei: str,
+        desired_odds: str,
+        odds_slippage: int,
+        betting_outcome_one: bool,
+        fill_salt: int,
+    ) -> str:
         """Sign a fill order using EIP-712 typed data.
 
-        This is a simplified implementation.  SX Bet requires EIP-712
-        signatures over the fill order struct.  The exact domain and
-        type schema should be fetched from /metadata in production.
+        Constructs the exact typed-data payload required by SX Bet's
+        ``POST /orders/fill/v2`` endpoint, including the nested
+        ``FillObject`` struct.
 
-        For now, we sign a message hash as a placeholder — the actual
-        EIP-712 implementation requires the ``EIP712FillHasher`` contract
-        ABI and domain separator from the SX Bet metadata.
+        Domain:
+            name="SX Bet", version=domainVersion (from /metadata),
+            chainId=4162, verifyingContract=EIP712FillHasher
 
-        TODO: Implement full EIP-712 signing once live testing begins.
+        Primary type: ``Details`` containing human-readable metadata
+        and a nested ``FillObject`` with the actual fill parameters.
         """
         if not self.private_key:
             return ""
 
         try:
-            # Simplified: sign a message containing the fill details
-            # Full EIP-712 implementation needed for production
-            message = (
-                f"SX Bet Fill: {payload.get('marketHash', '')}"
-                f":{payload.get('takerAmount', '')}"
-                f":{payload.get('isBettingOutcomeOne', '')}"
+            verifying_contract = (
+                self._eip712_fill_hasher
+                or "0x845a2Da2D70fEDe8474b1C8518200798c60aC364"
             )
-            msg = encode_defunct(text=message)
-            signed = Account.sign_message(msg, private_key=self.private_key)
-            return signed.signature.hex()
+            ADDRESS_ZERO = "0x0000000000000000000000000000000000000000"
+            HASH_ZERO = (
+                "0x0000000000000000000000000000000000000000"
+                "000000000000000000000000"
+            )
+
+            full_message = {
+                "types": {
+                    "EIP712Domain": [
+                        {"name": "name", "type": "string"},
+                        {"name": "version", "type": "string"},
+                        {"name": "chainId", "type": "uint256"},
+                        {"name": "verifyingContract", "type": "address"},
+                    ],
+                    "Details": [
+                        {"name": "action", "type": "string"},
+                        {"name": "market", "type": "string"},
+                        {"name": "betting", "type": "string"},
+                        {"name": "stake", "type": "string"},
+                        {"name": "worstOdds", "type": "string"},
+                        {"name": "worstReturning", "type": "string"},
+                        {"name": "fills", "type": "FillObject"},
+                    ],
+                    "FillObject": [
+                        {"name": "stakeWei", "type": "string"},
+                        {"name": "marketHash", "type": "string"},
+                        {"name": "baseToken", "type": "string"},
+                        {"name": "desiredOdds", "type": "string"},
+                        {"name": "oddsSlippage", "type": "uint256"},
+                        {"name": "isTakerBettingOutcomeOne", "type": "bool"},
+                        {"name": "fillSalt", "type": "uint256"},
+                        {"name": "beneficiary", "type": "address"},
+                        {"name": "beneficiaryType", "type": "uint8"},
+                        {"name": "cashOutTarget", "type": "bytes32"},
+                    ],
+                },
+                "primaryType": "Details",
+                "domain": {
+                    "name": "SX Bet",
+                    "version": self._domain_version,
+                    "chainId": self.chain_id,
+                    "verifyingContract": verifying_contract,
+                },
+                "message": {
+                    "action": "N/A",
+                    "betting": "N/A",
+                    "stake": "N/A",
+                    "worstOdds": "N/A",
+                    "worstReturning": "N/A",
+                    "market": market_hash,
+                    "fills": {
+                        "stakeWei": stake_wei,
+                        "marketHash": market_hash,
+                        "baseToken": self.usdc_address,
+                        "desiredOdds": desired_odds,
+                        "oddsSlippage": odds_slippage,
+                        "isTakerBettingOutcomeOne": betting_outcome_one,
+                        "fillSalt": fill_salt,
+                        "beneficiary": ADDRESS_ZERO,
+                        "beneficiaryType": 0,
+                        "cashOutTarget": HASH_ZERO,
+                    },
+                },
+            }
+
+            signable = encode_typed_data(full_message=full_message)
+            signed = Account.sign_message(
+                signable, private_key=self.private_key
+            )
+            return "0x" + signed.signature.hex()
+
         except Exception as e:
             logger.error("EIP-712 signing failed", error=repr(e))
             return ""
