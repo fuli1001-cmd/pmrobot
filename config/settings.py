@@ -78,6 +78,10 @@ class Settings(BaseSettings):
     env: str = Field("production", description="Environment: production or testnet")
     dry_run: bool = Field(False, description="Dry run mode (no real trades)")
     log_level: str = Field("INFO", description="Logging level")
+    stop_on_loss: bool = Field(
+        False,
+        description="Emergency kill switch: terminate process on ANY real-money loss",
+    )
 
     # ═══ Azuro Configuration ═══
     azuro_enabled: bool = Field(False, description="Enable Azuro exchange adapter")

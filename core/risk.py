@@ -56,6 +56,9 @@ class RiskConfig:
     opportunity_ttl: float = 1.0
     # Minimum time between trades on same market (seconds)
     market_cooldown: float = 5.0
+    # Emergency kill switch: terminate process on ANY real-money loss.
+    # Intended for initial live testing — set False once confidence is built.
+    stop_on_loss: bool = False
 
 
 class RiskManager:
@@ -273,6 +276,20 @@ class RiskManager:
                 "Partial Fill Loss",
                 f"Lost ${loss_usdc:.2f} on {market_label}",
             )
+
+            # Emergency kill switch — terminate on ANY real loss
+            if self.config.stop_on_loss and loss_usdc > 0:
+                logger.critical(
+                    "STOP_ON_LOSS triggered — terminating process",
+                    loss_usdc=f"${loss_usdc:.2f}",
+                    market=market_label,
+                )
+                await self.notifier.send_alert(
+                    "🛑 STOP_ON_LOSS Kill Switch",
+                    f"Process terminated after ${loss_usdc:.2f} loss on {market_label}",
+                )
+                import sys
+                sys.exit(1)
         else:
             self.stats.failed_trades += 1
             self._consecutive_failures += 1
@@ -291,6 +308,14 @@ class RiskManager:
                 "Trading Paused",
                 f"Paused for {self.config.pause_duration}s after {self.config.max_consecutive_failures} failures",
             )
+
+            # Emergency kill switch — terminate on repeated failures too
+            if self.config.stop_on_loss:
+                logger.critical(
+                    "STOP_ON_LOSS triggered — terminating after consecutive failures",
+                )
+                import sys
+                sys.exit(1)
 
     async def check_relayer_quota(
         self,

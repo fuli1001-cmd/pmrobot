@@ -70,6 +70,7 @@ class ArbitrageBot:
         self.risk_manager = RiskManager(
             RiskConfig(
                 max_slippage=settings.max_slippage,
+                stop_on_loss=settings.stop_on_loss,
             )
         )
         self.executor: Optional[OrderExecutor] = None
