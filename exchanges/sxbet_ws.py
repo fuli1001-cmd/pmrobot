@@ -102,6 +102,8 @@ class SxBetWebSocket:
         self._ably: Optional[AblyRealtime] = None
         self._subscribed: Set[str] = set()          # market hashes
         self._books: Dict[str, SxBetOrderBook] = {} # market_hash -> latest book
+        # Running state: market_hash -> {orderHash -> order_dict}
+        self._live_orders: Dict[str, Dict[str, dict]] = {}
         self._connected = False
 
     # ------------------------------------------------------------------
@@ -142,6 +144,7 @@ class SxBetWebSocket:
             self._ably = None
         self._subscribed.clear()
         self._books.clear()
+        self._live_orders.clear()
         logger.info("SX Bet WebSocket closed")
 
     # ------------------------------------------------------------------
@@ -149,11 +152,23 @@ class SxBetWebSocket:
     # ------------------------------------------------------------------
 
     async def _auth_callback(self, token_params) -> dict:
-        """Fetch an Ably token from SX Bet's ``/user/token`` endpoint.
+        """Fetch an Ably tokenRequest from SX Bet's ``/user/token`` endpoint.
 
         This is called by the Ably SDK whenever a token is needed or
         needs to be renewed.  Returns a ``tokenRequest`` dict that the
-        SDK uses to authenticate.
+        SDK uses to authenticate with Ably.
+
+        SX Bet response format (top-level tokenRequest)::
+
+            {
+                "keyName": "Pb_c6A.2IZKTQ",
+                "clientId": "0x...",
+                "capability": "{\"*\":[\"subscribe\"]}",
+                "ttl": 86400000,
+                "timestamp": 1772779201784,
+                "nonce": "3522558038605510",
+                "mac": "lJpC6VMLV22A6xeGSt5q+..."
+            }
         """
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.get(
@@ -161,16 +176,13 @@ class SxBetWebSocket:
                 headers={"X-Api-Key": self._api_key},
             )
             resp.raise_for_status()
-            body = resp.json()
+            token_request = resp.json()
 
-        # SX Bet returns: {"status": "success", "data": {"token": "..."}}
-        # The "token" value is an Ably token string.
-        token = body.get("data", {}).get("token", "")
-        if not token:
-            raise ValueError("SX Bet /user/token returned empty token")
+        if not token_request.get("keyName"):
+            raise ValueError("SX Bet /user/token returned invalid tokenRequest")
 
-        logger.debug("SX Bet Ably token obtained")
-        return token
+        logger.debug("SX Bet Ably tokenRequest obtained", key_name=token_request["keyName"])
+        return token_request
 
     # ------------------------------------------------------------------
     # Subscriptions
@@ -217,6 +229,8 @@ class SxBetWebSocket:
             channel = self._ably.channels.get(channel_name)
             await channel.detach()
             self._subscribed.discard(market_hash)
+            self._live_orders.pop(market_hash, None)
+            self._books.pop(market_hash, None)
 
         logger.debug(
             "SX Bet WS: unsubscribed",
@@ -231,25 +245,13 @@ class SxBetWebSocket:
     def _handle_order_book_message(self, market_hash: str, message) -> None:
         """Process an incoming Ably message for a specific market.
 
-        Expected message.data structure (order_book_v2 channel)::
+        SX Bet sends *incremental* updates: each message contains only
+        the orders that changed.  Orders with ``status == "ACTIVE"`` are
+        added/updated; orders with ``status == "INACTIVE"`` (or other
+        non-active status) are removed.
 
-            {
-              "orders": [
-                {
-                  "orderHash": "0x...",
-                  "marketHash": "0x...",
-                  "totalBetSize": "100000000",
-                  "fillAmount": "0",
-                  "percentageOdds": "50000000000000000000",
-                  "isMakerBettingOutcomeOne": true,
-                  ...
-                },
-                ...
-              ]
-            }
-
-        We parse orders to extract best taker prices and depth for
-        outcome 1 (YES) and outcome 2 (NO).
+        We maintain a per-market dict of live orders and recompute the
+        aggregate book after each update.
         """
         try:
             data = message.data
@@ -260,7 +262,28 @@ class SxBetWebSocket:
             if not orders and isinstance(data, list):
                 orders = data
 
-            book = self._parse_orders(market_hash, orders)
+            if not orders:
+                return
+
+            # Ensure per-market live order dict exists
+            if market_hash not in self._live_orders:
+                self._live_orders[market_hash] = {}
+            live = self._live_orders[market_hash]
+
+            # Apply incremental updates
+            for order in orders:
+                order_hash = order.get("orderHash", "")
+                if not order_hash:
+                    continue
+                status = order.get("status", "")
+                if status == "ACTIVE":
+                    live[order_hash] = order
+                else:
+                    # INACTIVE, CANCELLED, FILLED, etc. → remove
+                    live.pop(order_hash, None)
+
+            # Recompute aggregate book from all live orders
+            book = self._parse_orders(market_hash, list(live.values()))
             self._books[market_hash] = book
 
             if self._on_book_update:

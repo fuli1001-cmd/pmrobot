@@ -327,6 +327,19 @@ class CrossPlatformMonitor:
         """
         self._eval_count += 1
 
+        # Periodic stats (at top, so they fire even when no arb found)
+        now = time.time()
+        if now - self._last_stats_time >= 60:
+            logger.info(
+                "Cross-platform monitor stats",
+                evaluations=self._eval_count,
+                opportunities=self._opp_count,
+                pairs=len(self._pairs),
+                pm_tokens=len(self._pm_token_to_pairs),
+                sx_markets=len(self._sx_hash_to_pairs),
+            )
+            self._last_stats_time = now
+
         pm = pair.polymarket
         sx = pair.azuro  # field named azuro, holds SX Bet market
 
@@ -424,19 +437,6 @@ class CrossPlatformMonitor:
             self._queue.put_nowait(opportunity)
         except asyncio.QueueFull:
             logger.warning("Cross-platform queue full — opportunity dropped")
-
-        # Periodic stats
-        now = time.time()
-        if now - self._last_stats_time >= 60:
-            logger.info(
-                "Cross-platform monitor stats",
-                evaluations=self._eval_count,
-                opportunities=self._opp_count,
-                pairs=len(self._pairs),
-                pm_tokens=len(self._pm_token_to_pairs),
-                sx_markets=len(self._sx_hash_to_pairs),
-            )
-            self._last_stats_time = now
 
     def _compute_combo(
         self,
