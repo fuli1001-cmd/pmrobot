@@ -493,7 +493,7 @@ class OrderExecutor:
             # Submit with FOK time-in-force
             response = self.client.post_order(
                 signed_order,
-                order_type=ClobOrderType.FOK,
+                orderType=ClobOrderType.FOK,
             )
 
             # Parse response
