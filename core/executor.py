@@ -11,7 +11,7 @@ from py_clob_client.clob_types import OrderArgs, OrderType as ClobOrderType
 from py_clob_client.order_builder.constants import BUY, SELL
 
 from config.settings import get_settings
-from config.constants import CLOB_API_BASE_URL, POLYGON_CHAIN_ID, SIGNATURE_TYPE_POLY_GNOSIS_SAFE
+from config.constants import CLOB_API_BASE_URL, POLYGON_CHAIN_ID
 from models.market import NegativeRiskArbitrageOpportunity, NegativeRiskStrategy
 from models.order import ArbitrageOpportunity, ShortArbitrageOpportunity, Order, OrderSide, OrderStatus, OrderType
 from models.position import AccountState
@@ -58,6 +58,7 @@ class OrderExecutor:
         passphrase: str,
         private_key: Optional[str] = None,
         proxy_wallet: Optional[str] = None,
+        signature_type: Optional[int] = None,
         chain_id: int = POLYGON_CHAIN_ID,
         dry_run: bool = False,
     ):
@@ -91,13 +92,22 @@ class OrderExecutor:
             raise ValueError("Private key is required for live trading")
 
         # Initialize CLOB client with private key for signing
-        # IMPORTANT: Use signature_type=1 (Poly Proxy) and funder=proxy_wallet
-        # This is critical for accounts where EOA is a signer for a Magic/Gnosis Safe
+        # signature_type controls server-side verification:
+        #   0 = EOA (direct wallet), 1 = POLY_PROXY, 2 = POLY_GNOSIS_SAFE
+        # MetaMask-login proxies are Gnosis Safe → require type 2
+        # Email-login proxies are Polymarket-specific → require type 1 (but often broken)
+        if signature_type is not None:
+            sig_type = signature_type
+        elif proxy_wallet:
+            from py_order_utils.model import POLY_GNOSIS_SAFE
+            sig_type = POLY_GNOSIS_SAFE
+        else:
+            sig_type = None
         self.client = ClobClient(
             host=CLOB_API_BASE_URL,
             key=private_key,
             chain_id=chain_id,
-            signature_type=1 if proxy_wallet else None,
+            signature_type=sig_type,
             funder=proxy_wallet,
         )
         
@@ -128,7 +138,9 @@ class OrderExecutor:
         )
 
         if proxy_wallet:
-            logger.info("Using Proxy Wallet", address=proxy_wallet)
+            sig_names = {0: "EOA", 1: "POLY_PROXY", 2: "POLY_GNOSIS_SAFE"}
+            logger.info("Using Proxy Wallet", address=proxy_wallet,
+                        signature_type=sig_names.get(sig_type, sig_type))
         
         self.proxy_wallet = proxy_wallet
 
@@ -821,5 +833,6 @@ def create_executor(dry_run: bool = False) -> OrderExecutor:
         passphrase=settings.polymarket_passphrase,
         private_key=settings.private_key,
         proxy_wallet=settings.proxy_wallet_address,
+        signature_type=settings.signature_type,
         dry_run=dry_run or settings.dry_run,
     )

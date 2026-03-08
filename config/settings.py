@@ -28,6 +28,9 @@ class Settings(BaseSettings):
     proxy_wallet_address: Optional[str] = Field(
         None, description="Gnosis Safe proxy wallet address"
     )
+    signature_type: Optional[int] = Field(
+        None, description="Signature type: 0=EOA, 1=POLY_PROXY, 2=POLY_GNOSIS_SAFE. Auto-detected if not set."
+    )
 
     # Builder / Relayer Credentials (for gasless merge & mint)
     builder_api_key: Optional[str] = Field(None, description="Polymarket Builder API Key")
