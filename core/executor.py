@@ -1,6 +1,7 @@
 """Order execution engine using CLOB API."""
 
 import asyncio
+import math
 import time
 from dataclasses import dataclass
 from enum import Enum
@@ -492,10 +493,29 @@ class OrderExecutor:
         try:
             # Build order arguments
             clob_side = SELL if order.side == OrderSide.SELL else BUY
+
+            # Polymarket CLOB requires:
+            #   BUY:  maker_amount (USDC = size*price) ≤ 2 decimal places
+            #   SELL: maker_amount (shares) ≤ 2 decimal places
+            # Use GCD to find the largest valid size so size*price is exact 2-dec.
+            price = round(order.price, 2)
+            if clob_side == BUY:
+                P = round(price * 100)  # price in cents (integer)
+                step = 100 // math.gcd(P, 100)
+                S = (int(order.size * 100) // step) * step
+                size = S / 100
+            else:
+                size = math.floor(order.size * 100) / 100
+
+            if size <= 0:
+                order.status = OrderStatus.FAILED
+                logger.warning("Order size too small after rounding", raw_size=order.size)
+                return order
+
             order_args = OrderArgs(
                 token_id=order.token_id,
-                price=order.price,
-                size=order.size,
+                price=price,
+                size=size,
                 side=clob_side,
             )
 
