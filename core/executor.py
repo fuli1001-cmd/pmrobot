@@ -165,7 +165,7 @@ class OrderExecutor:
                 params=BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
             )
             raw_bal = resp.get("balance", "0")
-            api_balance = float(raw_bal)
+            api_balance = float(raw_bal) / 1e6  # API returns micro-USDC (6 decimals)
         except Exception as e:
             logger.error("Failed to fetch API balance", error=repr(e))
         
@@ -457,10 +457,14 @@ class OrderExecutor:
             sell_price = round(filled_order.filled_avg_price * discount, 2)
             sell_price = max(sell_price, 0.01)
             try:
+                sell_size = math.floor(filled_order.filled_size * 100) / 100
+                if sell_size <= 0:
+                    logger.warning("Vector exit size too small", raw=filled_order.filled_size)
+                    return
                 order_args = OrderArgs(
                     token_id=filled_order.token_id,
                     price=sell_price,
-                    size=filled_order.filled_size,
+                    size=sell_size,
                     side="SELL",
                 )
                 signed_order = self.client.create_order(order_args)
@@ -532,14 +536,14 @@ class OrderExecutor:
             if response.get("success"):
                 order.order_id = response.get("orderID")
                 order.status = OrderStatus.FILLED
-                order.filled_size = order.size
-                order.filled_avg_price = order.price
+                order.filled_size = size
+                order.filled_avg_price = price
                 logger.info(
                     "Order filled",
                     order_id=order.order_id,
                     token_id=order.token_id[:8],
-                    price=order.price,
-                    size=order.size,
+                    price=price,
+                    size=size,
                 )
             else:
                 order.status = OrderStatus.FAILED
@@ -589,10 +593,14 @@ class OrderExecutor:
             sell_price = max(sell_price, 0.01)  # Floor at CLOB min tick
 
             try:
+                sell_size = math.floor(filled_order.filled_size * 100) / 100
+                if sell_size <= 0:
+                    logger.warning("Emergency exit size too small", raw=filled_order.filled_size)
+                    return
                 order_args = OrderArgs(
                     token_id=filled_order.token_id,
                     price=sell_price,
-                    size=filled_order.filled_size,
+                    size=sell_size,
                     side="SELL",
                 )
                 signed_order = self.client.create_order(order_args)
