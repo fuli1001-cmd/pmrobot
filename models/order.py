@@ -271,12 +271,19 @@ class OrderBook:
             size *= 2
         test_sizes.append(max_size)
         
+        # Use L1 prices for proportional USDC split (not 50/50).
+        # Binary arb buys equal token counts, so USDC is split by price ratio.
+        best_self = self.asks[0].price
+        best_other = other_book.asks[0].price
+        total_l1 = best_self + best_other
+
         for test_size in test_sizes:
-            # Calculate prices for each side (half the total size each)
-            half_size = test_size / 2
+            # Proportional split: cheap side needs less USDC depth
+            usdc_self = test_size * best_self / total_l1
+            usdc_other = test_size * best_other / total_l1
             
-            info_self = self.calculate_depth_penetration(half_size, "buy")
-            info_other = other_book.calculate_depth_penetration(half_size, "buy")
+            info_self = self.calculate_depth_penetration(usdc_self, "buy")
+            info_other = other_book.calculate_depth_penetration(usdc_other, "buy")
             
             if not info_self["is_complete"] or not info_other["is_complete"]:
                 break  # Not enough liquidity at this size

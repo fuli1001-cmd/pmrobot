@@ -226,12 +226,17 @@ class OrderExecutor:
         """
         start_time = time.time()
 
-        # Create FOK orders for both sides
+        # Equal token counts for binary arbitrage:
+        # Each YES+NO pair resolves to $1.00 regardless of outcome.
+        # Allocate USDC proportionally to prices, NOT 50/50.
+        total_cost_per_pair = opportunity.avg_price_yes + opportunity.avg_price_no
+        num_tokens = opportunity.trade_size_usdc / total_cost_per_pair
+
         order_yes = Order(
             token_id=opportunity.market.token_id_yes,
             side=OrderSide.BUY,
             price=opportunity.avg_price_yes,
-            size=opportunity.trade_size_usdc / 2 / opportunity.avg_price_yes,
+            size=num_tokens,
             order_type=OrderType.FOK,
         )
 
@@ -239,7 +244,7 @@ class OrderExecutor:
             token_id=opportunity.market.token_id_no,
             side=OrderSide.BUY,
             price=opportunity.avg_price_no,
-            size=opportunity.trade_size_usdc / 2 / opportunity.avg_price_no,
+            size=num_tokens,
             order_type=OrderType.FOK,
         )
 
@@ -258,27 +263,43 @@ class OrderExecutor:
             )
 
         try:
-            # Execute both orders concurrently
-            results = await asyncio.gather(
-                self._submit_order(order_yes),
-                self._submit_order(order_no),
-                return_exceptions=True,
-            )
+            # Sequential execution: submit thin side first.
+            # Lower price = more tokens = typically thinner liquidity.
+            # If thin side FOK fails → zero loss (no position opened).
+            # If thin side fills + thick side fails → small emergency exit.
+            if order_yes.price <= order_no.price:
+                first_order, second_order = order_yes, order_no
+                first_label, second_label = "yes", "no"
+            else:
+                first_order, second_order = order_no, order_yes
+                first_label, second_label = "no", "yes"
 
-            order_yes, order_no = results[0], results[1]
-            execution_time = (time.time() - start_time) * 1000
-
-            # Analyze results
-            if isinstance(order_yes, Exception) or isinstance(order_no, Exception):
-                # Handle exceptions
-                error_msg = str(order_yes if isinstance(order_yes, Exception) else order_no)
+            first_order = await self._submit_order(first_order)
+            if not first_order.is_filled:
+                # Thin side failed — no position opened, zero loss
+                execution_time = (time.time() - start_time) * 1000
+                if first_label == "yes":
+                    order_yes = first_order
+                else:
+                    order_no = first_order
                 return ExecutionReport(
                     result=ExecutionResult.FAILED,
                     opportunity=opportunity,
-                    error_message=error_msg,
+                    order_yes=order_yes,
+                    order_no=order_no,
                     execution_time_ms=execution_time,
                 )
 
+            # Thin side filled, now submit thick side
+            second_order = await self._submit_order(second_order)
+
+            # Map back to yes/no
+            if first_label == "yes":
+                order_yes, order_no = first_order, second_order
+            else:
+                order_no, order_yes = first_order, second_order
+
+            execution_time = (time.time() - start_time) * 1000
             yes_success = order_yes.is_filled
             no_success = order_no.is_filled
 
@@ -295,8 +316,8 @@ class OrderExecutor:
                     final_balance=final_balance,
                 )
 
-            elif yes_success or no_success:
-                # Partial fill - need emergency exit
+            else:
+                # Partial fill — thick side failed after thin side filled
                 logger.warning(
                     "Partial fill detected - initiating emergency exit",
                     yes_filled=yes_success,
@@ -309,16 +330,6 @@ class OrderExecutor:
                 )
                 return ExecutionReport(
                     result=ExecutionResult.PARTIAL,
-                    opportunity=opportunity,
-                    order_yes=order_yes,
-                    order_no=order_no,
-                    execution_time_ms=execution_time,
-                )
-
-            else:
-                # Both failed (FOK rejected)
-                return ExecutionReport(
-                    result=ExecutionResult.FAILED,
                     opportunity=opportunity,
                     order_yes=order_yes,
                     order_no=order_no,
