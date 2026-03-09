@@ -533,6 +533,13 @@ class OrderExecutor:
                 logger.warning("Order size too small after rounding", raw_size=order.size)
                 return order
 
+            # Polymarket requires minimum $1 per marketable order
+            order_usdc = size * price
+            if order_usdc < 1.0:
+                order.status = OrderStatus.FAILED
+                logger.warning("Order USDC below $1 minimum", usdc=f"${order_usdc:.2f}", size=size, price=price)
+                return order
+
             order_args = OrderArgs(
                 token_id=order.token_id,
                 price=price,

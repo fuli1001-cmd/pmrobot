@@ -277,7 +277,21 @@ class OrderBook:
         best_other = other_book.asks[0].price
         total_l1 = best_self + best_other
 
+        # Polymarket enforces min $1 per order (size * price >= 1.0).
+        # Equal token sizing means the cheap side is the binding constraint:
+        #   num_tokens * min(price_self, price_other) >= 1.0
+        #   total_usdc = num_tokens * total_l1
+        # So: min_total_usdc = total_l1 / min(price_self, price_other)
+        min_price = min(best_self, best_other)
+        min_total_for_order = total_l1 / min_price if min_price > 0 else float('inf')
+        # Bump up to next dollar to be safe after GCD rounding
+        import math as _math
+        min_total_for_order = _math.ceil(min_total_for_order)
+
         for test_size in test_sizes:
+            # Skip sizes where the cheap side would produce < $1 order
+            if test_size < min_total_for_order:
+                continue
             # Proportional split: cheap side needs less USDC depth
             usdc_self = test_size * best_self / total_l1
             usdc_other = test_size * best_other / total_l1
