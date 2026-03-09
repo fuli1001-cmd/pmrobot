@@ -451,10 +451,16 @@ class OrderExecutor:
 
     async def _submit_sell_exit(self, filled_order: Order) -> None:
         """Submit a market sell to exit a position (with retry)."""
+        # Wait for Polygon settlement before selling (tokens need ~3-5s to be credited)
+        await asyncio.sleep(3.0)
+
         max_retries = 3
         for attempt in range(1, max_retries + 1):
+            # Hybrid discount: percentage-based for high prices, absolute for low prices
             discount = 0.90 - 0.05 * (attempt - 1)  # 10%, 15%, 20% discount
-            sell_price = round(filled_order.filled_avg_price * discount, 2)
+            pct_price = round(filled_order.filled_avg_price * discount, 2)
+            abs_price = round(filled_order.filled_avg_price - 0.01 * attempt, 2)
+            sell_price = min(pct_price, abs_price)  # Use the more aggressive price
             sell_price = max(sell_price, 0.01)
             try:
                 sell_size = math.floor(filled_order.filled_size * 100) / 100
@@ -585,11 +591,17 @@ class OrderExecutor:
             size=filled_order.filled_size,
         )
 
+        # Wait for Polygon settlement before selling (tokens need ~3-5s to be credited)
+        await asyncio.sleep(3.0)
+
         # Retry up to 3 times with increasing price discount
         max_retries = 3
         for attempt in range(1, max_retries + 1):
+            # Hybrid discount: percentage-based for high prices, absolute for low prices
             discount = 0.95 - 0.03 * (attempt - 1)  # 5%, 8%, 11% discount
-            sell_price = round(filled_order.filled_avg_price * discount, 2)
+            pct_price = round(filled_order.filled_avg_price * discount, 2)
+            abs_price = round(filled_order.filled_avg_price - 0.01 * attempt, 2)
+            sell_price = min(pct_price, abs_price)  # Use the more aggressive price
             sell_price = max(sell_price, 0.01)  # Floor at CLOB min tick
 
             try:
