@@ -22,6 +22,18 @@ from utils.logger import get_logger
 logger = get_logger(__name__)
 
 
+def _is_transient_ws_error(error: Exception) -> bool:
+    """Return True for reconnectable websocket/network errors."""
+    error_text = repr(error)
+    transient_markers = (
+        "timed out during opening handshake",
+        "ConnectionResetError",
+        "WinError 64",
+        "指定的网络名不再可用",
+    )
+    return any(marker in error_text for marker in transient_markers)
+
+
 class OrderBookManager:
     """
     Manages order books for multiple markets.
@@ -170,6 +182,8 @@ class ArbitrageDetector:
             trade_size_usdc=effective_trade_size,
             total_cost=total_cost,
             estimated_fee=estimated_fee,
+            levels_yes=greedy_result["levels_self"],
+            levels_no=greedy_result["levels_other"],
             timestamp=time.time(),
         )
 
@@ -718,13 +732,18 @@ class MarketMonitor:
             try:
                 await self._connect_and_subscribe()
             except ConnectionClosed as e:
-                logger.warning(
+                log_fn = logger.info if e.code == 1006 else logger.warning
+                log_fn(
                     "WebSocket connection closed",
                     code=e.code,
                     reason=e.reason,
                 )
             except Exception as e:
-                logger.error("WebSocket error", error=repr(e))
+                error_text = repr(e)
+                if _is_transient_ws_error(e):
+                    logger.info("WebSocket transient disconnect", error=error_text)
+                else:
+                    logger.error("WebSocket error", error=error_text)
 
             if self._running:
                 logger.info(
@@ -1003,13 +1022,18 @@ class NegativeRiskMarketMonitor:
             try:
                 await self._connect_and_monitor()
             except ConnectionClosed as e:
-                logger.warning(
+                log_fn = logger.info if e.code == 1006 else logger.warning
+                log_fn(
                     "NegRisk WebSocket connection closed",
                     code=e.code,
                     reason=e.reason,
                 )
             except Exception as e:
-                logger.error("Negative Risk monitor error", error=repr(e))
+                error_text = repr(e)
+                if _is_transient_ws_error(e):
+                    logger.info("Negative Risk monitor transient disconnect", error=error_text)
+                else:
+                    logger.error("Negative Risk monitor error", error=error_text)
 
             if self._running:
                 await asyncio.sleep(self._reconnect_delay)

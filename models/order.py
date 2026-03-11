@@ -412,6 +412,8 @@ class ArbitrageOpportunity:
     # Profit calculation
     total_cost: float  # avg_price_yes + avg_price_no (should be < 1.0)
     estimated_fee: float  # Total fees for both sides
+    levels_yes: int = 0
+    levels_no: int = 0
     
     timestamp: float = 0.0
     

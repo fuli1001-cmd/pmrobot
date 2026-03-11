@@ -263,11 +263,15 @@ class OrderExecutor:
             )
 
         try:
-            # Sequential execution: submit thin side first.
-            # Lower price = more tokens = typically thinner liquidity.
-            # If thin side FOK fails → zero loss (no position opened).
-            # If thin side fills + thick side fails → small emergency exit.
-            if order_yes.price <= order_no.price:
+            # Sequential execution: submit the more fragile side first.
+            # More levels consumed at detection time usually means thinner book.
+            # Tie-break with higher price, because equal token counts require more
+            # USDC on that leg and it tends to move out from under us sooner.
+            # If the first leg FOK fails -> zero loss. If it fills and the second
+            # fails -> emergency exit still works, but this ordering reduces risk.
+            yes_fragility = (opportunity.levels_yes, opportunity.avg_price_yes)
+            no_fragility = (opportunity.levels_no, opportunity.avg_price_no)
+            if yes_fragility >= no_fragility:
                 first_order, second_order = order_yes, order_no
                 first_label, second_label = "yes", "no"
             else:
@@ -579,7 +583,18 @@ class OrderExecutor:
 
         except Exception as e:
             order.status = OrderStatus.FAILED
-            logger.error("Order submission failed", error=repr(e))
+            error_text = repr(e)
+            if "fully filled or killed" in error_text:
+                logger.warning(
+                    "Order not fillable under FOK",
+                    token_id=order.token_id[:8],
+                    side=order.side.value,
+                    price=order.price,
+                    size=size,
+                    error=error_text,
+                )
+            else:
+                logger.error("Order submission failed", error=error_text)
 
         return order
 
