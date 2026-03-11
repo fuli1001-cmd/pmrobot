@@ -223,7 +223,8 @@ class OrderBook:
         other_book: "OrderBook",
         profit_threshold: float,
         max_size: float,
-        min_size: float = 10.0,
+        min_size: float = 1.0,
+        depth_safety_multiplier: float = 1.5,
     ) -> dict:
         """
         Greedy fill algorithm: expand position size while profit threshold is met.
@@ -238,6 +239,7 @@ class OrderBook:
             profit_threshold: Minimum profit percentage required (e.g., 0.01 = 1%)
             max_size: Maximum position size in USDC
             min_size: Minimum position size in USDC
+            depth_safety_multiplier: Reserve multiple required on each leg
             
         Returns:
             Dict with:
@@ -258,6 +260,7 @@ class OrderBook:
                 "profit_pct": 0.0,
                 "levels_self": 0,
                 "levels_other": 0,
+                "safe_max_size": 0.0,
             }
         
         # Binary search for optimal size
@@ -277,6 +280,29 @@ class OrderBook:
         best_other = other_book.asks[0].price
         total_l1 = best_self + best_other
 
+        # Convert per-leg available depth into a safe max total budget.
+        # If one leg gets x USDC of the total budget, require reserve multiple m:
+        #   x * m <= available_depth_leg
+        # Rearranged to total budget cap for each leg:
+        #   total <= available_depth_leg * total_l1 / (best_leg * m)
+        available_depth_self = self.get_available_depth(side="ask")
+        available_depth_other = other_book.get_available_depth(side="ask")
+        safe_max_self = available_depth_self * total_l1 / (best_self * depth_safety_multiplier)
+        safe_max_other = available_depth_other * total_l1 / (best_other * depth_safety_multiplier)
+        safe_max_size = min(max_size, safe_max_self, safe_max_other)
+
+        if safe_max_size < min_size:
+            return {
+                "optimal_size": 0.0,
+                "avg_price_self": None,
+                "avg_price_other": None,
+                "combined_cost": None,
+                "profit_pct": 0.0,
+                "levels_self": 0,
+                "levels_other": 0,
+                "safe_max_size": safe_max_size,
+            }
+
         # Polymarket enforces min $1 per order (size * price >= 1.0).
         # Equal token sizing means the cheap side is the binding constraint:
         #   num_tokens * min(price_self, price_other) >= 1.0
@@ -288,7 +314,12 @@ class OrderBook:
         import math as _math
         min_total_for_order = _math.ceil(min_total_for_order)
 
+        test_sizes.append(safe_max_size)
+        test_sizes = sorted({round(size, 6) for size in test_sizes})
+
         for test_size in test_sizes:
+            if test_size > safe_max_size:
+                continue
             # Skip sizes where the cheap side would produce < $1 order
             if test_size < min_total_for_order:
                 continue
@@ -314,6 +345,7 @@ class OrderBook:
                     "profit_pct": profit_pct,
                     "levels_self": info_self["levels_used"],
                     "levels_other": info_other["levels_used"],
+                    "safe_max_size": safe_max_size,
                 }
             else:
                 # Profit dropped below threshold, stop expanding
@@ -328,6 +360,7 @@ class OrderBook:
                 "profit_pct": 0.0,
                 "levels_self": 0,
                 "levels_other": 0,
+                "safe_max_size": safe_max_size,
             }
         
         return best_result
@@ -408,6 +441,9 @@ class ArbitrageOpportunity:
     
     # Trade parameters
     trade_size_usdc: float
+    safe_max_trade_size_usdc: float = 0.0
+    configured_max_trade_size_usdc: float = 0.0
+    depth_safety_multiplier: float = 1.0
     
     # Profit calculation
     total_cost: float  # avg_price_yes + avg_price_no (should be < 1.0)

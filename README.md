@@ -425,7 +425,8 @@ LLM_MODEL=deepseek-chat
 
 # ═══ 交易参数 ═══
 PROFIT_THRESHOLD=0.005           # PM 平台内利润阈值 (0.5%)
-SINGLE_TRADE_SIZE=20             # PM 平台内单笔金额 (USDC)
+MAX_TRADE_SIZE=20                # PM 平台内最大下单金额 (USDC)
+DEPTH_SAFETY_MULTIPLIER=1.5      # 订单簿安全冗余倍数
 MAX_SLIPPAGE=0.002               # 最大滑点 (0.2%)
 MERGE_INTERVAL=600               # 自动合并间隔 (秒)
 MARKET_REFRESH_INTERVAL=600      # 全量刷新 + 跨平台扫描间隔 (秒)
@@ -473,7 +474,8 @@ python main.py
 | 参数 | 环境变量 | 默认值 | 范围 | 说明 |
 |------|----------|--------|------|------|
 | 利润阈值 | `PROFIT_THRESHOLD` | 0.008 (0.8%) | 0.001~0.1 | 套利触发最低利润率 |
-| 单笔金额 | `SINGLE_TRADE_SIZE` | 100.0 | 1~10000 | USDC 金额（NegRisk 按结果数平分） |
+| 最大下单金额 | `MAX_TRADE_SIZE` | 100.0 | 1~10000 | 实际下单金额上限，最终金额会按订单簿深度动态下调 |
+| 深度安全倍数 | `DEPTH_SAFETY_MULTIPLIER` | 1.5 | 1~10 | 要求每条腿具备的订单簿冗余倍数，越大越保守 |
 | 最大滑点 | `MAX_SLIPPAGE` | 0.002 (0.2%) | 0.01%~5% | 加权均价偏差上限 |
 | 合并间隔 | `MERGE_INTERVAL` | 600 (10min) | 60~3600 | Settler 自动合并周期 |
 | 刷新间隔 | `MARKET_REFRESH_INTERVAL` | 1800 (30min) | 0~86400 | 全量市场 + 跨平台扫描间隔 |
@@ -519,7 +521,7 @@ python main.py
 | SX Bet (SX Network USDC) | $200 | 跨平台 SX 腿 |
 | **总计** | **$500** | 最小可运行配置 |
 
-推荐初始参数：`SINGLE_TRADE_SIZE=20`, `CROSS_TRADE_SIZE=25`
+推荐初始参数：`MAX_TRADE_SIZE=20`, `DEPTH_SAFETY_MULTIPLIER=1.5`, `CROSS_TRADE_SIZE=25`
 
 ---
 

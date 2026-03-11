@@ -95,6 +95,7 @@ class ArbitrageDetector:
         profit_threshold: float = 0.008,
         trade_size: float = 100.0,
         max_slippage: float = 0.002,
+        depth_safety_multiplier: float = 1.5,
         cooldown_seconds: float = 0.0,  # 0 for dry-run, use 5-10 for real trading
     ):
         """
@@ -102,13 +103,15 @@ class ArbitrageDetector:
 
         Args:
             profit_threshold: Minimum profit threshold (e.g., 0.008 = 0.8%)
-            trade_size: Trade size in USDC
+            trade_size: Maximum trade size in USDC
             max_slippage: Maximum allowed slippage
+            depth_safety_multiplier: Required order book reserve multiple
             cooldown_seconds: Seconds to wait before re-detecting same market
         """
         self.profit_threshold = profit_threshold
         self.trade_size = trade_size
         self.max_slippage = max_slippage
+        self.depth_safety_multiplier = depth_safety_multiplier
         self.cooldown_seconds = cooldown_seconds
         self._last_opportunity: dict[str, float] = {}  # market_id -> timestamp
 
@@ -142,7 +145,8 @@ class ArbitrageDetector:
             other_book=book_no,
             profit_threshold=self.profit_threshold,
             max_size=self.trade_size,
-            min_size=5.0,  # Lowered from 10 to capture more opportunities
+            min_size=1.0,
+            depth_safety_multiplier=self.depth_safety_multiplier,
         )
         
         # Skip if no profitable size found
@@ -180,6 +184,9 @@ class ArbitrageDetector:
             avg_price_yes=avg_price_yes,
             avg_price_no=avg_price_no,
             trade_size_usdc=effective_trade_size,
+            safe_max_trade_size_usdc=greedy_result["safe_max_size"],
+            configured_max_trade_size_usdc=self.trade_size,
+            depth_safety_multiplier=self.depth_safety_multiplier,
             total_cost=total_cost,
             estimated_fee=estimated_fee,
             levels_yes=greedy_result["levels_self"],
@@ -209,6 +216,10 @@ class ArbitrageDetector:
                 gross_profit=f"{opportunity.gross_profit_pct:.4f}",
                 net_profit=f"{opportunity.net_profit_pct:.4f}",
                 profit_usdc=f"${opportunity.net_profit_usdc:.2f}",
+                trade_size=f"${opportunity.trade_size_usdc:.2f}",
+                safe_max_trade_size=f"${opportunity.safe_max_trade_size_usdc:.2f}",
+                configured_max_trade_size=f"${opportunity.configured_max_trade_size_usdc:.2f}",
+                depth_safety_multiplier=opportunity.depth_safety_multiplier,
             )
             return opportunity
 

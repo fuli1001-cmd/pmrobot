@@ -52,8 +52,17 @@ class Settings(BaseSettings):
     profit_threshold: float = Field(
         0.008, ge=0.001, le=0.1, description="Minimum profit threshold (0.8%)"
     )
-    single_trade_size: float = Field(
-        100.0, ge=1.0, le=10000.0, description="Single trade size in USDC"
+    max_trade_size: float = Field(
+        100.0,
+        ge=1.0,
+        le=10000.0,
+        description="Maximum trade size in USDC",
+    )
+    depth_safety_multiplier: float = Field(
+        1.5,
+        ge=1.0,
+        le=10.0,
+        description="Required order book reserve multiple before taking a trade",
     )
     max_slippage: float = Field(
         0.002, ge=0.0001, le=0.05, description="Maximum allowed slippage (0.2%)"
@@ -155,7 +164,6 @@ class Settings(BaseSettings):
     def notifications_enabled(self) -> bool:
         """Check if any notifications are configured."""
         return bool((self.telegram_bot_token and self.telegram_chat_id) or self.wechat_webhook_url)
-
 
 @lru_cache()
 def get_settings() -> Settings:

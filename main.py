@@ -101,7 +101,7 @@ class ArbitrageBot:
             env=self.settings.env,
             dry_run=self.dry_run,
             profit_threshold=f"{self.settings.profit_threshold:.2%}",
-            trade_size=f"${self.settings.single_trade_size:.2f}",
+            trade_size=f"${self.settings.max_trade_size:.2f}",
         )
 
         self._running = True
@@ -127,7 +127,7 @@ class ArbitrageBot:
             f"> Mode: {'DRY RUN' if self.dry_run else 'LIVE'}\n"
             f"> Balance: ${initial_balance:.2f}\n"
             f"> Threshold: {self.settings.profit_threshold:.2%}\n"
-            f"> Trade Size: ${self.settings.single_trade_size:.2f}"
+            f"> Max Trade Size: ${self.settings.max_trade_size:.2f}"
         )
 
         try:
@@ -229,7 +229,7 @@ class ArbitrageBot:
             )
 
         # Filter for minimum liquidity
-        min_liquidity = self.settings.single_trade_size * 2
+        min_liquidity = self.settings.max_trade_size * 2
         tradeable = [m for m in markets if m.liquidity >= min_liquidity]
 
         logger.info(
@@ -252,7 +252,7 @@ class ArbitrageBot:
             )
 
         # Filter for minimum liquidity
-        min_liquidity = self.settings.single_trade_size * 2
+        min_liquidity = self.settings.max_trade_size * 2
         tradeable = [e for e in events if e.liquidity >= min_liquidity]
 
         logger.info(
@@ -276,6 +276,9 @@ class ArbitrageBot:
                     net_profit_pct=f"{opp.net_profit_pct:.2%}",
                     profit_usdc=f"${opp.net_profit_usdc:.2f}",
                     trade_size=f"${opp.trade_size_usdc:.2f}",
+                    safe_max_trade_size=f"${opp.safe_max_trade_size_usdc:.2f}",
+                    configured_max_trade_size=f"${opp.configured_max_trade_size_usdc:.2f}",
+                    depth_safety_multiplier=opp.depth_safety_multiplier,
                 )
                 try:
                     self._opportunity_queue.put_nowait(opp)
@@ -312,8 +315,9 @@ class ArbitrageBot:
         self.monitor = MarketMonitor(
             markets=markets,
             profit_threshold=self.settings.profit_threshold,
-            trade_size=self.settings.single_trade_size,
+            trade_size=self.settings.max_trade_size,
             max_slippage=self.settings.max_slippage,
+            depth_safety_multiplier=self.settings.depth_safety_multiplier,
             on_opportunity=on_opportunity,
             on_short_opportunity=on_short_opportunity,
         )
@@ -354,7 +358,7 @@ class ArbitrageBot:
         self.neg_risk_monitor = NegativeRiskMarketMonitor(
             events=events,
             profit_threshold=self.settings.profit_threshold,
-            trade_size=self.settings.single_trade_size,
+            trade_size=self.settings.max_trade_size,
             max_slippage=self.settings.max_slippage,
             on_opportunity=on_neg_risk_opportunity,
         )
@@ -667,7 +671,7 @@ class ArbitrageBot:
 
                 logger.info("Refreshing markets...")
 
-                min_liquidity = self.settings.single_trade_size * 2
+                min_liquidity = self.settings.max_trade_size * 2
 
                 async with MarketScanner(rate_limit=self.settings.api_rate_limit) as scanner:
                     # Fetch fee-free markets (sports ⊂ fee-free, so this
