@@ -480,6 +480,16 @@ python main.py
 | 合并间隔 | `MERGE_INTERVAL` | 600 (10min) | 60~3600 | Settler 自动合并周期 |
 | 刷新间隔 | `MARKET_REFRESH_INTERVAL` | 1800 (30min) | 0~86400 | 全量市场 + 跨平台扫描间隔 |
 
+### 下单金额逻辑说明
+
+- `MAX_TRADE_SIZE` 是单次机会允许使用的最大预算，不代表每次都会按这个金额下单。
+- 系统会先根据 YES/NO 两条腿前几档可买深度，结合 `DEPTH_SAFETY_MULTIPLIER`，计算安全上限 `safe_max_size`。
+- `safe_max_size = min(MAX_TRADE_SIZE, safe_max_self, safe_max_other)`，其中 `safe_max_self` / `safe_max_other` 是两条腿各自按深度和安全倍数推导出的安全预算上限。
+- 然后系统会在不超过 `safe_max_size` 的候选金额里，寻找仍然满足利润阈值、平台最小下单约束、以及双腿都能完整吃到的最大可行金额，作为最终实际下单金额。
+- 所以最终关系是：`实际下单金额 <= safe_max_size <= MAX_TRADE_SIZE`。
+- 当 `safe_max_size` 本身也满足利润和最小下单约束时，最终实际下单金额就会等于 `safe_max_size`。
+- 日志中的 `configured_max_trade_size`、`safe_max_trade_size`、`trade_size` 分别对应：配置上限、安全上限、最终实际下单金额。
+
 ### 跨平台参数
 
 | 参数 | 环境变量 | 默认值 | 说明 |

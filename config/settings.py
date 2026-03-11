@@ -94,6 +94,14 @@ class Settings(BaseSettings):
         False,
         description="Emergency kill switch: terminate process on ANY real-money loss",
     )
+    pm_internal_arb_enabled: bool = Field(
+        True,
+        description="Enable Polymarket internal (Binary + NegRisk) arbitrage monitoring",
+    )
+    pm_arb_concurrent: bool = Field(
+        False,
+        description="Submit both legs concurrently (True) or sequentially fragile-first (False)",
+    )
 
     # ═══ Azuro Configuration ═══
     azuro_enabled: bool = Field(False, description="Enable Azuro exchange adapter")

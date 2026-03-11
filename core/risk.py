@@ -82,11 +82,12 @@ class RiskManager:
         self._market_last_trade: Dict[str, float] = {}
         self._recent_opportunities: Deque[float] = deque(maxlen=100)
 
-        # Initialize notifier
+        # Initialize notifier (must include WeChat so alerts are actually sent)
         settings = get_settings()
         self.notifier = create_notifier(
             settings.telegram_bot_token,
             settings.telegram_chat_id,
+            wechat_webhook_url=settings.wechat_webhook_url,
         )
 
         logger.info(

@@ -108,6 +108,7 @@ class ArbitrageBot:
 
         # Initialize executor
         self.executor = create_executor(dry_run=self.dry_run)
+        self.executor._concurrent = self.settings.pm_arb_concurrent
 
         # Initialize CTF contract for short arbitrage (Mint)
         self.ctf_contract = CTFContract(
@@ -153,15 +154,22 @@ class ArbitrageBot:
 
             # Phase 2: Start monitoring and execution loops
             tasks = [
-                self._run_monitor(markets),
-                self._run_neg_risk_monitor(neg_risk_events),
-                self._run_executor(),
-                self._run_neg_risk_executor(),
-                self._run_short_executor(),
                 self._run_settler(),
                 self._run_stats_reporter(),
                 self._run_market_refresher(),
             ]
+
+            # Binary / NegRisk internal arbitrage (can be disabled)
+            if self.settings.pm_internal_arb_enabled:
+                tasks.extend([
+                    self._run_monitor(markets),
+                    self._run_neg_risk_monitor(neg_risk_events),
+                    self._run_executor(),
+                    self._run_neg_risk_executor(),
+                    self._run_short_executor(),
+                ])
+            else:
+                logger.info("PM internal arbitrage DISABLED (PM_INTERNAL_ARB_ENABLED=false)")
 
             # Add cross-platform executor + WebSocket monitors
             if self._cross_executor:

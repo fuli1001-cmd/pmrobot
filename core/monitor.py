@@ -694,6 +694,7 @@ class MarketMonitor:
         profit_threshold: float = 0.008,
         trade_size: float = 100.0,
         max_slippage: float = 0.002,
+        depth_safety_multiplier: float = 1.5,
         on_opportunity: Optional[Callable[[ArbitrageOpportunity], None]] = None,
         on_short_opportunity: Optional[Callable[[ShortArbitrageOpportunity], None]] = None,
     ):
@@ -705,6 +706,7 @@ class MarketMonitor:
             profit_threshold: Minimum profit threshold
             trade_size: Trade size in USDC
             max_slippage: Maximum allowed slippage
+            depth_safety_multiplier: Required order book reserve multiple
             on_opportunity: Callback when long arbitrage opportunity is detected
             on_short_opportunity: Callback when short (Mint+Sell) opportunity is detected
         """
@@ -720,6 +722,7 @@ class MarketMonitor:
             profit_threshold=profit_threshold,
             trade_size=trade_size,
             max_slippage=max_slippage,
+            depth_safety_multiplier=depth_safety_multiplier,
         )
         self.on_opportunity = on_opportunity
         self.on_short_opportunity = on_short_opportunity
@@ -884,7 +887,10 @@ class MarketMonitor:
         except json.JSONDecodeError as e:
             # Transient parse errors are normal during reconnections
             if message and not message.isspace():
-                logger.debug("Failed to parse WebSocket message", error=repr(e), msg_preview=message[:100])
+                if "INVALID OPERATION" in message or "404" in message:
+                    logger.debug("Ignored invalid op (likely 404/No Orderbook)", msg_preview=message[:100])
+                else:
+                    logger.debug("Failed to parse WebSocket message", error=repr(e), msg_preview=message[:100])
         except Exception as e:
             logger.debug("Error handling message", error=repr(e))
 

@@ -441,13 +441,13 @@ class ArbitrageOpportunity:
     
     # Trade parameters
     trade_size_usdc: float
-    safe_max_trade_size_usdc: float = 0.0
-    configured_max_trade_size_usdc: float = 0.0
-    depth_safety_multiplier: float = 1.0
     
     # Profit calculation
     total_cost: float  # avg_price_yes + avg_price_no (should be < 1.0)
     estimated_fee: float  # Total fees for both sides
+    safe_max_trade_size_usdc: float = 0.0
+    configured_max_trade_size_usdc: float = 0.0
+    depth_safety_multiplier: float = 1.0
     levels_yes: int = 0
     levels_no: int = 0
     

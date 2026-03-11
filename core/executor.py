@@ -263,45 +263,56 @@ class OrderExecutor:
             )
 
         try:
-            # Sequential execution: submit the more fragile side first.
-            # More levels consumed at detection time usually means thinner book.
-            # Tie-break with higher price, because equal token counts require more
-            # USDC on that leg and it tends to move out from under us sooner.
-            # If the first leg FOK fails -> zero loss. If it fills and the second
-            # fails -> emergency exit still works, but this ordering reduces risk.
-            yes_fragility = (opportunity.levels_yes, opportunity.avg_price_yes)
-            no_fragility = (opportunity.levels_no, opportunity.avg_price_no)
-            if yes_fragility >= no_fragility:
-                first_order, second_order = order_yes, order_no
-                first_label, second_label = "yes", "no"
-            else:
-                first_order, second_order = order_no, order_yes
-                first_label, second_label = "no", "yes"
+            concurrent = getattr(self, '_concurrent', False)
 
-            first_order = await self._submit_order(first_order)
-            if not first_order.is_filled:
-                # Thin side failed — no position opened, zero loss
-                execution_time = (time.time() - start_time) * 1000
-                if first_label == "yes":
-                    order_yes = first_order
-                else:
-                    order_no = first_order
-                return ExecutionReport(
-                    result=ExecutionResult.FAILED,
-                    opportunity=opportunity,
-                    order_yes=order_yes,
-                    order_no=order_no,
-                    execution_time_ms=execution_time,
+            if concurrent:
+                # Concurrent execution: fire both legs simultaneously.
+                # Minimises time-window for order-book changes between legs.
+                # Risk: if one FOK fails we must emergency-exit the other.
+                order_yes, order_no = await asyncio.gather(
+                    self._submit_order(order_yes),
+                    self._submit_order(order_no),
                 )
-
-            # Thin side filled, now submit thick side
-            second_order = await self._submit_order(second_order)
-
-            # Map back to yes/no
-            if first_label == "yes":
-                order_yes, order_no = first_order, second_order
             else:
-                order_no, order_yes = first_order, second_order
+                # Sequential execution: submit the more fragile side first.
+                # More levels consumed at detection time usually means thinner book.
+                # Tie-break with higher price, because equal token counts require more
+                # USDC on that leg and it tends to move out from under us sooner.
+                # If the first leg FOK fails -> zero loss. If it fills and the second
+                # fails -> emergency exit still works, but this ordering reduces risk.
+                yes_fragility = (opportunity.levels_yes, opportunity.avg_price_yes)
+                no_fragility = (opportunity.levels_no, opportunity.avg_price_no)
+                if yes_fragility >= no_fragility:
+                    first_order, second_order = order_yes, order_no
+                    first_label, second_label = "yes", "no"
+                else:
+                    first_order, second_order = order_no, order_yes
+                    first_label, second_label = "no", "yes"
+
+                first_order = await self._submit_order(first_order)
+                if not first_order.is_filled:
+                    # Thin side failed — no position opened, zero loss
+                    execution_time = (time.time() - start_time) * 1000
+                    if first_label == "yes":
+                        order_yes = first_order
+                    else:
+                        order_no = first_order
+                    return ExecutionReport(
+                        result=ExecutionResult.FAILED,
+                        opportunity=opportunity,
+                        order_yes=order_yes,
+                        order_no=order_no,
+                        execution_time_ms=execution_time,
+                    )
+
+                # Thin side filled, now submit thick side
+                second_order = await self._submit_order(second_order)
+
+                # Map back to yes/no
+                if first_label == "yes":
+                    order_yes, order_no = first_order, second_order
+                else:
+                    order_no, order_yes = first_order, second_order
 
             execution_time = (time.time() - start_time) * 1000
             yes_success = order_yes.is_filled
