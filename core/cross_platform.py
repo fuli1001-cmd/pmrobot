@@ -40,7 +40,7 @@ _ALT_EXECUTION_COST_USD = 0.01
 # We add a small buffer for order-book movement between quote and fill.
 # NOTE: With VWAP pricing the fill cost is already realistic; this buffer
 # covers book changes between the quote timestamp and execution.
-_ALT_SLIPPAGE_BUFFER = 0.005  # 0.5% (was 3% for Azuro AMM)
+_ALT_SLIPPAGE_BUFFER = 0.002  # 0.2% (was 3% for Azuro AMM)
 
 # SX Bet oracle fee: 5% on winning profit only.  Since we hedge both
 # sides, one side always wins.  Effective fee on trade = ~2.5% of profit.

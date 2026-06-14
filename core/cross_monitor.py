@@ -124,6 +124,19 @@ class CrossPlatformMonitor:
         self._opp_count = 0
         self._last_stats_time = time.time()
 
+        # Diagnostic: track rejection reasons and best near-miss per stats window
+        self._diag_no_sx_book = 0
+        self._diag_no_pm_price = 0
+        self._diag_no_sx_price = 0
+        self._diag_pm_depth_fail = 0
+        self._diag_sx_depth_fail = 0
+        self._diag_cost_ge_1 = 0
+        self._diag_net_le_0 = 0
+        self._diag_below_threshold = 0
+        self._diag_best_net_profit = -999.0
+        self._diag_best_pair_label = ""
+        self._diag_best_total_cost = 0.0
+
     # ------------------------------------------------------------------
     # Pair management (called from market refresher)
     # ------------------------------------------------------------------
@@ -338,6 +351,33 @@ class CrossPlatformMonitor:
                 pm_tokens=len(self._pm_token_to_pairs),
                 sx_markets=len(self._sx_hash_to_pairs),
             )
+            # Diagnostic: log rejection breakdown and best near-miss
+            logger.info(
+                "Cross-platform diagnostic",
+                no_sx_book=self._diag_no_sx_book,
+                no_pm_price=self._diag_no_pm_price,
+                no_sx_price=self._diag_no_sx_price,
+                pm_depth_fail=self._diag_pm_depth_fail,
+                sx_depth_fail=self._diag_sx_depth_fail,
+                cost_ge_1=self._diag_cost_ge_1,
+                net_le_0=self._diag_net_le_0,
+                below_threshold=self._diag_below_threshold,
+                best_net_profit=f"{self._diag_best_net_profit:.4%}" if self._diag_best_net_profit > -999.0 else "N/A",
+                best_total_cost=f"{self._diag_best_total_cost:.4f}" if self._diag_best_total_cost > 0 else "N/A",
+                best_pair=self._diag_best_pair_label or "N/A",
+            )
+            # Reset diagnostic counters for next window
+            self._diag_no_sx_book = 0
+            self._diag_no_pm_price = 0
+            self._diag_no_sx_price = 0
+            self._diag_pm_depth_fail = 0
+            self._diag_sx_depth_fail = 0
+            self._diag_cost_ge_1 = 0
+            self._diag_net_le_0 = 0
+            self._diag_below_threshold = 0
+            self._diag_best_net_profit = -999.0
+            self._diag_best_pair_label = ""
+            self._diag_best_total_cost = 0.0
             self._last_stats_time = now
 
         pm = pair.polymarket
@@ -355,6 +395,7 @@ class CrossPlatformMonitor:
         # ── Gather SX prices from WS cache ──
         sx_book = self._sx_ws.get_book(sx.market_id)
         if not sx_book:
+            self._diag_no_sx_book += 1
             return
 
         sx_price_yes = sx_book.price_yes
@@ -399,7 +440,14 @@ class CrossPlatformMonitor:
 
         net_profit_pct, price_yes, price_no, total_cost, yes_plat = best
 
+        # Track best near-miss for diagnostics
+        if net_profit_pct > self._diag_best_net_profit:
+            self._diag_best_net_profit = net_profit_pct
+            self._diag_best_total_cost = total_cost
+            self._diag_best_pair_label = f"{pm.question[:40]}|{yes_plat.value}"
+
         if net_profit_pct < self._profit_threshold:
+            self._diag_below_threshold += 1
             return
 
         # Build opportunity
@@ -451,15 +499,21 @@ class CrossPlatformMonitor:
         Returns (net_profit_pct, price_yes, price_no, total_cost, yes_platform)
         or None if not viable.
         """
-        if pm_price <= 0 or sx_price <= 0:
+        if pm_price <= 0:
+            self._diag_no_pm_price += 1
+            return None
+        if sx_price <= 0:
+            self._diag_no_sx_price += 1
             return None
 
         # Depth gate: PM side must have sufficient depth
         if pm_depth < max(_MIN_PM_CLOB_DEPTH_USD, self._trade_size):
+            self._diag_pm_depth_fail += 1
             return None
 
         # SX depth gate
         if sx_depth < self._trade_size:
+            self._diag_sx_depth_fail += 1
             return None
 
         # Assign prices based on direction
@@ -472,6 +526,7 @@ class CrossPlatformMonitor:
 
         total_cost = price_yes + price_no
         if total_cost >= 1.0:
+            self._diag_cost_ge_1 += 1
             return None
 
         gross_profit_pct = (1.0 - total_cost) / total_cost
@@ -480,6 +535,7 @@ class CrossPlatformMonitor:
         net_profit_pct = gross_profit_pct - execution_fee - oracle_fee
 
         if net_profit_pct <= 0:
+            self._diag_net_le_0 += 1
             return None
 
         return (net_profit_pct, price_yes, price_no, total_cost, yes_platform)
