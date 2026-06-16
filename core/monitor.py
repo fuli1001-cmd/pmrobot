@@ -12,7 +12,6 @@ from config.constants import (
     CLOB_WS_URL, 
     get_profit_threshold,
     ESTIMATED_MINT_GAS_COST_USD,
-    MIN_SHORT_ARBITRAGE_SIZE,
     SHORT_ARBITRAGE_THRESHOLD,
 )
 from models.market import Market, NegativeRiskEvent, NegativeRiskStrategy, NegativeRiskArbitrageOpportunity
@@ -267,15 +266,24 @@ class ArbitrageDetector:
         if total_revenue <= 1.0:
             return None
         
-        # Calculate effective trade size based on available depth
+        # Short mint+sell pays a fixed gas cost, so do not silently shrink
+        # below the configured MAX_TRADE_SIZE. If depth cannot support that
+        # size, skip the opportunity.
         depth_yes = book_yes.get_available_depth("bid", max_levels=5)
         depth_no = book_no.get_available_depth("bid", max_levels=5)
         min_depth = min(depth_yes, depth_no)
-        effective_trade_size = min(self.trade_size, min_depth * 0.3)
+        safe_depth_size = min_depth * 0.3
         
-        # Skip if below minimum for short arbitrage
-        if effective_trade_size < MIN_SHORT_ARBITRAGE_SIZE:
+        if safe_depth_size < self.trade_size:
+            logger.debug(
+                "Short arbitrage skipped: insufficient depth for configured size",
+                market=market.slug,
+                configured_trade_size=f"${self.trade_size:.2f}",
+                safe_depth_size=f"${safe_depth_size:.2f}",
+            )
             return None
+
+        effective_trade_size = self.trade_size
         
         opportunity = ShortArbitrageOpportunity(
             market=market,
@@ -1291,4 +1299,3 @@ class NegativeRiskMarketMonitor:
             
             if self.on_opportunity:
                 self.on_opportunity(opportunity)
-

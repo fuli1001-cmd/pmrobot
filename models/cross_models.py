@@ -21,17 +21,13 @@ class CrossPlatformOpportunity:
 
     The opportunity pairs a YES buy on one platform with a NO buy on
     the other, such that total cost < 1.0 (guaranteed profit).
-
-    NOTE: Field names ``az_market_id`` / ``az_question`` are kept for
-    backward compatibility but represent the *alternative* platform
-    (SX Bet or Azuro), not necessarily Azuro.
     """
 
     # Aligned market identifiers
     pm_market_id: str
-    az_market_id: str       # Alt platform market ID (SX Bet marketHash or Azuro conditionId)
+    alt_market_id: str      # Alt platform market ID (currently SX Bet marketHash)
     pm_question: str
-    az_question: str        # Alt platform question / event name
+    alt_question: str       # Alt platform question / event name
 
     # Strategy
     strategy: CrossPlatformStrategy = CrossPlatformStrategy.BINARY_HEDGE

@@ -1,8 +1,8 @@
 """
 Prediction Market Arbitrage Bot - Main Entry Point
 
-A fully automated arbitrage bot supporting Polymarket and Azuro
-prediction markets (single-platform and cross-platform strategies).
+A fully automated arbitrage bot supporting Polymarket internal
+strategies and Polymarket/SX Bet cross-platform strategies.
 """
 
 import argparse
@@ -737,10 +737,7 @@ class ArbitrageBot:
     # ------------------------------------------------------------------
 
     async def _init_cross_platform(self) -> None:
-        """Initialise cross-platform exchange adapters and components.
-
-        Prefers SX Bet over Azuro when both are enabled.
-        """
+        """Initialise cross-platform exchange adapters and components."""
         logger.info("Initialising cross-platform arbitrage...")
 
         # Polymarket exchange adapter
@@ -909,7 +906,7 @@ class ArbitrageBot:
                     await self.notifier.send_alert(
                         "🚨 Cross-Platform Partial Fill",
                         f"PM: {opportunity.pm_question[:50]}\n"
-                        f"ALT: {opportunity.az_question[:50]}\n"
+                        f"ALT: {opportunity.alt_question[:50]}\n"
                         f"Error: {report.error_message}\n"
                         f"Estimated Loss: ${loss:.2f}",
                     )
@@ -921,7 +918,7 @@ class ArbitrageBot:
                     logger.info(
                         "DRY RUN: Simulated cross-platform arb",
                         pm_market=opportunity.pm_question[:60],
-                        alt_market=opportunity.az_question[:60],
+                        alt_market=opportunity.alt_question[:60],
                         strategy=opportunity.strategy.value,
                         yes_on=opportunity.yes_platform.value,
                         price_yes=f"{opportunity.price_yes:.4f}",
@@ -947,7 +944,7 @@ class ArbitrageBot:
 def parse_args() -> argparse.Namespace:
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
-        description="Prediction Market Arbitrage Bot (Polymarket + Azuro)",
+        description="Prediction Market Arbitrage Bot (Polymarket + SX Bet)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 

@@ -1,7 +1,7 @@
 """Cross-platform market alignment.
 
-Matches prediction-market events across Polymarket and Azuro so that
-the arbitrage engine can compare prices for the *same* real-world event.
+Matches prediction-market events across Polymarket and an alternative
+platform so the arbitrage engine can compare prices for the same event.
 
 Matching strategy (in priority order):
 1. **Structural rules** – normalise team names, match by
@@ -60,15 +60,15 @@ class AlignedMarketPair:
     """A matched pair of markets across two platforms."""
 
     polymarket: UnifiedMarket
-    azuro: UnifiedMarket
+    alt_market: UnifiedMarket
     confidence: float = 1.0  # 1.0 for structural, <1.0 for LLM
     match_method: str = "structural"
     matched_at: float = field(default_factory=time.time)
-    teams_reversed: bool = False  # True when PM team_a ≈ AZ team_b (opposite order)
+    teams_reversed: bool = False  # True when PM team_a matches alt team_b.
 
 
 # Internal type for an LLM candidate pair.
-_CandidatePair = Tuple[UnifiedMarket, UnifiedMarket, str]  # (pm, az, cache_key)
+_CandidatePair = Tuple[UnifiedMarket, UnifiedMarket, str]  # (pm, alt, cache_key)
 
 
 # ---------------------------------------------------------------------------
@@ -76,12 +76,12 @@ _CandidatePair = Tuple[UnifiedMarket, UnifiedMarket, str]  # (pm, az, cache_key)
 # ---------------------------------------------------------------------------
 
 class MarketAligner:
-    """Aligns Polymarket and Azuro markets for cross-platform comparison.
+    """Aligns Polymarket and alternative-platform markets for comparison.
 
     Usage::
 
         aligner = MarketAligner()
-        pairs = await aligner.align(pm_markets, az_markets)
+        pairs = await aligner.align(pm_markets, alt_markets)
     """
 
     # Path for persistent SQLite cache (next to alignment.py → data/)
@@ -161,7 +161,7 @@ class MarketAligner:
     async def align(
         self,
         pm_markets: List[UnifiedMarket],
-        az_markets: List[UnifiedMarket],
+        alt_markets: List[UnifiedMarket],
     ) -> List[AlignedMarketPair]:
         """Find matching market pairs across the two platforms.
 
@@ -171,39 +171,39 @@ class MarketAligner:
 
         Args:
             pm_markets: Polymarket markets (sports-filtered).
-            az_markets: Azuro markets.
+            alt_markets: Alternative-platform markets.
 
         Returns:
             List of aligned pairs.
         """
         pairs: List[AlignedMarketPair] = []
 
-        # Build lookup index for Azuro markets by normalised team pair
-        az_index = self._build_team_index(az_markets)
+        # Build lookup index for alt markets by normalised team pair.
+        alt_index = self._build_team_index(alt_markets)
 
         # ── Phase 1: Structural matching ──
         unmatched_pms: List[UnifiedMarket] = []
-        structural_az_ids: set = set()
+        structural_alt_ids: set = set()
         for pm in pm_markets:
-            pair = self._structural_match(pm, az_markets, az_index)
+            pair = self._structural_match(pm, alt_markets, alt_index)
             if pair:
                 pairs.append(pair)
-                structural_az_ids.add(pair.azuro.market_id)
+                structural_alt_ids.add(pair.alt_market.market_id)
             else:
                 unmatched_pms.append(pm)
 
         # ── Phase 2: LLM batch fallback ──
         if self.use_llm and self.llm_api_key and unmatched_pms:
             llm_pairs = await self._llm_batch_match(
-                unmatched_pms, az_markets,
-                already_matched_az_ids=structural_az_ids,
+                unmatched_pms, alt_markets,
+                already_matched_alt_ids=structural_alt_ids,
             )
             pairs.extend(llm_pairs)
 
         logger.info(
             "Market alignment complete",
             pm_count=len(pm_markets),
-            az_count=len(az_markets),
+            alt_count=len(alt_markets),
             structural=len(pairs) - len([p for p in pairs if p.match_method == "llm"]),
             llm=len([p for p in pairs if p.match_method == "llm"]),
             total_matched=len(pairs),
@@ -217,8 +217,8 @@ class MarketAligner:
     def _structural_match(
         self,
         pm: UnifiedMarket,
-        az_markets: List[UnifiedMarket],
-        az_index: Dict[str, List[UnifiedMarket]],
+        alt_markets: List[UnifiedMarket],
+        alt_index: Dict[str, List[UnifiedMarket]],
     ) -> Optional[AlignedMarketPair]:
         """Try to match via cache hit or structural rules (no LLM)."""
 
@@ -229,8 +229,8 @@ class MarketAligner:
             return None
 
         # Check in-memory cache first
-        for az in az_markets:
-            cache_key = self._cache_key(pm.question, az.question)
+        for alt in alt_markets:
+            cache_key = self._cache_key(pm.question, alt.question)
             if cache_key in self._cache:
                 return self._cache[cache_key]
 
@@ -242,26 +242,26 @@ class MarketAligner:
         if not pm_key:
             return None
 
-        candidates = az_index.get(pm_key, [])
-        for az in candidates:
-            # Detect whether PM team_a maps to AZ team_b (i.e. reversed).
+        candidates = alt_index.get(pm_key, [])
+        for alt in candidates:
+            # Detect whether PM team_a maps to alt team_b (i.e. reversed).
             # The sorted key is identical either way, so we check raw order.
             pm_norm_a = normalize_team_name(pm.team_a)
-            az_norm_a = normalize_team_name(az.team_a)
-            reversed_ = pm_norm_a != "" and az_norm_a != "" and pm_norm_a != az_norm_a
+            alt_norm_a = normalize_team_name(alt.team_a)
+            reversed_ = pm_norm_a != "" and alt_norm_a != "" and pm_norm_a != alt_norm_a
 
             # Structural team-pair match is high confidence;
             # skip strict time check — only reject obviously wrong dates.
             pair = AlignedMarketPair(
-                polymarket=pm, azuro=az,
+                polymarket=pm, alt_market=alt,
                 confidence=1.0, match_method="structural",
                 teams_reversed=reversed_,
             )
-            self._cache[self._cache_key(pm.question, az.question)] = pair
+            self._cache[self._cache_key(pm.question, alt.question)] = pair
             logger.debug(
                 "Structural match found",
                 pm_q=pm.question[:60],
-                az_q=az.question[:60],
+                alt_q=alt.question[:60],
                 reversed=reversed_,
             )
             return pair
@@ -274,20 +274,20 @@ class MarketAligner:
     async def _llm_batch_match(
         self,
         unmatched_pms: List[UnifiedMarket],
-        az_markets: List[UnifiedMarket],
-        already_matched_az_ids: set = None,
+        alt_markets: List[UnifiedMarket],
+        already_matched_alt_ids: set = None,
     ) -> List[AlignedMarketPair]:
         """Collect candidate pairs, check persistent cache, then batch-call LLM.
 
         Returns matched pairs found via LLM.
         """
         pairs: List[AlignedMarketPair] = []
-        # Already matched AZ market_ids (avoid double-matching)
-        matched_az_ids: set = set(already_matched_az_ids) if already_matched_az_ids else set()
+        # Already matched alt market_ids (avoid double-matching)
+        matched_alt_ids: set = set(already_matched_alt_ids) if already_matched_alt_ids else set()
 
         # Collect candidates that need LLM judgment
         candidates: List[_CandidatePair] = []
-        total_product = len(unmatched_pms) * len(az_markets)
+        total_product = len(unmatched_pms) * len(alt_markets)
         time_filtered = 0
         bet_type_filtered = 0
         name_filtered = 0
@@ -297,18 +297,18 @@ class MarketAligner:
                 bet_type_filtered += 1
                 continue
             pm_words = self._name_words(pm.team_a, pm.team_b)
-            for az in az_markets:
-                if az.market_id in matched_az_ids:
+            for alt in alt_markets:
+                if alt.market_id in matched_alt_ids:
                     continue
-                if not self._times_close(pm.start_time, az.start_time):
+                if not self._times_close(pm.start_time, alt.start_time):
                     time_filtered += 1
                     continue
                 # Fast pre-filter: require at least one team-name word overlap
-                if pm_words and not pm_words & self._name_words(az.team_a, az.team_b):
+                if pm_words and not pm_words & self._name_words(alt.team_a, alt.team_b):
                     name_filtered += 1
                     continue
 
-                cache_key = self._cache_key(pm.question, az.question)
+                cache_key = self._cache_key(pm.question, alt.question)
 
                 # Check persistent LLM cache first
                 if cache_key in self._llm_cache:
@@ -316,16 +316,16 @@ class MarketAligner:
                     is_match, confidence = self._llm_cache[cache_key]
                     if is_match:
                         pair = AlignedMarketPair(
-                            polymarket=pm, azuro=az,
+                            polymarket=pm, alt_market=alt,
                             confidence=confidence, match_method="llm",
                         )
                         self._cache[cache_key] = pair
                         pairs.append(pair)
-                        matched_az_ids.add(az.market_id)
+                        matched_alt_ids.add(alt.market_id)
                         break  # This PM is matched, move to next
                     continue  # Cached negative, skip
 
-                candidates.append((pm, az, cache_key))
+                candidates.append((pm, alt, cache_key))
 
         logger.info(
             "LLM candidate filtering",
@@ -365,37 +365,37 @@ class MarketAligner:
         for i in range(0, len(candidates), _LLM_BATCH_SIZE):
             batch = candidates[i : i + _LLM_BATCH_SIZE]
 
-            # Skip pairs whose PM or AZ was already matched in a prior batch
+            # Skip pairs whose PM or alt market was already matched in a prior batch
             active_batch: List[_CandidatePair] = []
-            for pm, az, ck in batch:
-                if az.market_id in matched_az_ids:
+            for pm, alt, ck in batch:
+                if alt.market_id in matched_alt_ids:
                     continue
                 # Check if this PM already matched (via an earlier batch)
                 if any(p.polymarket.market_id == pm.market_id for p in pairs):
                     continue
-                active_batch.append((pm, az, ck))
+                active_batch.append((pm, alt, ck))
 
             if not active_batch:
                 continue
 
             results = await self._llm_judge_batch(active_batch)
 
-            for (pm, az, cache_key), (is_match, confidence) in zip(
+            for (pm, alt, cache_key), (is_match, confidence) in zip(
                 active_batch, results
             ):
                 self._persist_llm_result(cache_key, is_match, confidence)
-                if is_match and az.market_id not in matched_az_ids:
+                if is_match and alt.market_id not in matched_alt_ids:
                     pair = AlignedMarketPair(
-                        polymarket=pm, azuro=az,
+                        polymarket=pm, alt_market=alt,
                         confidence=confidence, match_method="llm",
                     )
                     self._cache[cache_key] = pair
                     pairs.append(pair)
-                    matched_az_ids.add(az.market_id)
+                    matched_alt_ids.add(alt.market_id)
                     logger.info(
                         "LLM match found",
                         pm_q=pm.question[:60],
-                        az_q=az.question[:60],
+                        alt_q=alt.question[:60],
                         confidence=f"{confidence:.2f}",
                     )
 
@@ -422,11 +422,11 @@ class MarketAligner:
 
         # Build the batch prompt
         pair_lines: List[str] = []
-        for idx, (pm, az, _) in enumerate(batch, 1):
+        for idx, (pm, alt, _) in enumerate(batch, 1):
             pair_lines.append(
                 f"Pair {idx}:\n"
                 f"  A (Polymarket): {pm.question}\n"
-                f"  B (Azuro):      {az.question}"
+                f"  B (Alt):        {alt.question}"
             )
 
         system_prompt = (
@@ -574,7 +574,7 @@ class MarketAligner:
         if m:
             return self._team_pair_key(m.group(1).strip(), m.group(2).strip())
 
-        # Pattern: "X – Y" or "X - Y" (en-dash or hyphen, Azuro-style)
+        # Pattern: "X - Y" with hyphen or en dash.
         m = re.search(r"(.+?)\s+[–\-]\s+(.+)", q)
         if m:
             return self._team_pair_key(m.group(1).strip(), m.group(2).strip())

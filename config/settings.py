@@ -103,13 +103,14 @@ class Settings(BaseSettings):
         description="Submit both legs concurrently (True) or sequentially fragile-first (False)",
     )
 
-    # ═══ Azuro Configuration ═══
-    azuro_enabled: bool = Field(False, description="Enable Azuro exchange adapter")
-    azuro_lp_address: Optional[str] = Field(None, description="Azuro LP contract address (Polygon)")
-    azuro_core_address: Optional[str] = Field(None, description="Azuro Core contract address (Polygon)")
+    # ═══ Disabled Azuro Reference Configuration ═══
+    # Kept for legacy .env compatibility. The active cross-platform adapter is SX Bet.
+    azuro_enabled: bool = Field(False, description="Deprecated; Azuro adapter is disabled")
+    azuro_lp_address: Optional[str] = Field(None, description="Deprecated Azuro LP contract address (Polygon)")
+    azuro_core_address: Optional[str] = Field(None, description="Deprecated Azuro Core contract address (Polygon)")
     azuro_subgraph_url: str = Field(
         "https://thegraph-1.onchainfeed.org/subgraphs/name/azuro-protocol/azuro-data-feed-polygon",
-        description="Azuro data-feed subgraph URL",
+        description="Deprecated Azuro data-feed subgraph URL",
     )
 
     # ═══ SX Bet Configuration ═══

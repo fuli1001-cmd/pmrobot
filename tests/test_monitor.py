@@ -174,6 +174,47 @@ class TestArbitrageDetector:
 
         assert opportunity is None
 
+    def test_detect_short_uses_configured_trade_size_as_minimum(self, sample_market):
+        """Short arbitrage should use MAX_TRADE_SIZE, not a hard-coded $50 floor."""
+        detector = ArbitrageDetector(
+            profit_threshold=0.008,
+            trade_size=5.0,
+            max_slippage=0.02,
+        )
+        book_yes = OrderBook(
+            token_id="yes_token",
+            bids=[OrderBookLevel(price=0.56, size=100)],
+        )
+        book_no = OrderBook(
+            token_id="no_token",
+            bids=[OrderBookLevel(price=0.56, size=100)],
+        )
+
+        opportunity = detector.detect_short(sample_market, book_yes, book_no)
+
+        assert opportunity is not None
+        assert opportunity.trade_size_usdc == 5.0
+
+    def test_detect_short_skips_when_depth_cannot_fill_configured_size(self, sample_market):
+        """Short arbitrage should not silently shrink below MAX_TRADE_SIZE."""
+        detector = ArbitrageDetector(
+            profit_threshold=0.008,
+            trade_size=5.0,
+            max_slippage=0.02,
+        )
+        book_yes = OrderBook(
+            token_id="yes_token",
+            bids=[OrderBookLevel(price=0.56, size=20)],
+        )
+        book_no = OrderBook(
+            token_id="no_token",
+            bids=[OrderBookLevel(price=0.56, size=20)],
+        )
+
+        opportunity = detector.detect_short(sample_market, book_yes, book_no)
+
+        assert opportunity is None
+
 
 class TestArbitrageOpportunity:
     """Test cases for ArbitrageOpportunity."""

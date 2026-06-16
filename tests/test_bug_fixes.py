@@ -80,7 +80,7 @@ def test_new_categories():
     from config.constants import CROSS_SPORT_MAP
     issues = []
 
-    sports = {pm_tag: az_name for pm_tag, az_name in CROSS_SPORT_MAP}
+    sports = {pm_tag: sx_slug for pm_tag, sx_slug in CROSS_SPORT_MAP}
 
     # Rugby
     if "rugby" not in sports:
@@ -161,9 +161,9 @@ def test_structural_match_filters_props():
         team_b="Giron",
         start_time=1700000000.0,
     )
-    az = UnifiedMarket(
-        platform=Platform.AZURO,
-        market_id="az_1",
+    alt = UnifiedMarket(
+        platform=Platform.SXBET,
+        market_id="sx_1",
         question="Mariano Navone – Marcos Giron",
         sport="tennis",
         event_name="Navone vs Giron",
@@ -172,16 +172,16 @@ def test_structural_match_filters_props():
         start_time=1700000000.0,
     )
 
-    az_index = a._build_team_index([az])
+    alt_index = a._build_team_index([alt])
 
     # Prop bet should NOT structurally match
-    result_prop = a._structural_match(pm_prop, [az], az_index)
+    result_prop = a._structural_match(pm_prop, [alt], alt_index)
     if result_prop is not None:
         print("  FAIL: O/U prop bet was structurally matched (should be None)")
         return False
 
     # Moneyline SHOULD structurally match
-    result_ml = a._structural_match(pm_moneyline, [az], az_index)
+    result_ml = a._structural_match(pm_moneyline, [alt], alt_index)
     if result_ml is None:
         print("  FAIL: Moneyline was NOT structurally matched (should match)")
         return False

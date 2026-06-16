@@ -5,7 +5,7 @@ discover synthetic arbitrage opportunities and execute them concurrently.
 
 Supported alternative platforms:
   - SX Bet (CLOB, 0% taker fee, 5% oracle fee on profit)
-  - Azuro  (AMM, disabled — see exchanges/azuro.py for details)
+  - Azuro  (AMM, disabled; see exchanges/azuro.py for details)
 
 Arbitrage condition (binary hedge):
     price_yes(A) + price_no(B) < 1.0 - fees - execution_cost
@@ -32,11 +32,10 @@ logger = get_logger(__name__)
 
 # Estimated execution cost per alternative-platform bet (in USDC terms).
 # SX Bet on SX Network: very low gas (~$0.001), but we budget $0.01.
-# Azuro on Polygon: ~$0.02 gas per bet.
+# Disabled Azuro reference path used a higher Polygon gas budget.
 _ALT_EXECUTION_COST_USD = 0.01
 
-# SX Bet CLOB slippage buffer.  Unlike Azuro's AMM (which needed 3% buffer
-# for price impact), SX Bet's CLOB has deterministic best-ask prices.
+# SX Bet CLOB slippage buffer. SX Bet's CLOB has deterministic best-ask prices.
 # We add a small buffer for order-book movement between quote and fill.
 # NOTE: With VWAP pricing the fill cost is already realistic; this buffer
 # covers book changes between the quote timestamp and execution.
@@ -50,7 +49,7 @@ _SXBET_ORACLE_FEE_PCT = 0.025  # 2.5% effective on trade profit
 # Minimum CLOB depth (USDC) required on the Polymarket side before we
 # consider a cross-platform opportunity executable.  Markets with thin
 # order books cannot be fully filled via FOK and would result in a
-# naked Azuro position.  Should be >= trade_size.
+# naked alt-platform position. Should be >= trade_size.
 _MIN_PM_CLOB_DEPTH_USD = 100.0
 
 
@@ -89,14 +88,14 @@ class CrossPlatformDetector:
         """
         opportunities: List[CrossPlatformOpportunity] = []
 
-        # De-duplicate input pairs by (PM market_id, AZ market_id).
+        # De-duplicate input pairs by (PM market_id, alt market_id).
         # The alignment step can produce the same combination multiple
-        # times when NegRisk events overlap or the same AZ condition
+        # times when NegRisk events overlap or the same alt market
         # matches identical PM questions from different event groups.
         seen_pair_keys: set[tuple[str, str]] = set()
         unique_pairs: list[AlignedMarketPair] = []
         for pair in pairs:
-            key = (pair.polymarket.market_id, pair.azuro.market_id)
+            key = (pair.polymarket.market_id, pair.alt_market.market_id)
             if key not in seen_pair_keys:
                 seen_pair_keys.add(key)
                 unique_pairs.append(pair)
@@ -114,15 +113,15 @@ class CrossPlatformDetector:
             if opp and opp.is_profitable(self.profit_threshold):
                 opportunities.append(opp)
 
-        # De-duplicate: keep only the best opportunity per AZ market.
+        # De-duplicate: keep only the best opportunity per alt market.
         # The same real-world event can be matched to multiple PM markets
         # (e.g. "Match Winner" AND "Set 1 Winner").  Only one can be bet.
-        best_by_az: dict[str, CrossPlatformOpportunity] = {}
+        best_by_alt: dict[str, CrossPlatformOpportunity] = {}
         for opp in opportunities:
-            existing = best_by_az.get(opp.az_market_id)
+            existing = best_by_alt.get(opp.alt_market_id)
             if existing is None or opp.net_profit_pct > existing.net_profit_pct:
-                best_by_az[opp.az_market_id] = opp
-        opportunities = list(best_by_az.values())
+                best_by_alt[opp.alt_market_id] = opp
+        opportunities = list(best_by_alt.values())
 
         # Sort by profit (best first)
         opportunities.sort(key=lambda o: o.net_profit_pct, reverse=True)
@@ -147,8 +146,8 @@ class CrossPlatformDetector:
         """Evaluate a single aligned pair for arbitrage.
 
         Checks both directions:
-          - YES on PM + NO on Azuro
-          - YES on Azuro + NO on PM
+          - YES on PM + NO on alt
+          - YES on alt + NO on PM
         and returns the more profitable combo (if any).
         """
         try:
@@ -160,7 +159,7 @@ class CrossPlatformDetector:
             # Alt platform (SX Bet) uses live=True for depth data.
             pm_odds, alt_odds = await asyncio.gather(
                 self.pm.get_odds(pair.polymarket.market_id, self.trade_size, live=True),
-                self.alt.get_odds(pair.azuro.market_id, self.trade_size, live=True),
+                self.alt.get_odds(pair.alt_market.market_id, self.trade_size, live=True),
             )
 
             if not pm_odds or not alt_odds:
@@ -251,9 +250,9 @@ class CrossPlatformDetector:
             if best:
                 # Fill in market IDs and questions
                 best.pm_market_id = pair.polymarket.market_id
-                best.az_market_id = pair.azuro.market_id
+                best.alt_market_id = pair.alt_market.market_id
                 best.pm_question = pair.polymarket.question
-                best.az_question = pair.azuro.question
+                best.alt_question = pair.alt_market.question
                 best.trade_size_usdc = self.trade_size
 
             return best
@@ -310,7 +309,7 @@ class CrossPlatformDetector:
         # Apply CLOB slippage buffer to the alternative platform leg.
         # For SX Bet (CLOB) this is a small buffer for order-book
         # movement between quote and fill (~0.5%).
-        # For Azuro (AMM) this was 3% — but Azuro is now disabled.
+        # Disabled Azuro AMM path used a larger buffer.
         if yes_platform != Platform.POLYMARKET:
             price_yes *= (1.0 + _ALT_SLIPPAGE_BUFFER)
         if no_platform != Platform.POLYMARKET:
@@ -336,9 +335,9 @@ class CrossPlatformDetector:
 
         return CrossPlatformOpportunity(
             pm_market_id="",  # Filled later
-            az_market_id="",
+            alt_market_id="",
             pm_question="",
-            az_question="",
+            alt_question="",
             strategy=CrossPlatformStrategy.BINARY_HEDGE,
             yes_platform=yes_platform,
             no_platform=no_platform,
@@ -378,7 +377,7 @@ class CrossPlatformExecutor:
 
         Both legs are submitted concurrently.  If one fails, the other
         is flagged for emergency handling (Polymarket can be unwound
-        via market sell; Azuro positions are held to settlement).
+        via market sell; alt-platform positions may be held to settlement).
 
         Args:
             opportunity: Opportunity to execute.
@@ -392,7 +391,7 @@ class CrossPlatformExecutor:
             logger.info(
                 "DRY RUN: Would execute cross-platform arb",
                 pm_q=opportunity.pm_question[:50],
-                az_q=opportunity.az_question[:50],
+                alt_q=opportunity.alt_question[:50],
                 yes_on=opportunity.yes_platform.value,
                 profit=f"{opportunity.net_profit_pct:.2%}",
                 size=f"${opportunity.trade_size_usdc:.2f}",
@@ -537,7 +536,7 @@ class CrossPlatformExecutor:
             market_id = opportunity.pm_market_id
         else:
             exchange = self.alt
-            market_id = opportunity.az_market_id  # field name kept for compat
+            market_id = opportunity.alt_market_id
 
         # SX Bet (or any alt without instant sell) — nothing we can do
         if filled_platform != Platform.POLYMARKET:
@@ -595,6 +594,6 @@ class CrossPlatformExecutor:
     def _resolve_sides(self, opp: CrossPlatformOpportunity):
         """Map opportunity sides to exchange instances + market IDs."""
         if opp.yes_platform == Platform.POLYMARKET:
-            return (self.pm, opp.pm_market_id, self.alt, opp.az_market_id)
+            return (self.pm, opp.pm_market_id, self.alt, opp.alt_market_id)
         else:
-            return (self.alt, opp.az_market_id, self.pm, opp.pm_market_id)
+            return (self.alt, opp.alt_market_id, self.pm, opp.pm_market_id)

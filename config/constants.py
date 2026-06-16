@@ -52,7 +52,6 @@ PROFIT_THRESHOLD_NEG_RISK_LARGE = 0.015  # 1.5% for 6+ outcomes (was 2.5%)
 # Short Arbitrage (Mint + Sell) Constants
 USDC_CONTRACT_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"  # USDC on Polygon
 ESTIMATED_MINT_GAS_COST_USD = 0.05  # Conservative estimate for Polygon Mint gas cost
-MIN_SHORT_ARBITRAGE_SIZE = 50.0  # Minimum $50 to make short arbitrage worthwhile
 SHORT_ARBITRAGE_THRESHOLD = 0.01  # 1.0% min profit for short (was 1.5%)
 
 
@@ -74,32 +73,28 @@ def get_profit_threshold(outcome_count: int = 2) -> float:
         return PROFIT_THRESHOLD_NEG_RISK_LARGE
 
 
-# ═══ Azuro Protocol Constants ═══
+# ═══ Disabled Azuro Reference Constants ═══
 AZURO_DATA_FEED_POLYGON_URL = (
     "https://thegraph-1.onchainfeed.org/subgraphs/name/"
     "azuro-protocol/azuro-data-feed-polygon"
 )
 
-# Cross-platform profit threshold (higher than intra-platform
-# due to Azuro bet exit risk — NFTs cannot be resold instantly)
+# Legacy cross-platform threshold kept for disabled Azuro reference code.
 CROSS_PLATFORM_PROFIT_THRESHOLD = 0.03  # 3%
 
-# Default slippage buffer for Azuro minOdds parameter
+# Default slippage buffer for disabled Azuro minOdds reference code.
 DEFAULT_AZURO_MIN_ODDS_SLIPPAGE = 0.02  # 2%
 
-# Estimated gas cost per Azuro bet on Polygon (USDC)
+# Estimated gas cost per disabled Azuro bet reference code on Polygon (USDC)
 ESTIMATED_AZURO_GAS_COST_USD = 0.02
 
-# Cross-platform sport mapping: (PM Events-API tag_slug, Azuro sport name)
+# Cross-platform sport mapping: (PM Events-API tag_slug, SX Bet sport slug)
 # Each tuple is scanned independently to keep Cartesian products small.
 #
 # NOTE: soccer and basketball are excluded because Polymarket only offers
 # season/tournament-level markets for these sports (e.g. "2026 NBA Champion",
 # "EPL Winner"), NOT individual match outcomes.  SX Bet only has match-level
 # markets, so no cross-platform pairing is possible.
-#
-# Azuro mapping (DEPRECATED — Azuro disabled):
-#   CROSS_SPORT_MAP was (pm_tag, azuro_sport_name) tuples.
 #
 # SX Bet mapping: (pm_tag_slug, sx_sport_slug)
 # The sx_sport_slug is used by SxBetExchange.get_markets(sport=...) which
@@ -123,4 +118,3 @@ CROSS_SPORT_MAP: list[tuple[str, str]] = [
     ("crypto", "crypto"),                        # SX sportId=14
     ("entertainment", "entertainment"),           # SX sportId=18
 ]
-

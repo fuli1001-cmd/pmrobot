@@ -160,7 +160,7 @@ class CrossPlatformMonitor:
 
         for pair in pairs:
             pm = pair.polymarket
-            sx = pair.azuro  # field named azuro, holds SX Bet market
+            sx = pair.alt_market
 
             # PM tokens: we need both YES and NO token IDs.
             # UnifiedMarket.metadata contains these (set by polymarket.py).
@@ -381,7 +381,7 @@ class CrossPlatformMonitor:
             self._last_stats_time = now
 
         pm = pair.polymarket
-        sx = pair.azuro  # field named azuro, holds SX Bet market
+        sx = pair.alt_market
 
         # ── Gather PM prices from cache ──
         yes_token = pm.metadata.get("token_id_yes", "")
@@ -453,9 +453,9 @@ class CrossPlatformMonitor:
         # Build opportunity
         opportunity = CrossPlatformOpportunity(
             pm_market_id=pm.market_id,
-            az_market_id=sx.market_id,
+            alt_market_id=sx.market_id,
             pm_question=pm.question,
-            az_question=sx.question,
+            alt_question=sx.question,
             strategy=CrossPlatformStrategy.BINARY_HEDGE,
             yes_platform=yes_plat,
             no_platform=(Platform.SXBET if yes_plat == Platform.POLYMARKET else Platform.POLYMARKET),
