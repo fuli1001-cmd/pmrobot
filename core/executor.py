@@ -331,6 +331,20 @@ class OrderExecutor:
                     final_balance=final_balance,
                 )
 
+            if not yes_success and not no_success:
+                logger.warning(
+                    "Both arbitrage orders failed",
+                    yes_status=order_yes.status.value,
+                    no_status=order_no.status.value,
+                )
+                return ExecutionReport(
+                    result=ExecutionResult.FAILED,
+                    opportunity=opportunity,
+                    order_yes=order_yes,
+                    order_no=order_no,
+                    execution_time_ms=execution_time,
+                )
+
             else:
                 # Partial fill — thick side failed after thin side filled
                 logger.warning(
