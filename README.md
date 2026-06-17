@@ -14,6 +14,7 @@
 - [系统架构](#-系统架构)
 - [项目结构](#-项目结构)
 - [快速开始](#-快速开始)
+- [部署地区建议](#-部署地区建议)
 - [配置参数](#-配置参数)
 - [命令行选项](#-命令行选项)
 - [通知渠道](#-通知渠道)
@@ -464,6 +465,35 @@ python main.py --dry-run --log-json
 # ⚠️ 实盘运行（真实资金！先确保 dry-run 稳定 24h+）
 python main.py
 ```
+
+## 🌍 部署地区建议
+
+Polymarket 会按出口 IP 做 `geoblock`。本项目在 live 模式启动前会先调用官方接口 `https://polymarket.com/api/geoblock` 做预检查；如果当前出口 IP 属于 blocked 区域，机器人会直接拒绝启动实盘交易。
+
+基于 Polymarket 官方 geoblock 文档，当前部署建议如下：
+
+- **优先推荐：AWS `eu-west-1`（Ireland）**
+  - 官方文档将其标记为 **Closest Non-Georestricted Region**
+  - 地理上接近 Polymarket 主服务器，且不是官方 blocked 区域
+- **不推荐：AWS `eu-west-2`（London）**
+  - 官方文档写明 `Primary Servers: eu-west-2`
+  - 但同一文档也明确 `GB United Kingdom` 属于 `Blocked`
+  - 这意味着它虽然更近，但普通部署大概率会因英国出口 IP 被拒单
+- **不推荐：美国与德国节点**
+  - 官方 blocked 列表明确包含 `US United States` 和 `DE Germany`
+  - 因此常见的 AWS 弗吉尼亚 `us-east-1`、法兰克福 `eu-central-1` 都不适合作为 live trading 出口
+
+建议在目标机器上先手工确认一次：
+
+```bash
+curl https://polymarket.com/api/geoblock
+```
+
+只有返回 `blocked: false`，才说明该机器当前出口 IP 可用于 Polymarket 主站下单。最终是否可交易，以这个接口的实时返回为准，而不是仅凭机房名称判断。
+
+官方参考：
+
+- Polymarket Geographic Restrictions: `https://docs.polymarket.com/api-reference/geoblock`
 
 ---
 
