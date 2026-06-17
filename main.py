@@ -24,6 +24,7 @@ from models.market import NegativeRiskEvent, NegativeRiskArbitrageOpportunity
 from models.order import ArbitrageOpportunity, ShortArbitrageOpportunity
 from utils.logger import setup_logging, get_logger
 from utils.notifier import create_notifier
+from utils.geoblock import GeoblockCheckError, check_polymarket_geoblock
 
 # Cross-platform imports (lazy-loaded when enabled)
 from exchanges.base import BaseExchange
@@ -94,6 +95,51 @@ class ArbitrageBot:
         self._cross_monitor: Optional[CrossPlatformMonitor] = None
         self._sx_ws: Optional[SxBetWebSocket] = None
 
+    async def _verify_geoblock(self) -> None:
+        """Check whether this egress IP is eligible for live Polymarket trading."""
+        try:
+            geo = await check_polymarket_geoblock()
+        except GeoblockCheckError as exc:
+            logger.error("Polymarket geoblock precheck failed", error=repr(exc))
+            if self.dry_run:
+                logger.warning(
+                    "Continuing despite geoblock precheck failure because dry run is enabled"
+                )
+                return
+
+            await self.notifier.send_alert(
+                "Polymarket geoblock precheck failed",
+                f"Live trading aborted before startup.\nReason: {exc}",
+            )
+            raise RuntimeError(
+                f"live trading blocked: could not verify geoblock status: {exc}"
+            ) from exc
+
+        logger.info(
+            "Polymarket geoblock status",
+            blocked=geo.blocked,
+            country=geo.country,
+            region=geo.region,
+            ip=geo.ip,
+        )
+
+        if geo.blocked and not self.dry_run:
+            details = (
+                f"Detected egress IP {geo.ip} in {geo.location}. "
+                "Live trading aborted before startup."
+            )
+            logger.error(
+                "Polymarket trading blocked by geoblock precheck",
+                ip=geo.ip,
+                country=geo.country,
+                region=geo.region,
+            )
+            await self.notifier.send_alert(
+                "Polymarket trading blocked",
+                details,
+            )
+            raise RuntimeError(details)
+
     async def start(self) -> None:
         """Start the arbitrage bot."""
         logger.info(
@@ -103,6 +149,8 @@ class ArbitrageBot:
             profit_threshold=f"{self.settings.profit_threshold:.2%}",
             trade_size=f"${self.settings.max_trade_size:.2f}",
         )
+
+        await self._verify_geoblock()
 
         self._running = True
 
