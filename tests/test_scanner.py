@@ -1,6 +1,7 @@
 """Tests for the market scanner module."""
 
 import pytest
+import httpx
 from unittest.mock import AsyncMock, patch, MagicMock
 
 from core.scanner import MarketScanner
@@ -100,6 +101,34 @@ class TestMarketScanner:
 
             assert len(markets) == 2
             assert all(isinstance(m, Market) for m in markets)
+
+    @pytest.mark.asyncio
+    async def test_context_manager_disables_compressed_gamma_responses(self, scanner):
+        """Gamma Brotli responses can fail to decode in some httpx installs."""
+        async with scanner:
+            assert scanner._client.headers["Accept-Encoding"] == "identity"
+
+    @pytest.mark.asyncio
+    async def test_get_json_retries_decoding_error_without_compression(self, scanner):
+        """A bad compressed response should not make market discovery return zero."""
+        mock_response = MagicMock()
+        mock_response.json.return_value = SAMPLE_MARKET_RESPONSE
+        mock_response.raise_for_status = MagicMock()
+
+        scanner._client = MagicMock()
+        scanner._client.get = AsyncMock(
+            side_effect=[
+                httpx.DecodingError("bad brotli stream"),
+                mock_response,
+            ]
+        )
+
+        data = await scanner._get_json("/markets", {"limit": "10"})
+
+        assert data == SAMPLE_MARKET_RESPONSE
+        assert scanner._client.get.await_count == 2
+        retry_kwargs = scanner._client.get.await_args_list[1].kwargs
+        assert retry_kwargs["headers"]["Accept-Encoding"] == "identity"
 
 
 class TestMarket:

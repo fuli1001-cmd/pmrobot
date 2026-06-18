@@ -15,6 +15,11 @@ from utils.rate_limiter import RateLimiter
 
 logger = get_logger(__name__)
 
+GAMMA_HEADERS = {
+    "Accept": "application/json",
+    "Accept-Encoding": "identity",
+}
+
 
 class MarketScanner:
     """
@@ -34,13 +39,33 @@ class MarketScanner:
 
     async def __aenter__(self):
         """Async context manager entry."""
-        self._client = httpx.AsyncClient(timeout=30.0)
+        self._client = httpx.AsyncClient(timeout=30.0, headers=GAMMA_HEADERS)
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         """Async context manager exit."""
         if self._client:
             await self._client.aclose()
+
+    async def _get_json(self, path: str, params: dict):
+        """Fetch JSON from Gamma with a retry for bad compressed responses."""
+        url = f"{self.base_url}{path}"
+        try:
+            response = await self._client.get(url, params=params)
+        except httpx.DecodingError as exc:
+            logger.warning(
+                "Gamma response decoding failed, retrying without compression",
+                path=path,
+                error=repr(exc),
+            )
+            response = await self._client.get(
+                url,
+                params=params,
+                headers={**GAMMA_HEADERS, "Cache-Control": "no-cache"},
+            )
+
+        response.raise_for_status()
+        return response.json()
 
     async def fetch_active_markets(
         self,
@@ -70,12 +95,7 @@ class MarketScanner:
         }
 
         try:
-            response = await self._client.get(
-                f"{self.base_url}/markets",
-                params=params,
-            )
-            response.raise_for_status()
-            data = response.json()
+            data = await self._get_json("/markets", params)
 
             markets = []
             for item in data:
@@ -147,12 +167,7 @@ class MarketScanner:
         await self.rate_limiter.acquire()
 
         try:
-            response = await self._client.get(
-                f"{self.base_url}/markets",
-                params={"slug": slug},
-            )
-            response.raise_for_status()
-            data = response.json()
+            data = await self._get_json("/markets", {"slug": slug})
 
             if data:
                 return self._parse_market(data[0])
@@ -315,9 +330,9 @@ class MarketScanner:
         while len(all_markets) < 2000 and offset < max_events:
             await self.rate_limiter.acquire()
             try:
-                response = await self._client.get(
-                    f"{self.base_url}/events",
-                    params={
+                data = await self._get_json(
+                    "/events",
+                    {
                         "active": "true",
                         "closed": "false",
                         "tag_slug": tag_slug,
@@ -325,8 +340,6 @@ class MarketScanner:
                         "offset": str(offset),
                     },
                 )
-                response.raise_for_status()
-                data = response.json()
                 if not data:
                     break
 
@@ -404,17 +417,15 @@ class MarketScanner:
         
         while len(events) < max_events:
             try:
-                response = await self._client.get(
-                    f"{self.base_url}/events",
-                    params={
+                data = await self._get_json(
+                    "/events",
+                    {
                         "active": "true",
                         "closed": "false",
                         "limit": str(limit),
                         "offset": str(offset),
                     },
                 )
-                response.raise_for_status()
-                data = response.json()
                 
                 if not data:
                     break
