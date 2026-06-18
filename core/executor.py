@@ -1,7 +1,9 @@
 """Order execution engine using CLOB API."""
 
 import asyncio
+from importlib import metadata
 import math
+import re
 import time
 from dataclasses import dataclass
 from enum import Enum
@@ -20,6 +22,14 @@ from utils.logger import get_logger
 from utils.rate_limiter import RateLimiter
 
 logger = get_logger(__name__)
+
+MIN_MARKETABLE_ORDER_USDC = 1.0
+MIN_PY_CLOB_CLIENT_VERSION = "0.34.6"
+
+
+def _version_tuple(version: str) -> Tuple[int, ...]:
+    """Parse package versions well enough for minimum-version checks."""
+    return tuple(int(part) for part in re.findall(r"\d+", version))
 
 
 class ExecutionResult(Enum):
@@ -92,6 +102,8 @@ class OrderExecutor:
         if not private_key:
             raise ValueError("Private key is required for live trading")
 
+        self._check_clob_client_version()
+
         # Initialize CLOB client with private key for signing
         # signature_type controls server-side verification:
         #   0 = EOA (direct wallet), 1 = POLY_PROXY, 2 = POLY_GNOSIS_SAFE
@@ -144,6 +156,25 @@ class OrderExecutor:
                         signature_type=sig_names.get(sig_type, sig_type))
         
         self.proxy_wallet = proxy_wallet
+
+    @staticmethod
+    def _check_clob_client_version() -> None:
+        """Fail fast when the installed CLOB client cannot sign current orders."""
+        try:
+            installed = metadata.version("py-clob-client")
+        except metadata.PackageNotFoundError as exc:
+            raise RuntimeError(
+                "py-clob-client is not installed; run `pip install -U py-clob-client`"
+            ) from exc
+
+        if _version_tuple(installed) < _version_tuple(MIN_PY_CLOB_CLIENT_VERSION):
+            raise RuntimeError(
+                "Installed py-clob-client is too old for live trading "
+                f"(installed={installed}, required>={MIN_PY_CLOB_CLIENT_VERSION}); "
+                "run `pip install -U py-clob-client`"
+            )
+
+        logger.info("py-clob-client version checked", version=installed)
 
     async def get_account_balance(self) -> float:
         """
@@ -544,18 +575,11 @@ class OrderExecutor:
             # Build order arguments
             clob_side = SELL if order.side == OrderSide.SELL else BUY
 
-            # Polymarket CLOB requires:
-            #   BUY:  maker_amount (USDC = size*price) ≤ 2 decimal places
-            #   SELL: maker_amount (shares) ≤ 2 decimal places
-            # Use GCD to find the largest valid size so size*price is exact 2-dec.
-            price = round(order.price, 2)
-            if clob_side == BUY:
-                P = round(price * 100)  # price in cents (integer)
-                step = 100 // math.gcd(P, 100)
-                S = (int(order.size * 100) // step) * step
-                size = S / 100
-            else:
-                size = math.floor(order.size * 100) / 100
+            price, size, order_usdc = self._prepare_clob_order_values(
+                order.side,
+                order.price,
+                order.size,
+            )
 
             if size <= 0:
                 order.status = OrderStatus.FAILED
@@ -563,8 +587,7 @@ class OrderExecutor:
                 return order
 
             # Polymarket requires minimum $1 per marketable order
-            order_usdc = size * price
-            if order_usdc < 1.0:
+            if order_usdc < MIN_MARKETABLE_ORDER_USDC:
                 order.status = OrderStatus.FAILED
                 logger.warning("Order USDC below $1 minimum", usdc=f"${order_usdc:.2f}", size=size, price=price)
                 return order
@@ -620,12 +643,34 @@ class OrderExecutor:
 
         return order
 
+    @staticmethod
+    def _prepare_clob_order_values(
+        side: OrderSide,
+        raw_price: float,
+        raw_size: float,
+    ) -> Tuple[float, float, float]:
+        """Round price/size to CLOB-compatible values and return notional USDC."""
+        # Polymarket CLOB requires:
+        #   BUY:  maker_amount (USDC = size*price) <= 2 decimal places
+        #   SELL: maker_amount (shares) <= 2 decimal places
+        # Use GCD to find the largest valid BUY size so size*price is exact 2-dec.
+        price = round(raw_price, 2)
+        if side == OrderSide.BUY:
+            price_cents = round(price * 100)
+            step = 100 // math.gcd(price_cents, 100)
+            size_cents = (int(raw_size * 100) // step) * step
+            size = size_cents / 100
+        else:
+            size = math.floor(raw_size * 100) / 100
+
+        return price, size, size * price
+
     async def _emergency_exit(
         self,
         opportunity: ArbitrageOpportunity,
         filled_yes: Optional[Order],
         filled_no: Optional[Order],
-    ) -> None:
+    ) -> bool:
         """
         Emergency exit when only one side is filled.
 
@@ -638,7 +683,7 @@ class OrderExecutor:
         """
         filled_order = filled_yes or filled_no
         if not filled_order:
-            return
+            return False
 
         logger.warning(
             "Emergency exit: selling position",
@@ -663,7 +708,7 @@ class OrderExecutor:
                 sell_size = math.floor(filled_order.filled_size * 100) / 100
                 if sell_size <= 0:
                     logger.warning("Emergency exit size too small", raw=filled_order.filled_size)
-                    return
+                    return False
                 order_args = OrderArgs(
                     token_id=filled_order.token_id,
                     price=sell_price,
@@ -679,7 +724,7 @@ class OrderExecutor:
                         order_id=response.get("orderID"),
                         attempt=attempt,
                     )
-                    return  # Success — stop retrying
+                    return True  # Success — stop retrying
                 else:
                     logger.error(
                         "Emergency exit rejected",
@@ -696,6 +741,8 @@ class OrderExecutor:
             if attempt < max_retries:
                 await asyncio.sleep(1.0 * attempt)
 
+        return False
+
     def _update_position(
         self,
         opportunity: ArbitrageOpportunity,
@@ -709,6 +756,21 @@ class OrderExecutor:
             no_token_id=opportunity.market.token_id_no,
             yes_delta=order_yes.filled_size,
             no_delta=order_no.filled_size,
+        )
+
+    def _update_short_inventory(
+        self,
+        opportunity: ShortArbitrageOpportunity,
+        yes_delta: float = 0.0,
+        no_delta: float = 0.0,
+    ) -> None:
+        """Track minted short-arb inventory so the settler can merge leftovers."""
+        self._account_state.update_position(
+            condition_id=opportunity.market.condition_id,
+            yes_token_id=opportunity.market.token_id_yes,
+            no_token_id=opportunity.market.token_id_no,
+            yes_delta=yes_delta,
+            no_delta=no_delta,
         )
 
     @property
@@ -782,6 +844,39 @@ class OrderExecutor:
                 execution_time_ms=0,
             )
 
+        # Do not mint if either sell leg cannot satisfy CLOB marketable-order
+        # requirements. Once minted, a rejected sell leaves us holding tokens.
+        sell_checks = [
+            ("YES", market.token_id_yes, opportunity.bid_price_yes),
+            ("NO", market.token_id_no, opportunity.bid_price_no),
+        ]
+        invalid_sells = []
+        for outcome, token_id, bid_price in sell_checks:
+            price, size, order_usdc = self._prepare_clob_order_values(
+                OrderSide.SELL,
+                bid_price,
+                num_tokens,
+            )
+            if size <= 0 or order_usdc < MIN_MARKETABLE_ORDER_USDC:
+                invalid_sells.append(
+                    f"{outcome} token {token_id[:8]} notional=${order_usdc:.2f} "
+                    f"(price={price}, size={size})"
+                )
+
+        if invalid_sells:
+            reason = "; ".join(invalid_sells)
+            logger.warning(
+                "Short arb skipped before mint: sell order below CLOB minimum",
+                market=market.slug[:50],
+                reason=reason,
+            )
+            return ExecutionReport(
+                result=ExecutionResult.SKIPPED,
+                opportunity=opportunity,
+                error_message=reason,
+                execution_time_ms=(time.time() - start_time) * 1000,
+            )
+
         try:
             # ── Step 1: Mint tokens ──────────────────────────────────
             condition_id = market.condition_id
@@ -811,6 +906,11 @@ class OrderExecutor:
                 "Short arb – mint succeeded, selling tokens",
                 gas_cost=f"${mint_report.gas_cost_usd:.4f}",
                 tx_hash=mint_report.tx_hash or "N/A",
+            )
+            self._update_short_inventory(
+                opportunity,
+                yes_delta=num_tokens,
+                no_delta=num_tokens,
             )
 
             # ── Step 2: Sell Yes + No concurrently ───────────────────
@@ -853,6 +953,11 @@ class OrderExecutor:
             no_ok = order_no_res.is_filled
 
             if yes_ok and no_ok:
+                self._update_short_inventory(
+                    opportunity,
+                    yes_delta=-order_yes_res.filled_size,
+                    no_delta=-order_no_res.filled_size,
+                )
                 final_balance = await self.get_account_balance()
                 logger.info(
                     "Short arb – both sells filled!",
@@ -869,16 +974,50 @@ class OrderExecutor:
                 )
 
             if yes_ok or no_ok:
+                if yes_ok:
+                    self._update_short_inventory(
+                        opportunity,
+                        yes_delta=-order_yes_res.filled_size,
+                    )
+                if no_ok:
+                    self._update_short_inventory(
+                        opportunity,
+                        no_delta=-order_no_res.filled_size,
+                    )
+
                 logger.warning(
                     "Short arb – partial sell, emergency exit needed",
                     yes_filled=yes_ok,
                     no_filled=no_ok,
                 )
-                await self._emergency_exit(
-                    opportunity,
-                    order_yes_res if yes_ok else None,
-                    order_no_res if no_ok else None,
+                residual_order = order_no_res if yes_ok else order_yes_res
+                residual_size = math.floor(residual_order.size * 100) / 100
+                emergency_order = Order(
+                    token_id=residual_order.token_id,
+                    side=OrderSide.SELL,
+                    price=residual_order.price,
+                    size=residual_order.size,
+                    order_type=OrderType.FOK,
+                    status=OrderStatus.FILLED,
+                    filled_size=residual_size,
+                    filled_avg_price=residual_order.price,
                 )
+                exited = await self._emergency_exit(
+                    opportunity,
+                    emergency_order,
+                    None,
+                )
+                if exited:
+                    if residual_order.token_id == market.token_id_yes:
+                        self._update_short_inventory(
+                            opportunity,
+                            yes_delta=-residual_size,
+                        )
+                    else:
+                        self._update_short_inventory(
+                            opportunity,
+                            no_delta=-residual_size,
+                        )
                 return ExecutionReport(
                     result=ExecutionResult.PARTIAL,
                     opportunity=opportunity,

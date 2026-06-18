@@ -652,18 +652,25 @@ class ArbitrageBot:
                         success=True,
                         extra_info=balance_info,
                     )
-                elif result.result == ExecutionResult.SKIPPED and self.dry_run:
-                    await self.risk_manager.record_success(
-                        opportunity,
-                        opportunity.net_profit_usdc,
-                        is_simulated=True,
-                    )
-                    logger.info(
-                        "DRY RUN: Simulated short arbitrage",
-                        market=opportunity.market.slug[:50],
-                        net_profit=f"{opportunity.net_profit_pct:.2%}",
-                        profit_usdc=f"${opportunity.net_profit_usdc:.2f}",
-                    )
+                elif result.result == ExecutionResult.SKIPPED:
+                    if self.dry_run:
+                        await self.risk_manager.record_success(
+                            opportunity,
+                            opportunity.net_profit_usdc,
+                            is_simulated=True,
+                        )
+                        logger.info(
+                            "DRY RUN: Simulated short arbitrage",
+                            market=opportunity.market.slug[:50],
+                            net_profit=f"{opportunity.net_profit_pct:.2%}",
+                            profit_usdc=f"${opportunity.net_profit_usdc:.2f}",
+                        )
+                    else:
+                        logger.info(
+                            "Short arbitrage skipped",
+                            market=opportunity.market.slug[:50],
+                            reason=result.error_message,
+                        )
                 else:
                     is_partial = result.result == ExecutionResult.PARTIAL
                     loss = opportunity.trade_size_usdc * 0.10 if is_partial else 0

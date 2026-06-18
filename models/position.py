@@ -101,6 +101,14 @@ class AccountState:
         pos = self.positions[condition_id]
         pos.yes_balance += yes_delta
         pos.no_balance += no_delta
+
+        if abs(pos.yes_balance) < 1e-9:
+            pos.yes_balance = 0.0
+        if abs(pos.no_balance) < 1e-9:
+            pos.no_balance = 0.0
+
+        if pos.yes_balance <= 0 and pos.no_balance <= 0:
+            del self.positions[condition_id]
         
         return pos
     
