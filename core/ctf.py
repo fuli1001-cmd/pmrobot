@@ -237,7 +237,9 @@ class CTFContract:
                     approve_hash = self.w3.eth.send_raw_transaction(
                         get_raw_transaction(signed_approve)
                     )
-                    self.w3.eth.wait_for_transaction_receipt(approve_hash)
+                    approve_receipt = self.w3.eth.wait_for_transaction_receipt(approve_hash)
+                    if approve_receipt.get("status") != 1:
+                        raise RuntimeError(f"USDC approval reverted: {approve_hash.hex()}")
                     logger.info("USDC approved", tx_hash=approve_hash.hex())
                 
                 # Step 2: Call splitPosition (Mint)
@@ -270,6 +272,23 @@ class CTFContract:
             
             execution_time = (time.time() - start_time) * 1000
             gas_used = receipt['gasUsed']
+
+            if receipt.get("status") != 1:
+                logger.error(
+                    "Mint transaction reverted",
+                    condition_id=condition_id[:16] + "...",
+                    gas_used=gas_used,
+                    tx_hash=mint_hash.hex(),
+                )
+                return MintReport(
+                    result=MintResult.FAILED,
+                    condition_id=condition_id,
+                    amount_usdc=amount_usdc,
+                    gas_used=gas_used,
+                    tx_hash=mint_hash.hex(),
+                    error_message="Mint transaction reverted",
+                    execution_time_ms=execution_time,
+                )
 
             # Estimate gas cost in USD (blocking call in thread)
             gas_price = await asyncio.to_thread(lambda: self.w3.eth.gas_price)
