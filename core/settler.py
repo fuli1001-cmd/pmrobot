@@ -32,6 +32,7 @@ from config.constants import (
 from models.position import AccountState, Position
 from utils.logger import get_logger
 from utils.notifier import create_notifier
+from utils.web3_compat import get_raw_transaction
 
 logger = get_logger(__name__)
 
@@ -417,7 +418,9 @@ class PositionSettler:
                     "gasPrice": self.w3.eth.gas_price,
                 })
                 signed_tx = self.w3.eth.account.sign_transaction(tx, self.account.key)
-                tx_hash = self.w3.eth.send_raw_transaction(signed_tx.rawTransaction)
+                tx_hash = self.w3.eth.send_raw_transaction(
+                    get_raw_transaction(signed_tx)
+                )
                 receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
                 return tx_hash, receipt
 

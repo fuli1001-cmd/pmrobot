@@ -32,6 +32,7 @@ from config.constants import (
     ESTIMATED_MINT_GAS_COST_USD,
 )
 from utils.logger import get_logger
+from utils.web3_compat import get_raw_transaction
 
 logger = get_logger(__name__)
 
@@ -233,7 +234,9 @@ class CTFContract:
                     })
                     
                     signed_approve = self.account.sign_transaction(approve_tx)
-                    approve_hash = self.w3.eth.send_raw_transaction(signed_approve.rawTransaction)
+                    approve_hash = self.w3.eth.send_raw_transaction(
+                        get_raw_transaction(signed_approve)
+                    )
                     self.w3.eth.wait_for_transaction_receipt(approve_hash)
                     logger.info("USDC approved", tx_hash=approve_hash.hex())
                 
@@ -257,7 +260,9 @@ class CTFContract:
                 })
                 
                 signed_mint = self.account.sign_transaction(mint_tx)
-                mint_hash = self.w3.eth.send_raw_transaction(signed_mint.rawTransaction)
+                mint_hash = self.w3.eth.send_raw_transaction(
+                    get_raw_transaction(signed_mint)
+                )
                 receipt = self.w3.eth.wait_for_transaction_receipt(mint_hash)
                 return mint_hash, receipt
 
@@ -355,7 +360,9 @@ class CTFContract:
                 })
 
                 signed = self.account.sign_transaction(merge_tx)
-                tx_hash = self.w3.eth.send_raw_transaction(signed.rawTransaction)
+                tx_hash = self.w3.eth.send_raw_transaction(
+                    get_raw_transaction(signed)
+                )
                 receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
                 return tx_hash, receipt
 

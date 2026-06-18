@@ -580,10 +580,7 @@ class OrderExecutor:
             signed_order = self.client.create_order(order_args)
 
             # Submit with FOK time-in-force
-            response = self.client.post_order(
-                signed_order,
-                orderType=ClobOrderType.FOK,
-            )
+            response = self.client.post_order(signed_order, ClobOrderType.FOK)
 
             # Parse response
             if response.get("success"):
