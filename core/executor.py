@@ -877,6 +877,25 @@ class OrderExecutor:
                 execution_time_ms=(time.time() - start_time) * 1000,
             )
 
+        ctf_address = getattr(ctf_contract, "address", None)
+        if self.proxy_wallet and ctf_address:
+            if ctf_address.lower() != self.proxy_wallet.lower():
+                reason = (
+                    "CTF mint wallet does not match CLOB trading wallet "
+                    f"(mint_wallet={ctf_address}, trading_wallet={self.proxy_wallet})"
+                )
+                logger.warning(
+                    "Short arb skipped before mint: wallet mismatch",
+                    market=market.slug[:50],
+                    reason=reason,
+                )
+                return ExecutionReport(
+                    result=ExecutionResult.SKIPPED,
+                    opportunity=opportunity,
+                    error_message=reason,
+                    execution_time_ms=(time.time() - start_time) * 1000,
+                )
+
         try:
             # ── Step 1: Mint tokens ──────────────────────────────────
             condition_id = market.condition_id

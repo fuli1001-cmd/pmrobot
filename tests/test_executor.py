@@ -46,6 +46,7 @@ async def test_concurrent_binary_both_failed_is_not_partial():
     executor.dry_run = False
     executor._concurrent = True
     executor._emergency_exit = AsyncMock()
+    executor.proxy_wallet = None
     executor._account_state = AccountState()
 
     async def fail_order(order):
@@ -81,6 +82,7 @@ async def test_concurrent_binary_both_failed_is_not_partial():
 async def test_short_arbitrage_skips_before_mint_when_sell_order_below_minimum():
     executor = OrderExecutor.__new__(OrderExecutor)
     executor.dry_run = False
+    executor.proxy_wallet = None
     executor._account_state = AccountState()
 
     market = Market(
@@ -113,6 +115,7 @@ async def test_short_arbitrage_skips_before_mint_when_sell_order_below_minimum()
 async def test_short_arbitrage_failed_sells_leave_mergeable_inventory():
     executor = OrderExecutor.__new__(OrderExecutor)
     executor.dry_run = False
+    executor.proxy_wallet = None
     executor._account_state = AccountState()
 
     async def fail_order(order):
@@ -157,3 +160,39 @@ async def test_short_arbitrage_failed_sells_leave_mergeable_inventory():
     assert position is not None
     assert position.yes_balance == 5.0
     assert position.no_balance == 5.0
+
+
+@pytest.mark.asyncio
+async def test_short_arbitrage_skips_before_mint_when_proxy_wallet_mismatches_ctf_wallet():
+    executor = OrderExecutor.__new__(OrderExecutor)
+    executor.dry_run = False
+    executor.proxy_wallet = "0x0000000000000000000000000000000000000001"
+    executor._account_state = AccountState()
+
+    market = Market(
+        condition_id="condition",
+        token_id_yes="yes_token",
+        token_id_no="no_token",
+        question="Test market?",
+        slug="test-market",
+    )
+    opportunity = ShortArbitrageOpportunity(
+        market=market,
+        bid_price_yes=0.60,
+        bid_price_no=0.50,
+        trade_size_usdc=5.0,
+        total_revenue=1.10,
+        mint_cost=1.0,
+        estimated_gas_cost=0.0,
+        estimated_fee=0.0,
+    )
+    ctf_contract = types.SimpleNamespace(
+        address="0x0000000000000000000000000000000000000002",
+        mint=AsyncMock(),
+    )
+
+    report = await executor.execute_short_arbitrage(opportunity, ctf_contract)
+
+    assert report.result == ExecutionResult.SKIPPED
+    assert "mint wallet does not match CLOB trading wallet" in report.error_message
+    ctf_contract.mint.assert_not_awaited()
