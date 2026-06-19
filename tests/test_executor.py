@@ -163,6 +163,57 @@ async def test_short_arbitrage_failed_sells_leave_mergeable_inventory():
 
 
 @pytest.mark.asyncio
+async def test_short_arbitrage_mint_failure_is_fatal_and_does_not_sell():
+    executor = OrderExecutor.__new__(OrderExecutor)
+    executor.dry_run = False
+    executor.proxy_wallet = None
+    executor._account_state = AccountState()
+
+    sell_order = AsyncMock()
+    executor._submit_order = sell_order
+
+    market = Market(
+        condition_id="condition",
+        token_id_yes="yes_token",
+        token_id_no="no_token",
+        question="Test market?",
+        slug="test-market",
+    )
+    opportunity = ShortArbitrageOpportunity(
+        market=market,
+        bid_price_yes=0.60,
+        bid_price_no=0.50,
+        trade_size_usdc=5.0,
+        total_revenue=1.10,
+        mint_cost=1.0,
+        estimated_gas_cost=0.0,
+        estimated_fee=0.0,
+    )
+
+    from core.ctf import MintResult
+
+    mint_report = types.SimpleNamespace(
+        result=MintResult.FAILED,
+        gas_cost_usd=0.0,
+        tx_hash="0xdead",
+        error_message="Relayer mint failed state=STATE_FAILED",
+        proxy_wallet="0x0000000000000000000000000000000000000001",
+        signer_address="0x0000000000000000000000000000000000000002",
+        relayer_tx_type="SAFE",
+        relayer_transaction_id="tx-id",
+        relayer_state="STATE_FAILED",
+    )
+    ctf_contract = types.SimpleNamespace(mint=AsyncMock(return_value=mint_report))
+
+    report = await executor.execute_short_arbitrage(opportunity, ctf_contract)
+
+    assert report.result == ExecutionResult.FAILED
+    assert report.fatal_error is True
+    assert "Relayer mint failed" in report.error_message
+    sell_order.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_short_arbitrage_skips_before_mint_when_proxy_wallet_mismatches_ctf_wallet():
     executor = OrderExecutor.__new__(OrderExecutor)
     executor.dry_run = False

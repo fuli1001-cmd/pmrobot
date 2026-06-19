@@ -50,6 +50,7 @@ class ExecutionReport:
     execution_time_ms: float = 0.0
     error_message: Optional[str] = None
     final_balance: Optional[float] = None
+    fatal_error: bool = False
 
     @property
     def is_success(self) -> bool:
@@ -913,12 +914,32 @@ class OrderExecutor:
                     "Short arb – mint failed",
                     error=mint_report.error_message,
                     market=market.slug[:50],
+                    condition_id=condition_id,
+                    amount_usdc=trade_size,
+                    proxy_wallet=getattr(mint_report, "proxy_wallet", None),
+                    signer_address=getattr(mint_report, "signer_address", None),
+                    relayer_tx_type=getattr(mint_report, "relayer_tx_type", None),
+                    relayer_transaction_id=getattr(mint_report, "relayer_transaction_id", None),
+                    relayer_state=getattr(mint_report, "relayer_state", None),
+                    collateral_token=getattr(mint_report, "collateral_token", None),
+                    collateral_balance_wei=getattr(
+                        mint_report,
+                        "collateral_balance_wei",
+                        None,
+                    ),
+                    collateral_allowance_wei=getattr(
+                        mint_report,
+                        "collateral_allowance_wei",
+                        None,
+                    ),
+                    tx_hash=mint_report.tx_hash,
                 )
                 return ExecutionReport(
                     result=ExecutionResult.FAILED,
                     opportunity=opportunity,
                     error_message=f"Mint failed: {mint_report.error_message}",
                     execution_time_ms=(time.time() - start_time) * 1000,
+                    fatal_error=True,
                 )
 
             logger.info(

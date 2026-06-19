@@ -410,6 +410,13 @@ POLYMARKET_PASSPHRASE=your_passphrase
 # Proxy Wallet（Gnosis Safe 地址，由 Polymarket 为你创建）
 PROXY_WALLET_ADDRESS=0xYourProxyWallet
 
+# Relayer API Key（Short Arb 的 proxy mint 需要）
+RELAYER_API_KEY=your_relayer_api_key
+RELAYER_API_KEY_ADDRESS=0xYourSignerAddress
+RELAYER_TX_TYPE=SAFE
+# 如 proxy 余额为 pUSD，可改为 0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB
+CTF_COLLATERAL_ADDRESS=0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174
+
 # ═══ SX Bet（跨平台套利必填） ═══
 SXBET_ENABLED=true
 SXBET_API_KEY=your_sx_bet_api_key

@@ -36,8 +36,16 @@ class Settings(BaseSettings):
     builder_api_key: Optional[str] = Field(None, description="Polymarket Builder API Key")
     builder_secret: Optional[str] = Field(None, description="Polymarket Builder API Secret")
     builder_passphrase: Optional[str] = Field(None, description="Polymarket Builder Passphrase")
+    relayer_api_key: Optional[str] = Field(None, description="Polymarket Relayer API Key")
+    relayer_api_key_address: Optional[str] = Field(
+        None, description="Address that owns the Relayer API Key"
+    )
     relayer_tx_type: str = Field(
-        "PROXY", description="Relayer wallet type: SAFE or PROXY"
+        "SAFE", description="Relayer wallet type: SAFE or PROXY"
+    )
+    ctf_collateral_address: str = Field(
+        "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174",
+        description="Collateral token used by CTF split/merge operations",
     )
 
     # Polygon RPC

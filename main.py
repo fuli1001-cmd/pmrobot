@@ -163,6 +163,12 @@ class ArbitrageBot:
             private_key=self.settings.private_key or "",
             rpc_url=self.settings.rpc_url,
             chain_id=POLYGON_CHAIN_ID if not self.settings.is_testnet else 80002,
+            proxy_wallet=self.settings.proxy_wallet_address,
+            relayer_api_key=self.settings.relayer_api_key,
+            relayer_api_key_address=self.settings.relayer_api_key_address,
+            relayer_tx_type=self.settings.relayer_tx_type,
+            collateral_token_address=self.settings.ctf_collateral_address,
+            is_testnet=self.settings.is_testnet,
             dry_run=self.dry_run,
         )
         
@@ -679,6 +685,19 @@ class ArbitrageBot:
                         is_partial=is_partial,
                         loss_usdc=loss,
                     )
+                    if result.fatal_error:
+                        await self.notifier.send_alert(
+                            "Short Arb Fatal Error",
+                            f"Market: {opportunity.market.question}\n"
+                            f"Reason: {result.error_message}",
+                        )
+                        logger.critical(
+                            "Stopping bot after fatal short arbitrage error",
+                            market=opportunity.market.slug[:50],
+                            error=result.error_message,
+                        )
+                        asyncio.create_task(self.stop())
+                        return
                     if is_partial:
                         await self.notifier.send_alert(
                             "🚨 Short Arb Partial Fill",
