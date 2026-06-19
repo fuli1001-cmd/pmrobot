@@ -37,7 +37,7 @@ from config.constants import (
     RELAYER_URL_TESTNET,
 )
 from utils.logger import get_logger
-from utils.web3_compat import get_raw_transaction
+from utils.web3_compat import encode_contract_call, get_raw_transaction
 
 logger = get_logger(__name__)
 
@@ -516,9 +516,10 @@ class CTFContract:
                 )
 
             if allowance < amount_wei:
-                approve_data = self.usdc_contract.encodeABI(
-                    fn_name="approve",
-                    args=[
+                approve_data = encode_contract_call(
+                    self.usdc_contract,
+                    "approve",
+                    [
                         Web3.to_checksum_address(CTF_CONTRACT_ADDRESS),
                         amount_wei * 10,
                     ],
@@ -535,9 +536,10 @@ class CTFContract:
                         f"state={approve_state} tx={approve_txn.get('transactionHash')}"
                     )
 
-            split_data = self.ctf_contract.encodeABI(
-                fn_name="splitPosition",
-                args=[
+            split_data = encode_contract_call(
+                self.ctf_contract,
+                "splitPosition",
+                [
                     self.collateral_token_address,
                     bytes(32),
                     bytes.fromhex(condition_id_hex),

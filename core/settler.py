@@ -32,7 +32,7 @@ from config.constants import (
 from models.position import AccountState, Position
 from utils.logger import get_logger
 from utils.notifier import create_notifier
-from utils.web3_compat import get_raw_transaction
+from utils.web3_compat import encode_contract_call, get_raw_transaction
 
 logger = get_logger(__name__)
 
@@ -331,9 +331,10 @@ class PositionSettler:
 
         try:
             # Encode calldata (no provider required)
-            calldata = self._ctf_for_abi.encodeABI(
-                fn_name="mergePositions",
-                args=[
+            calldata = encode_contract_call(
+                self._ctf_for_abi,
+                "mergePositions",
+                [
                     Web3.to_checksum_address(USDC_ADDRESS),
                     bytes(32),  # parentCollectionId (root)
                     bytes.fromhex(condition_id_hex),
