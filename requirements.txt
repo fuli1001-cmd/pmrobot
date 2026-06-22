@@ -1,5 +1,6 @@
 # Polymarket Client
-py-clob-client>=0.34.6
+py-clob-client==0.34.6
+py-order-utils==0.3.2
 
 # Async HTTP & WebSocket
 aiohttp>=3.9.0

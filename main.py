@@ -66,6 +66,8 @@ class ArbitrageBot:
         self._short_opportunity_queue: asyncio.Queue[ShortArbitrageOpportunity] = asyncio.Queue(maxsize=100)
         self._cross_opportunity_queue: asyncio.Queue[CrossPlatformOpportunity] = asyncio.Queue(maxsize=100)
         self._neg_risk_events: list = []
+        self._tasks: list[asyncio.Task] = []
+        self._stop_lock = asyncio.Lock()
 
         # Initialize components
         self.risk_manager = RiskManager(
@@ -207,32 +209,36 @@ class ArbitrageBot:
                 await self._init_cross_platform()
 
             # Phase 2: Start monitoring and execution loops
-            tasks = [
-                self._run_settler(),
-                self._run_stats_reporter(),
-                self._run_market_refresher(),
+            task_specs = [
+                ("settler", self._run_settler()),
+                ("stats_reporter", self._run_stats_reporter()),
+                ("market_refresher", self._run_market_refresher()),
             ]
 
             # Binary / NegRisk internal arbitrage (can be disabled)
             if self.settings.pm_internal_arb_enabled:
-                tasks.extend([
-                    self._run_monitor(markets),
-                    self._run_neg_risk_monitor(neg_risk_events),
-                    self._run_executor(),
-                    self._run_neg_risk_executor(),
-                    self._run_short_executor(),
+                task_specs.extend([
+                    ("market_monitor", self._run_monitor(markets)),
+                    ("neg_risk_monitor", self._run_neg_risk_monitor(neg_risk_events)),
+                    ("executor", self._run_executor()),
+                    ("neg_risk_executor", self._run_neg_risk_executor()),
+                    ("short_executor", self._run_short_executor()),
                 ])
             else:
                 logger.info("PM internal arbitrage DISABLED (PM_INTERNAL_ARB_ENABLED=false)")
 
             # Add cross-platform executor + WebSocket monitors
             if self._cross_executor:
-                tasks.append(self._run_cross_platform_executor())
+                task_specs.append(("cross_platform_executor", self._run_cross_platform_executor()))
             if self._cross_monitor:
-                tasks.append(self._cross_monitor.run_pm_ws())
+                task_specs.append(("cross_platform_pm_ws", self._cross_monitor.run_pm_ws()))
                 logger.info("Cross-platform WS tasks added (PM WS + SX Ably WS)")
 
-            await asyncio.gather(*tasks)
+            self._tasks = [
+                asyncio.create_task(coro, name=f"pmrobot:{name}")
+                for name, coro in task_specs
+            ]
+            await asyncio.gather(*self._tasks)
 
         except asyncio.CancelledError:
             logger.info("Bot cancelled")
@@ -246,39 +252,66 @@ class ArbitrageBot:
 
     async def stop(self) -> None:
         """Stop the arbitrage bot."""
-        if not self._running:
-            return
-            
-        logger.info("Stopping arbitrage bot...")
-        self._running = False
+        async with self._stop_lock:
+            active_tasks = [task for task in self._tasks if not task.done()]
+            if not self._running and not active_tasks:
+                return
 
-        if self.monitor:
-            await self.monitor.stop()
+            was_running = self._running
+            if was_running:
+                logger.info("Stopping arbitrage bot...")
+            self._running = False
 
-        if self.neg_risk_monitor:
-            await self.neg_risk_monitor.stop()
+            async def cleanup(label: str, awaitable) -> None:
+                try:
+                    await awaitable
+                except Exception as exc:
+                    logger.warning("Cleanup step failed", step=label, error=repr(exc))
 
-        if self.settler:
-            await self.settler.stop()
+            if self.monitor:
+                await cleanup("market_monitor", self.monitor.stop())
 
-        # Cross-platform WebSocket cleanup
-        if self._cross_monitor:
-            await self._cross_monitor.stop()
-        if self._sx_ws:
-            await self._sx_ws.close()
-        if self._sx_exchange:
-            await self._sx_exchange.disconnect()
-        if self._pm_exchange:
-            await self._pm_exchange.disconnect()
+            if self.neg_risk_monitor:
+                await cleanup("neg_risk_monitor", self.neg_risk_monitor.stop())
 
-        # Final stats
-        stats = self.risk_manager.get_stats_summary()
-        await self.notifier.send(
-            f"🛑 <font color=\"warning\"><b>Arbitrage Bot Stopped</b></font>\n\n"
-            f"> Total Trades: {stats['total_trades']}\n"
-            f"> Success Rate: {stats['success_rate']}\n"
-            f"> Net Profit: {stats['net_profit']}"
-        )
+            if self.settler:
+                await cleanup("settler", self.settler.stop())
+
+            # Cross-platform WebSocket cleanup
+            if self._cross_monitor:
+                await cleanup("cross_monitor", self._cross_monitor.stop())
+            if self._sx_ws:
+                await cleanup("sx_ws", self._sx_ws.close())
+            if self._sx_exchange:
+                await cleanup("sx_exchange", self._sx_exchange.disconnect())
+            if self._pm_exchange:
+                await cleanup("pm_exchange", self._pm_exchange.disconnect())
+
+            current_task = asyncio.current_task()
+            tasks_to_cancel = [
+                task for task in self._tasks
+                if task is not current_task and not task.done()
+            ]
+            for task in tasks_to_cancel:
+                task.cancel()
+
+            if tasks_to_cancel:
+                await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
+
+            self._tasks = [
+                task for task in self._tasks
+                if task is current_task and not task.done()
+            ]
+
+            if was_running:
+                # Final stats
+                stats = self.risk_manager.get_stats_summary()
+                await self.notifier.send(
+                    f"🛑 <font color=\"warning\"><b>Arbitrage Bot Stopped</b></font>\n\n"
+                    f"> Total Trades: {stats['total_trades']}\n"
+                    f"> Success Rate: {stats['success_rate']}\n"
+                    f"> Net Profit: {stats['net_profit']}"
+                )
 
     async def _scan_markets(self) -> list:
         """Scan for tradeable markets."""
@@ -721,9 +754,14 @@ class ArbitrageBot:
     async def _run_stats_reporter(self) -> None:
         """Periodically report statistics."""
         while self._running:
-            await asyncio.sleep(300)  # Every 5 minutes
-            stats = self.risk_manager.get_stats_summary()
-            logger.info("Stats report", **stats)
+            try:
+                await asyncio.sleep(300)  # Every 5 minutes
+                if not self._running:
+                    break
+                stats = self.risk_manager.get_stats_summary()
+                logger.info("Stats report", **stats)
+            except asyncio.CancelledError:
+                break
 
     async def _run_market_refresher(self) -> None:
         """
@@ -750,6 +788,8 @@ class ArbitrageBot:
         while self._running:
             try:
                 await asyncio.sleep(interval)
+                if not self._running:
+                    break
 
                 logger.info("Refreshing markets...")
 

@@ -41,6 +41,12 @@ from utils.web3_compat import encode_contract_call, get_raw_transaction
 
 logger = get_logger(__name__)
 
+RELAYER_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/126.0.0.0 Safari/537.36 Edg/126.0.0.0"
+)
+
 # CTF Contract ABI (minimal - only functions we need)
 CTF_ABI = [
     {
@@ -241,7 +247,9 @@ class CTFContract:
 
     def _relayer_headers(self) -> dict:
         return {
+            "Accept": "application/json, text/plain, */*",
             "Content-Type": "application/json",
+            "User-Agent": RELAYER_USER_AGENT,
             "RELAYER_API_KEY": self.relayer_api_key or "",
             "RELAYER_API_KEY_ADDRESS": self.relayer_api_key_address or "",
         }
