@@ -2,7 +2,6 @@
 import asyncio
 import os
 from dotenv import load_dotenv, set_key
-from py_clob_client.client import ClobClient
 from eth_account import Account
 
 async def main():
@@ -23,47 +22,35 @@ async def main():
         print(f"❌ Invalid Private Key: {e}")
         return
 
-    # 3. Initialize Client & Derive Proxy
+    # 3. Initialize Client & Derive API credentials / wallet
     print(f"\n🤖 Connecting to Polymarket (Polygon)...")
     try:
-        client = ClobClient("https://clob.polymarket.com/", key=pk, chain_id=137)
-        
-        # Derive API Credentials
+        from polymarket import SecureClient
+
         print("   Generating/Deriving API Credentials...")
-        creds = client.create_or_derive_api_creds()
-        print(f"   ✅ API Key:      {creds.api_key}")
-        print(f"   ✅ API Secret:   {creds.api_secret[0:5]}...****")
-        print(f"   ✅ Passphrase:   {creds.api_passphrase[0:5]}...****")
-        
-        # Derive Proxy Address
-        print("   Fetching Proxy Address...")
-        # Try multiple methods just in case SDK changed
-        proxy = None
+        client = SecureClient.create(private_key=pk)
         try:
-            proxy = client.get_proxy_address() # Common method
-        except:
-             # Fallback or older SDK method check
-             pass
-             
-        if not proxy:
-             # Try deriving from creds if possible or another call
-             # Usually create_or_derive_api_creds makes sure proxy exists
-             # Let's try to get it from the client object internal state if needed or re-call
-             try:
-                 proxy = client.get_address() # Some SDK versions
-             except:
-                 pass
-        
-        if proxy:
-            print(f"   🎯 Proxy Address: {proxy}")
-        else:
-             print("   ⚠️ Could not auto-fetch Proxy Address. It might be 'null' if never created.")
-             
+            creds = client.credentials
+            wallet = client.wallet
+            wallet_type = client.wallet_type
+
+            print(f"   ✅ API Key:      {creds.key}")
+            print(f"   ✅ API Secret:   {creds.secret[0:5]}...****")
+            print(f"   ✅ Passphrase:   {creds.passphrase[0:5]}...****")
+            print(f"   🎯 Wallet:       {wallet}")
+            print(f"   🎯 Wallet Type:  {wallet_type}")
+
+            set_key(".env", "POLYMARKET_API_KEY", creds.key)
+            set_key(".env", "POLYMARKET_API_SECRET", creds.secret)
+            set_key(".env", "POLYMARKET_PASSPHRASE", creds.passphrase)
+            set_key(".env", "PROXY_WALLET_ADDRESS", wallet)
+        finally:
+            client.close()
+
         print(f"\n✨ SUMMARY:")
-        if proxy:
-             print(f"EOA:   {eoa.address}")
-             print(f"PROXY: {proxy}")
-             print("👉 Please ensure this PROXY address matches the one in your .env PROXY_WALLET_ADDRESS")
+        print(f"EOA:    {eoa.address}")
+        print(f"WALLET: {wallet}")
+        print("👉 Credentials and PROXY_WALLET_ADDRESS were written to .env")
         
     except Exception as e:
         print(f"❌ Failed to derive credentials: {e}")

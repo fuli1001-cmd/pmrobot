@@ -9,12 +9,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import List, Optional, Tuple
 
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs, OrderType as ClobOrderType
-from py_clob_client.order_builder.constants import BUY, SELL
-
 from config.settings import get_settings
-from config.constants import CLOB_API_BASE_URL, POLYGON_CHAIN_ID
+from config.constants import POLYGON_CHAIN_ID
 from models.market import NegativeRiskArbitrageOpportunity, NegativeRiskStrategy
 from models.order import ArbitrageOpportunity, ShortArbitrageOpportunity, Order, OrderSide, OrderStatus, OrderType
 from models.position import AccountState
@@ -24,7 +20,7 @@ from utils.rate_limiter import RateLimiter
 logger = get_logger(__name__)
 
 MIN_MARKETABLE_ORDER_USDC = 1.0
-MIN_PY_CLOB_CLIENT_VERSION = "0.34.6"
+MIN_POLYMARKET_CLIENT_VERSION = "0.1.0b9"
 
 
 def _version_tuple(version: str) -> Tuple[int, ...]:
@@ -103,48 +99,32 @@ class OrderExecutor:
         if not private_key:
             raise ValueError("Private key is required for live trading")
 
-        self._check_clob_client_version()
+        self._check_polymarket_client_version()
 
-        # Initialize CLOB client with private key for signing
-        # signature_type controls server-side verification:
-        #   0 = EOA (direct wallet), 1 = POLY_PROXY, 2 = POLY_GNOSIS_SAFE
-        # MetaMask-login proxies are Gnosis Safe → require type 2
-        # Email-login proxies are Polymarket-specific → require type 1 (but often broken)
-        if signature_type is not None:
-            sig_type = signature_type
-        elif proxy_wallet:
-            from py_order_utils.model import POLY_GNOSIS_SAFE
-            sig_type = POLY_GNOSIS_SAFE
-        else:
-            sig_type = None
-        self.client = ClobClient(
-            host=CLOB_API_BASE_URL,
-            key=private_key,
-            chain_id=chain_id,
-            signature_type=sig_type,
-            funder=proxy_wallet,
-        )
-        
-        # Set API credentials for authentication
-        from py_clob_client.clob_types import ApiCreds
-        
+        from polymarket import ApiKeyCreds, SecureClient
+
+        credentials = None
         if api_key and api_secret and passphrase:
-            # Use provided credentials
-            self.client.set_api_creds(ApiCreds(
-                api_key=api_key,
-                api_secret=api_secret,
-                api_passphrase=passphrase,
-            ))
+            credentials = ApiKeyCreds(
+                key=api_key,
+                secret=api_secret,
+                passphrase=passphrase,
+            )
         else:
-            # Auto-derive credentials from private key
             logger.info("No API credentials provided, deriving from Private Key...")
-            try:
-                creds = self.client.create_or_derive_api_creds()
-                self.client.set_api_creds(creds)
-                logger.info("Successfully derived API credentials")
-            except Exception as e:
-                logger.error("Failed to derive API credentials", error=repr(e))
-                raise ValueError(f"Could not derive API credentials: {e}")
+
+        try:
+            self.client = SecureClient.create(
+                private_key=private_key,
+                wallet=proxy_wallet,
+                credentials=credentials,
+            )
+        except Exception as e:
+            logger.error("Failed to initialize Polymarket client", error=repr(e))
+            raise ValueError(f"Could not initialize Polymarket client: {e}")
+
+        if not credentials:
+            logger.info("Successfully derived API credentials")
 
         logger.info(
             "Order executor initialized",
@@ -152,30 +132,34 @@ class OrderExecutor:
         )
 
         if proxy_wallet:
-            sig_names = {0: "EOA", 1: "POLY_PROXY", 2: "POLY_GNOSIS_SAFE"}
-            logger.info("Using Proxy Wallet", address=proxy_wallet,
-                        signature_type=sig_names.get(sig_type, sig_type))
+            logger.info("Using Proxy Wallet", address=proxy_wallet)
+        if signature_type is not None:
+            logger.warning(
+                "signature_type is ignored by polymarket-client; wallet type is auto-detected",
+                signature_type=signature_type,
+            )
         
         self.proxy_wallet = proxy_wallet
 
     @staticmethod
-    def _check_clob_client_version() -> None:
-        """Fail fast when the installed CLOB client cannot sign current orders."""
+    def _check_polymarket_client_version() -> None:
+        """Fail fast when the installed Polymarket SDK is too old."""
         try:
-            installed = metadata.version("py-clob-client")
+            installed = metadata.version("polymarket-client")
         except metadata.PackageNotFoundError as exc:
             raise RuntimeError(
-                "py-clob-client is not installed; run `pip install -U py-clob-client`"
+                "polymarket-client is not installed; run "
+                "`pip install --pre polymarket-client` with Python 3.11+"
             ) from exc
 
-        if _version_tuple(installed) < _version_tuple(MIN_PY_CLOB_CLIENT_VERSION):
+        if _version_tuple(installed) < _version_tuple(MIN_POLYMARKET_CLIENT_VERSION):
             raise RuntimeError(
-                "Installed py-clob-client is too old for live trading "
-                f"(installed={installed}, required>={MIN_PY_CLOB_CLIENT_VERSION}); "
-                "run `pip install -U py-clob-client`"
+                "Installed polymarket-client is too old for live trading "
+                f"(installed={installed}, required>={MIN_POLYMARKET_CLIENT_VERSION}); "
+                "run `pip install --pre -U polymarket-client`"
             )
 
-        logger.info("py-clob-client version checked", version=installed)
+        logger.info("polymarket-client version checked", version=installed)
 
     async def get_account_balance(self) -> float:
         """
@@ -192,12 +176,11 @@ class OrderExecutor:
 
         api_balance = 0.0
         try:
-            from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
-            resp = self.client.get_balance_allowance(
-                params=BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+            balance = await asyncio.to_thread(
+                self.client.get_balance_allowance,
+                asset_type="COLLATERAL",
             )
-            raw_bal = resp.get("balance", "0")
-            api_balance = float(raw_bal) / 1e6  # API returns micro-USDC (6 decimals)
+            api_balance = float(balance.balance) / 1e6
         except Exception as e:
             logger.error("Failed to fetch API balance", error=repr(e))
         
@@ -539,18 +522,17 @@ class OrderExecutor:
                 if sell_size <= 0:
                     logger.warning("Vector exit size too small", raw=filled_order.filled_size)
                     return
-                order_args = OrderArgs(
+                exit_order = Order(
                     token_id=filled_order.token_id,
+                    side=OrderSide.SELL,
                     price=sell_price,
                     size=sell_size,
-                    side="SELL",
+                    order_type=OrderType.FOK,
                 )
-                signed_order = self.client.create_order(order_args)
-                if signed_order:
-                    resp = self.client.post_order(signed_order)
-                    if resp and resp.get("success"):
-                        logger.info("Vector exit order placed", attempt=attempt)
-                        return
+                result = await self._submit_order(exit_order)
+                if result.is_filled:
+                    logger.info("Vector exit order filled", attempt=attempt)
+                    return
             except Exception as e:
                 logger.error(
                     "Emergency exit failed for order",
@@ -573,9 +555,6 @@ class OrderExecutor:
         await self.rate_limiter.acquire()
 
         try:
-            # Build order arguments
-            clob_side = SELL if order.side == OrderSide.SELL else BUY
-
             price, size, order_usdc = self._prepare_clob_order_values(
                 order.side,
                 order.price,
@@ -593,22 +572,28 @@ class OrderExecutor:
                 logger.warning("Order USDC below $1 minimum", usdc=f"${order_usdc:.2f}", size=size, price=price)
                 return order
 
-            order_args = OrderArgs(
-                token_id=order.token_id,
-                price=price,
-                size=size,
-                side=clob_side,
-            )
-
-            # Create and sign order
-            signed_order = self.client.create_order(order_args)
-
-            # Submit with FOK time-in-force
-            response = self.client.post_order(signed_order, ClobOrderType.FOK)
+            if order.side == OrderSide.BUY:
+                response = await asyncio.to_thread(
+                    self.client.place_market_order,
+                    token_id=order.token_id,
+                    side="BUY",
+                    amount=f"{order_usdc:.2f}",
+                    max_price=str(price),
+                    order_type="FOK",
+                )
+            else:
+                response = await asyncio.to_thread(
+                    self.client.place_market_order,
+                    token_id=order.token_id,
+                    side="SELL",
+                    shares=str(size),
+                    min_price=str(price),
+                    order_type="FOK",
+                )
 
             # Parse response
-            if response.get("success"):
-                order.order_id = response.get("orderID")
+            if getattr(response, "ok", False):
+                order.order_id = getattr(response, "order_id", None)
                 order.status = OrderStatus.FILLED
                 order.filled_size = size
                 order.filled_avg_price = price
@@ -621,10 +606,11 @@ class OrderExecutor:
                 )
             else:
                 order.status = OrderStatus.FAILED
+                reason = getattr(response, "message", None) or repr(response)
                 logger.warning(
                     "Order rejected",
                     token_id=order.token_id[:8],
-                    reason=response.get("errorMsg"),
+                    reason=reason,
                 )
 
         except Exception as e:
@@ -710,26 +696,26 @@ class OrderExecutor:
                 if sell_size <= 0:
                     logger.warning("Emergency exit size too small", raw=filled_order.filled_size)
                     return False
-                order_args = OrderArgs(
+                exit_order = Order(
                     token_id=filled_order.token_id,
+                    side=OrderSide.SELL,
                     price=sell_price,
                     size=sell_size,
-                    side="SELL",
+                    order_type=OrderType.FOK,
                 )
-                signed_order = self.client.create_order(order_args)
-                response = self.client.post_order(signed_order)
+                response = await self._submit_order(exit_order)
 
-                if response.get("success"):
+                if response.is_filled:
                     logger.info(
                         "Emergency exit successful",
-                        order_id=response.get("orderID"),
+                        order_id=response.order_id,
                         attempt=attempt,
                     )
                     return True  # Success — stop retrying
                 else:
                     logger.error(
                         "Emergency exit rejected",
-                        reason=response.get("errorMsg"),
+                        reason=response.status.value,
                         attempt=attempt,
                     )
             except Exception as e:

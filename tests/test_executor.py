@@ -1,38 +1,9 @@
 """Tests for order execution classification."""
 
-import sys
 import types
 from unittest.mock import AsyncMock
 
 import pytest
-
-if "py_clob_client.client" not in sys.modules:
-    py_clob_client = types.ModuleType("py_clob_client")
-    py_clob_client_client = types.ModuleType("py_clob_client.client")
-    py_clob_client_types = types.ModuleType("py_clob_client.clob_types")
-    py_clob_client_constants = types.ModuleType("py_clob_client.order_builder.constants")
-
-    class _StubClobClient:
-        pass
-
-    class _StubOrderArgs:
-        pass
-
-    class _StubClobOrderType:
-        FOK = "FOK"
-        GTC = "GTC"
-        GTD = "GTD"
-
-    py_clob_client_client.ClobClient = _StubClobClient
-    py_clob_client_types.OrderArgs = _StubOrderArgs
-    py_clob_client_types.OrderType = _StubClobOrderType
-    py_clob_client_constants.BUY = "BUY"
-    py_clob_client_constants.SELL = "SELL"
-
-    sys.modules["py_clob_client"] = py_clob_client
-    sys.modules["py_clob_client.client"] = py_clob_client_client
-    sys.modules["py_clob_client.clob_types"] = py_clob_client_types
-    sys.modules["py_clob_client.order_builder.constants"] = py_clob_client_constants
 
 from core.executor import ExecutionResult, OrderExecutor
 from models.market import Market
