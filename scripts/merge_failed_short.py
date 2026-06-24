@@ -7,11 +7,9 @@ You can identify the market by slug, or pass condition/token ids explicitly.
 
 import argparse
 import asyncio
-import json
 import sys
 from pathlib import Path
 from typing import Optional, Tuple
-from urllib import parse, request
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -58,24 +56,19 @@ def parse_args() -> argparse.Namespace:
 
 
 def resolve_market_by_slug(slug: str) -> Tuple[str, str, str]:
-    from config.constants import GAMMA_API_BASE_URL
+    from polymarket import PublicClient
 
-    query = parse.urlencode({"slug": slug})
-    with request.urlopen(f"{GAMMA_API_BASE_URL}/markets?{query}", timeout=20) as resp:
-        payload = json.loads(resp.read().decode("utf-8"))
+    with PublicClient() as client:
+        market = client.get_market(slug=slug)
 
-    if not payload:
-        raise RuntimeError(f"No Gamma market found for slug: {slug}")
+    condition_id = market.condition_id
+    yes_token_id = market.outcomes.yes.token_id
+    no_token_id = market.outcomes.no.token_id
 
-    market = payload[0]
-    condition_id = market.get("conditionId")
-    raw_tokens = market.get("clobTokenIds", "[]")
-    token_ids = json.loads(raw_tokens) if isinstance(raw_tokens, str) else raw_tokens
-
-    if not condition_id or len(token_ids) < 2:
+    if not condition_id or not yes_token_id or not no_token_id:
         raise RuntimeError(f"Market {slug!r} does not expose a binary condition/token pair")
 
-    return condition_id, str(token_ids[0]), str(token_ids[1])
+    return str(condition_id), str(yes_token_id), str(no_token_id)
 
 
 def signer_address(private_key: Optional[str]) -> Optional[str]:
@@ -104,10 +97,16 @@ def token_balance(w3, wallet: str, token_id: str) -> float:
 async def main() -> int:
     args = parse_args()
 
-    from config.settings import get_settings
-    from core.settler import PositionSettler
-    from models.position import Position
-    from web3 import Web3
+    try:
+        from config.settings import get_settings
+        from core.settler import PositionSettler
+        from models.position import Position
+        from web3 import Web3
+    except ImportError as exc:
+        raise SystemExit(
+            "This script requires the project environment with Python 3.11+ and "
+            "pydantic v2. Activate the pmrobot env and install requirements."
+        ) from exc
 
     settings = get_settings()
 
