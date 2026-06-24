@@ -79,7 +79,7 @@ def signer_address(private_key: Optional[str]) -> Optional[str]:
     return Web3().eth.account.from_key(private_key).address
 
 
-def token_balance(w3, wallet: str, token_id: str) -> float:
+def token_balance(w3, wallet: str, token_id: str) -> Tuple[float, int]:
     from config.constants import CTF_CONTRACT_ADDRESS
     from web3 import Web3
 
@@ -91,7 +91,53 @@ def token_balance(w3, wallet: str, token_id: str) -> float:
         Web3.to_checksum_address(wallet),
         int(token_id),
     ).call()
-    return raw / 1e6
+    return raw / 1e6, raw
+
+
+def print_wallet_positions(wallet: str, condition_id: str) -> None:
+    from polymarket import PublicClient
+
+    def describe(position) -> str:
+        size = position.size if position.size is not None else "?"
+        value = position.current_value if position.current_value is not None else "?"
+        outcome = position.outcome or "?"
+        token_id = str(position.token_id) if position.token_id else "?"
+        condition = str(position.condition_id) if position.condition_id else "?"
+        return (
+            f"  condition={condition} outcome={outcome} "
+            f"size={size} value={value} token={token_id}"
+        )
+
+    try:
+        with PublicClient() as client:
+            current = client.list_positions(
+                user=wallet,
+                market=[condition_id],
+                size_threshold=0.0,
+                page_size=20,
+            ).first_page().items
+            if current:
+                print("Open positions for requested condition:")
+                for position in current:
+                    print(describe(position))
+                return
+
+            all_positions = client.list_positions(
+                user=wallet,
+                size_threshold=0.0,
+                page_size=20,
+            ).first_page().items
+    except Exception as exc:
+        print(f"Could not query Polymarket positions: {exc!r}")
+        return
+
+    if not all_positions:
+        print("No open Polymarket positions found for this wallet.")
+        return
+
+    print("No position found for requested condition. Other open positions:")
+    for position in all_positions[:10]:
+        print(describe(position))
 
 
 async def main() -> int:
@@ -136,17 +182,18 @@ async def main() -> int:
     if not w3.is_connected():
         raise SystemExit(f"Could not connect to RPC: {rpc_url}")
 
-    yes_balance = token_balance(w3, wallet, yes_token_id)
-    no_balance = token_balance(w3, wallet, no_token_id)
+    yes_balance, yes_raw = token_balance(w3, wallet, yes_token_id)
+    no_balance, no_raw = token_balance(w3, wallet, no_token_id)
     amount = args.amount if args.amount is not None else min(yes_balance, no_balance)
 
     print(f"wallet:       {wallet}")
     print(f"condition:    {condition_id}")
-    print(f"YES token:    {yes_token_id} balance={yes_balance:.6f}")
-    print(f"NO token:     {no_token_id} balance={no_balance:.6f}")
+    print(f"YES token:    {yes_token_id} balance={yes_balance:.6f} raw={yes_raw}")
+    print(f"NO token:     {no_token_id} balance={no_balance:.6f} raw={no_raw}")
     print(f"merge amount: {amount:.6f}")
 
     if amount <= 0:
+        print_wallet_positions(wallet, condition_id)
         raise SystemExit("Nothing mergeable: min(YES, NO) balance is zero.")
     if amount > min(yes_balance, no_balance):
         raise SystemExit("Requested --amount exceeds mergeable YES/NO balance.")
