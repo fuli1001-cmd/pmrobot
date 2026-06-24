@@ -28,6 +28,7 @@ from config.constants import (
     POLYGON_CHAIN_ID,
     RELAYER_URL,
     RELAYER_URL_TESTNET,
+    USDC_CONTRACT_ADDRESS,
 )
 from models.position import AccountState, Position
 from utils.logger import get_logger
@@ -53,10 +54,6 @@ CTF_ABI = [
     }
 ]
 
-# USDC Contract Address on Polygon
-USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
-
-
 class PositionSettler:
     """
     Settles (merges) Yes+No token pairs back to USDC.
@@ -79,6 +76,7 @@ class PositionSettler:
         relay_tx_type: str = "PROXY",
         is_testnet: bool = False,
         dry_run: bool = False,
+        collateral_token_address: str = USDC_CONTRACT_ADDRESS,
     ):
         """
         Initialize the position settler.
@@ -94,10 +92,12 @@ class PositionSettler:
             relay_tx_type: "SAFE" or "PROXY" (wallet type on Relayer)
             is_testnet: Use staging Relayer URL
             dry_run: If True, log merge candidates but skip real transactions
+            collateral_token_address: Collateral token used by the original split/merge
         """
         self._dry_run = dry_run
         self.min_merge_amount = min_merge_amount
         self.merge_interval = merge_interval
+        self.collateral_token_address = Web3.to_checksum_address(collateral_token_address)
         self._last_merge_time = 0.0
         self._running = False
         self._enabled = bool(private_key)
@@ -151,6 +151,7 @@ class PositionSettler:
             enabled=self._enabled,
             min_merge=min_merge_amount,
             interval=merge_interval,
+            collateral_token=self.collateral_token_address,
         )
 
     # ------------------------------------------------------------------
@@ -335,7 +336,7 @@ class PositionSettler:
                 self._ctf_for_abi,
                 "mergePositions",
                 [
-                    Web3.to_checksum_address(USDC_ADDRESS),
+                    self.collateral_token_address,
                     bytes(32),  # parentCollectionId (root)
                     bytes.fromhex(condition_id_hex),
                     [1, 2],  # partition
@@ -407,7 +408,7 @@ class PositionSettler:
             def _build_sign_send():
                 partition = [1, 2]
                 tx = self.ctf.functions.mergePositions(
-                    Web3.to_checksum_address(USDC_ADDRESS),
+                    self.collateral_token_address,
                     bytes(32),  # parentCollectionId (empty for root)
                     bytes.fromhex(position.condition_id[2:]),  # conditionId
                     partition,
@@ -483,4 +484,5 @@ def create_settler() -> PositionSettler:
         relay_tx_type=settings.relayer_tx_type,
         is_testnet=settings.is_testnet,
         dry_run=settings.dry_run,
+        collateral_token_address=settings.ctf_collateral_address,
     )

@@ -26,7 +26,28 @@ ERC1155_ABI = [
         "outputs": [{"name": "", "type": "uint256"}],
         "stateMutability": "view",
         "type": "function",
-    }
+    },
+    {
+        "inputs": [
+            {"name": "parentCollectionId", "type": "bytes32"},
+            {"name": "conditionId", "type": "bytes32"},
+            {"name": "indexSet", "type": "uint256"},
+        ],
+        "name": "getCollectionId",
+        "outputs": [{"name": "", "type": "bytes32"}],
+        "stateMutability": "view",
+        "type": "function",
+    },
+    {
+        "inputs": [
+            {"name": "collateralToken", "type": "address"},
+            {"name": "collectionId", "type": "bytes32"},
+        ],
+        "name": "getPositionId",
+        "outputs": [{"name": "", "type": "uint256"}],
+        "stateMutability": "pure",
+        "type": "function",
+    },
 ]
 
 
@@ -92,6 +113,24 @@ def token_balance(w3, wallet: str, token_id: str) -> Tuple[float, int]:
         int(token_id),
     ).call()
     return raw / 1e6, raw
+
+
+def ctf_position_token_ids(w3, condition_id: str, collateral_token: str) -> Tuple[str, str]:
+    from config.constants import CTF_CONTRACT_ADDRESS
+    from web3 import Web3
+
+    ctf = w3.eth.contract(
+        address=Web3.to_checksum_address(CTF_CONTRACT_ADDRESS),
+        abi=ERC1155_ABI,
+    )
+    cid_hex = condition_id[2:] if condition_id.startswith("0x") else condition_id
+    condition_bytes = bytes.fromhex(cid_hex)
+    collateral = Web3.to_checksum_address(collateral_token)
+    yes_collection = ctf.functions.getCollectionId(bytes(32), condition_bytes, 1).call()
+    no_collection = ctf.functions.getCollectionId(bytes(32), condition_bytes, 2).call()
+    yes_position = ctf.functions.getPositionId(collateral, yes_collection).call()
+    no_position = ctf.functions.getPositionId(collateral, no_collection).call()
+    return str(yes_position), str(no_position)
 
 
 def print_wallet_positions(wallet: str, condition_id: str) -> None:
@@ -182,14 +221,26 @@ async def main() -> int:
     if not w3.is_connected():
         raise SystemExit(f"Could not connect to RPC: {rpc_url}")
 
-    yes_balance, yes_raw = token_balance(w3, wallet, yes_token_id)
-    no_balance, no_raw = token_balance(w3, wallet, no_token_id)
+    collateral_token = settings.ctf_collateral_address
+    ctf_yes_token_id, ctf_no_token_id = ctf_position_token_ids(
+        w3,
+        condition_id,
+        collateral_token,
+    )
+
+    clob_yes_balance, clob_yes_raw = token_balance(w3, wallet, yes_token_id)
+    clob_no_balance, clob_no_raw = token_balance(w3, wallet, no_token_id)
+    yes_balance, yes_raw = token_balance(w3, wallet, ctf_yes_token_id)
+    no_balance, no_raw = token_balance(w3, wallet, ctf_no_token_id)
     amount = args.amount if args.amount is not None else min(yes_balance, no_balance)
 
     print(f"wallet:       {wallet}")
     print(f"condition:    {condition_id}")
-    print(f"YES token:    {yes_token_id} balance={yes_balance:.6f} raw={yes_raw}")
-    print(f"NO token:     {no_token_id} balance={no_balance:.6f} raw={no_raw}")
+    print(f"collateral:   {collateral_token}")
+    print(f"CLOB YES:     {yes_token_id} balance={clob_yes_balance:.6f} raw={clob_yes_raw}")
+    print(f"CLOB NO:      {no_token_id} balance={clob_no_balance:.6f} raw={clob_no_raw}")
+    print(f"CTF YES:      {ctf_yes_token_id} balance={yes_balance:.6f} raw={yes_raw}")
+    print(f"CTF NO:       {ctf_no_token_id} balance={no_balance:.6f} raw={no_raw}")
     print(f"merge amount: {amount:.6f}")
 
     if amount <= 0:
@@ -200,8 +251,8 @@ async def main() -> int:
 
     position = Position(
         condition_id=condition_id,
-        yes_token_id=yes_token_id,
-        no_token_id=no_token_id,
+        yes_token_id=ctf_yes_token_id,
+        no_token_id=ctf_no_token_id,
         yes_balance=amount,
         no_balance=amount,
     )
@@ -221,6 +272,7 @@ async def main() -> int:
         relay_tx_type=settings.relayer_tx_type,
         is_testnet=settings.is_testnet,
         dry_run=False,
+        collateral_token_address=collateral_token,
     )
     relayer_active = getattr(settler, "_use_relayer", False)
     if signer and wallet.lower() != signer.lower() and not relayer_active:
