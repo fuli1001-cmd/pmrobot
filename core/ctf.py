@@ -807,6 +807,113 @@ class CTFContract:
                 error_message=repr(e),
                 execution_time_ms=execution_time,
             )
+
+    async def _merge_via_relayer(
+        self,
+        condition_id: str,
+        amount_tokens: float,
+        amount_wei: int,
+        start_time: float,
+    ) -> MintReport:
+        condition_id_hex = condition_id[2:] if condition_id.startswith("0x") else condition_id
+
+        try:
+            merge_data = encode_contract_call(
+                self.ctf_contract,
+                "mergePositions",
+                [
+                    self.collateral_token_address,
+                    bytes(32),
+                    bytes.fromhex(condition_id_hex),
+                    [1, 2],
+                    amount_wei,
+                ],
+            )
+            merge_txn = await self._execute_relayer_transaction(
+                to=CTF_CONTRACT_ADDRESS,
+                data=merge_data,
+                metadata=f"Merge CTF position ${amount_tokens:.2f}",
+            )
+            state = merge_txn.get("state")
+            tx_hash = merge_txn.get("transactionHash") or merge_txn.get("hash")
+            transaction_id = merge_txn.get("transactionID")
+            execution_time = (time.time() - start_time) * 1000
+
+            if state not in ("STATE_MINED", "STATE_CONFIRMED"):
+                logger.error(
+                    "Relayer merge failed",
+                    state=state,
+                    transaction_id=transaction_id,
+                    tx_hash=tx_hash,
+                    condition_id=condition_id[:16] + "...",
+                    amount_tokens=amount_tokens,
+                    proxy_wallet=self.proxy_wallet,
+                    signer=self.signer_address,
+                    relayer_tx_type=self.relayer_tx_type,
+                )
+                return MintReport(
+                    result=MintResult.FAILED,
+                    condition_id=condition_id,
+                    amount_usdc=amount_tokens,
+                    tx_hash=tx_hash,
+                    error_message=f"Relayer merge failed state={state}",
+                    execution_time_ms=execution_time,
+                    relayer_transaction_id=transaction_id,
+                    relayer_state=state,
+                    relayer_tx_type=self.relayer_tx_type,
+                    proxy_wallet=self.proxy_wallet,
+                    signer_address=self.signer_address,
+                    collateral_token=self.collateral_token_address,
+                )
+
+            logger.info(
+                "Relayer merge successful",
+                state=state,
+                transaction_id=transaction_id,
+                tx_hash=tx_hash,
+                condition_id=condition_id[:16] + "...",
+                amount_tokens=amount_tokens,
+                proxy_wallet=self.proxy_wallet,
+                signer=self.signer_address,
+                relayer_tx_type=self.relayer_tx_type,
+            )
+            return MintReport(
+                result=MintResult.SUCCESS,
+                condition_id=condition_id,
+                amount_usdc=amount_tokens,
+                gas_cost_usd=0.0,
+                tx_hash=tx_hash,
+                execution_time_ms=execution_time,
+                relayer_transaction_id=transaction_id,
+                relayer_state=state,
+                relayer_tx_type=self.relayer_tx_type,
+                proxy_wallet=self.proxy_wallet,
+                signer_address=self.signer_address,
+                collateral_token=self.collateral_token_address,
+            )
+
+        except Exception as e:
+            execution_time = (time.time() - start_time) * 1000
+            logger.error(
+                "Relayer merge exception",
+                error=repr(e),
+                condition_id=condition_id[:16] + "...",
+                amount_tokens=amount_tokens,
+                proxy_wallet=self.proxy_wallet,
+                signer=self.signer_address,
+                relayer_tx_type=self.relayer_tx_type,
+            )
+            return MintReport(
+                result=MintResult.FAILED,
+                condition_id=condition_id,
+                amount_usdc=amount_tokens,
+                error_message=repr(e),
+                execution_time_ms=execution_time,
+                relayer_tx_type=self.relayer_tx_type,
+                proxy_wallet=self.proxy_wallet,
+                signer_address=self.signer_address,
+                collateral_token=self.collateral_token_address,
+            )
     
     async def merge(
         self,
@@ -839,6 +946,14 @@ class CTFContract:
                 result=MintResult.SUCCESS,
                 condition_id=condition_id,
                 amount_usdc=amount_tokens,
+            )
+
+        if self._use_relayer_mint:
+            return await self._merge_via_relayer(
+                condition_id=condition_id,
+                amount_tokens=amount_tokens,
+                amount_wei=amount_wei,
+                start_time=start_time,
             )
 
         try:

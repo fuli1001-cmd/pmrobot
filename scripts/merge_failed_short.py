@@ -183,9 +183,9 @@ async def main() -> int:
     args = parse_args()
 
     try:
+        from config.constants import POLYGON_AMOY_CHAIN_ID, POLYGON_CHAIN_ID
         from config.settings import get_settings
-        from core.settler import PositionSettler
-        from models.position import Position
+        from core.ctf import CTFContract, MintResult
         from web3 import Web3
     except ImportError as exc:
         raise SystemExit(
@@ -249,40 +249,52 @@ async def main() -> int:
     if amount > min(yes_balance, no_balance):
         raise SystemExit("Requested --amount exceeds mergeable YES/NO balance.")
 
-    position = Position(
-        condition_id=condition_id,
-        yes_token_id=ctf_yes_token_id,
-        no_token_id=ctf_no_token_id,
-        yes_balance=amount,
-        no_balance=amount,
-    )
-
     if not args.execute:
         print("preview only: rerun with --execute to submit the merge transaction.")
         return 0
 
-    settler = PositionSettler(
+    if not settings.private_key:
+        raise SystemExit("PRIVATE_KEY is required to sign the merge transaction.")
+
+    ctf = CTFContract(
         rpc_url=rpc_url,
         private_key=settings.private_key,
-        min_merge_amount=0.0,
-        merge_interval=settings.merge_interval,
-        builder_api_key=settings.builder_api_key,
-        builder_secret=settings.builder_secret,
-        builder_passphrase=settings.builder_passphrase,
-        relay_tx_type=settings.relayer_tx_type,
+        chain_id=POLYGON_AMOY_CHAIN_ID if settings.is_testnet else POLYGON_CHAIN_ID,
+        proxy_wallet=settings.proxy_wallet_address,
+        relayer_api_key=settings.relayer_api_key,
+        relayer_api_key_address=settings.relayer_api_key_address,
+        relayer_tx_type=settings.relayer_tx_type,
+        collateral_token_address=collateral_token,
         is_testnet=settings.is_testnet,
         dry_run=False,
-        collateral_token_address=collateral_token,
     )
-    relayer_active = getattr(settler, "_use_relayer", False)
-    if signer and wallet.lower() != signer.lower() and not relayer_active:
+    if not ctf.address or wallet.lower() != ctf.address.lower():
         raise SystemExit(
-            "Token wallet differs from signer and relayer is not active. "
-            "Configure builder relayer credentials or pass an EOA --wallet that holds the tokens."
+            "Token wallet differs from the configured CTF execution wallet. "
+            f"token_wallet={wallet} execution_wallet={ctf.address}. "
+            "For proxy-wallet tokens, configure RELAYER_API_KEY, "
+            "RELAYER_API_KEY_ADDRESS, PROXY_WALLET_ADDRESS, and RELAYER_TX_TYPE=SAFE."
         )
-    success = await settler._merge_position(position)
-    print("merge submitted successfully" if success else "merge failed")
-    return 0 if success else 1
+
+    report = await ctf.merge(condition_id, amount)
+    if report.result == MintResult.SUCCESS:
+        print("merge submitted successfully")
+        if report.tx_hash:
+            print(f"tx hash: {report.tx_hash}")
+        if report.relayer_transaction_id:
+            print(f"relayer transaction id: {report.relayer_transaction_id}")
+        if report.relayer_state:
+            print(f"relayer state: {report.relayer_state}")
+        return 0
+
+    print("merge failed")
+    if report.error_message:
+        print(f"error: {report.error_message}")
+    if report.relayer_state:
+        print(f"relayer state: {report.relayer_state}")
+    if report.tx_hash:
+        print(f"tx hash: {report.tx_hash}")
+    return 1
 
 
 if __name__ == "__main__":
