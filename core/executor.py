@@ -8,7 +8,7 @@ import re
 import time
 from dataclasses import dataclass
 from enum import Enum
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from config.settings import get_settings
 from config.constants import CLOB_API_BASE_URL, POLYGON_CHAIN_ID
@@ -914,6 +914,137 @@ class OrderExecutor:
         """Get current account state."""
         return self._account_state
 
+    @staticmethod
+    def _extract_balance_amount(balance_response) -> float:
+        """Return a human USDC/token balance from SDK balance responses."""
+        raw_balance = None
+        if isinstance(balance_response, dict):
+            raw_balance = balance_response.get("balance")
+        else:
+            raw_balance = getattr(balance_response, "balance", None)
+
+        if raw_balance is None:
+            return 0.0
+
+        value = float(raw_balance)
+        # Polymarket balance APIs return 6-decimal integer strings for assets.
+        return value / 1_000_000 if value > 1_000 else value
+
+    async def _get_conditional_token_balance(self, token_id: str) -> float:
+        """Fetch CLOB-reported conditional token balance for the trading wallet."""
+        if self.dry_run or not getattr(self, "client", None):
+            return float("inf")
+
+        try:
+            response = await asyncio.to_thread(
+                self.client.get_balance_allowance,
+                asset_type="CONDITIONAL",
+                token_id=str(token_id),
+            )
+            return self._extract_balance_amount(response)
+        except TypeError:
+            try:
+                from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
+
+                params = BalanceAllowanceParams(
+                    asset_type=AssetType.CONDITIONAL,
+                    token_id=str(token_id),
+                )
+                response = await asyncio.to_thread(
+                    self.client.get_balance_allowance,
+                    params,
+                )
+                return self._extract_balance_amount(response)
+            except Exception as e:
+                logger.debug(
+                    "Conditional token balance check failed",
+                    token_id=str(token_id)[:8],
+                    error=repr(e),
+                )
+                return 0.0
+        except Exception as e:
+            logger.debug(
+                "Conditional token balance check failed",
+                token_id=str(token_id)[:8],
+                error=repr(e),
+            )
+            return 0.0
+
+    async def _wait_for_sellable_short_balances(
+        self,
+        market,
+        required_size: float,
+        timeout: float,
+        poll_interval: float,
+    ) -> Tuple[bool, Dict[str, float]]:
+        """Wait until CLOB sees both minted short legs as sellable balances."""
+        deadline = time.time() + timeout
+        balances = {"yes": 0.0, "no": 0.0}
+
+        while True:
+            balances["yes"] = await self._get_conditional_token_balance(market.token_id_yes)
+            balances["no"] = await self._get_conditional_token_balance(market.token_id_no)
+
+            if balances["yes"] >= required_size and balances["no"] >= required_size:
+                return True, balances
+
+            if timeout <= 0 or time.time() >= deadline:
+                return False, balances
+
+            await asyncio.sleep(poll_interval)
+
+    async def _merge_minted_short_position(
+        self,
+        opportunity: ShortArbitrageOpportunity,
+        ctf_contract,
+        amount_tokens: float,
+        reason: str,
+    ) -> bool:
+        """Merge an unsold minted YES+NO pair back to collateral."""
+        from core.ctf import MintResult
+
+        logger.warning(
+            "Short arb recovery: merging unsold minted pair",
+            market=opportunity.market.slug[:50],
+            amount=f"${amount_tokens:.2f}",
+            reason=reason,
+        )
+        try:
+            merge_report = await ctf_contract.merge(
+                opportunity.market.condition_id,
+                amount_tokens,
+            )
+        except Exception as e:
+            logger.error(
+                "Short arb recovery merge raised",
+                market=opportunity.market.slug[:50],
+                reason=reason,
+                error=repr(e),
+            )
+            return False
+
+        if merge_report.result == MintResult.SUCCESS:
+            self._update_short_inventory(
+                opportunity,
+                yes_delta=-amount_tokens,
+                no_delta=-amount_tokens,
+            )
+            logger.info(
+                "Short arb recovery merge succeeded",
+                market=opportunity.market.slug[:50],
+                tx_hash=merge_report.tx_hash or "N/A",
+            )
+            return True
+
+        logger.error(
+            "Short arb recovery merge failed",
+            market=opportunity.market.slug[:50],
+            reason=reason,
+            error=merge_report.error_message,
+            tx_hash=merge_report.tx_hash,
+        )
+        return False
+
     # ------------------------------------------------------------------
     # Short Arbitrage: Mint → Sell-Yes + Sell-No
     # ------------------------------------------------------------------
@@ -1088,6 +1219,39 @@ class OrderExecutor:
                 no_delta=num_tokens,
             )
 
+            settings = get_settings()
+            balances_ready, balances = await self._wait_for_sellable_short_balances(
+                market,
+                required_size=num_tokens,
+                timeout=settings.short_sell_balance_timeout,
+                poll_interval=settings.short_sell_balance_poll_interval,
+            )
+            if not balances_ready:
+                merged = await self._merge_minted_short_position(
+                    opportunity,
+                    ctf_contract,
+                    num_tokens,
+                    reason="CLOB did not report sellable balances after mint",
+                )
+                reason = (
+                    "Mint succeeded but CLOB did not report sellable token balances "
+                    f"within {settings.short_sell_balance_timeout:.1f}s "
+                    f"(yes={balances['yes']:.6f}, no={balances['no']:.6f}, "
+                    f"merged={merged})"
+                )
+                logger.error(
+                    "Short arb aborted after mint: sellable balance unavailable",
+                    market=market.slug[:50],
+                    reason=reason,
+                )
+                return ExecutionReport(
+                    result=ExecutionResult.FAILED,
+                    opportunity=opportunity,
+                    error_message=reason,
+                    execution_time_ms=(time.time() - start_time) * 1000,
+                    fatal_error=True,
+                )
+
             # ── Step 2: Sell Yes + No concurrently ───────────────────
             order_yes = Order(
                 token_id=market.token_id_yes,
@@ -1202,16 +1366,25 @@ class OrderExecutor:
                 )
 
             # Both sells rejected – we're stuck holding minted tokens
+            merged = await self._merge_minted_short_position(
+                opportunity,
+                ctf_contract,
+                num_tokens,
+                reason="Both short sell legs rejected",
+            )
             logger.error(
-                "Short arb – both sells failed (holding tokens)",
+                "Short arb – both sells failed",
                 market=market.slug[:50],
+                recovery_merged=merged,
             )
             return ExecutionReport(
                 result=ExecutionResult.FAILED,
                 opportunity=opportunity,
                 order_yes=order_yes_res,
                 order_no=order_no_res,
+                error_message=f"Both short sells failed; recovery_merged={merged}",
                 execution_time_ms=execution_time,
+                fatal_error=True,
             )
 
         except Exception as e:

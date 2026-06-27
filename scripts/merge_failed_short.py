@@ -57,8 +57,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--slug", help="Gamma market slug to resolve condition/token ids")
     parser.add_argument("--condition-id", help="CTF condition id")
-    parser.add_argument("--yes-token-id", help="YES outcome token id")
-    parser.add_argument("--no-token-id", help="NO outcome token id")
+    parser.add_argument("--yes-token-id", help="YES CLOB outcome token id, used for display only")
+    parser.add_argument("--no-token-id", help="NO CLOB outcome token id, used for display only")
     parser.add_argument(
         "--amount",
         type=float,
@@ -202,9 +202,10 @@ async def main() -> int:
         yes_token_id = args.yes_token_id
         no_token_id = args.no_token_id
 
-    if not condition_id or not yes_token_id or not no_token_id:
+    if not condition_id:
         raise SystemExit(
-            "Provide either --slug, or all of --condition-id --yes-token-id --no-token-id."
+            "Provide either --slug or --condition-id. "
+            "--yes-token-id/--no-token-id are optional display fields."
         )
 
     rpc_url = (
@@ -228,8 +229,14 @@ async def main() -> int:
         collateral_token,
     )
 
-    clob_yes_balance, clob_yes_raw = token_balance(w3, wallet, yes_token_id)
-    clob_no_balance, clob_no_raw = token_balance(w3, wallet, no_token_id)
+    if yes_token_id:
+        clob_yes_balance, clob_yes_raw = token_balance(w3, wallet, yes_token_id)
+    else:
+        clob_yes_balance, clob_yes_raw = 0.0, 0
+    if no_token_id:
+        clob_no_balance, clob_no_raw = token_balance(w3, wallet, no_token_id)
+    else:
+        clob_no_balance, clob_no_raw = 0.0, 0
     yes_balance, yes_raw = token_balance(w3, wallet, ctf_yes_token_id)
     no_balance, no_raw = token_balance(w3, wallet, ctf_no_token_id)
     amount = args.amount if args.amount is not None else min(yes_balance, no_balance)
@@ -237,15 +244,19 @@ async def main() -> int:
     print(f"wallet:       {wallet}")
     print(f"condition:    {condition_id}")
     print(f"collateral:   {collateral_token}")
-    print(f"CLOB YES:     {yes_token_id} balance={clob_yes_balance:.6f} raw={clob_yes_raw}")
-    print(f"CLOB NO:      {no_token_id} balance={clob_no_balance:.6f} raw={clob_no_raw}")
+    print(f"CLOB YES:     {yes_token_id or 'not provided'} balance={clob_yes_balance:.6f} raw={clob_yes_raw}")
+    print(f"CLOB NO:      {no_token_id or 'not provided'} balance={clob_no_balance:.6f} raw={clob_no_raw}")
     print(f"CTF YES:      {ctf_yes_token_id} balance={yes_balance:.6f} raw={yes_raw}")
     print(f"CTF NO:       {ctf_no_token_id} balance={no_balance:.6f} raw={no_raw}")
     print(f"merge amount: {amount:.6f}")
 
     if amount <= 0:
         print_wallet_positions(wallet, condition_id)
-        raise SystemExit("Nothing mergeable: min(YES, NO) balance is zero.")
+        raise SystemExit(
+            "Nothing mergeable: min(YES, NO) balance is zero. "
+            "If wallet USDC dropped after a failed short, rerun with the failed "
+            "market slug/condition from logs/pmrobot.log."
+        )
     if amount > min(yes_balance, no_balance):
         raise SystemExit("Requested --amount exceeds mergeable YES/NO balance.")
 

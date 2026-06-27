@@ -97,6 +97,14 @@ class ArbitrageBot:
         self._cross_monitor: Optional[CrossPlatformMonitor] = None
         self._sx_ws: Optional[SxBetWebSocket] = None
 
+    @staticmethod
+    def _execution_report_has_fill(result) -> bool:
+        """Return True if an execution report shows any filled leg."""
+        for order in (getattr(result, "order_yes", None), getattr(result, "order_no", None)):
+            if order and (order.is_filled or order.filled_size > 0):
+                return True
+        return False
+
     async def _verify_geoblock(self) -> None:
         """Check whether this egress IP is eligible for live Polymarket trading."""
         try:
@@ -217,13 +225,17 @@ class ArbitrageBot:
 
             # Binary / NegRisk internal arbitrage (can be disabled)
             if self.settings.pm_internal_arb_enabled:
-                task_specs.extend([
+                internal_tasks = [
                     ("market_monitor", self._run_monitor(markets)),
                     ("neg_risk_monitor", self._run_neg_risk_monitor(neg_risk_events)),
                     ("executor", self._run_executor()),
                     ("neg_risk_executor", self._run_neg_risk_executor()),
-                    ("short_executor", self._run_short_executor()),
-                ])
+                ]
+                if self.settings.pm_short_arb_enabled:
+                    internal_tasks.append(("short_executor", self._run_short_executor()))
+                else:
+                    logger.info("PM short mint+sell arbitrage DISABLED (PM_SHORT_ARB_ENABLED=false)")
+                task_specs.extend(internal_tasks)
             else:
                 logger.info("PM internal arbitrage DISABLED (PM_INTERNAL_ARB_ENABLED=false)")
 
@@ -389,6 +401,13 @@ class ArbitrageBot:
 
         def on_short_opportunity(opp: ShortArbitrageOpportunity):
             """Callback when short (Mint+Sell) opportunity is detected."""
+            if not self.settings.pm_short_arb_enabled:
+                logger.debug(
+                    "Short opportunity ignored because short arbitrage is disabled",
+                    market=opp.market.slug[:50],
+                )
+                return
+
             if self.risk_manager.can_trade_market(opp.market.condition_id):
                 logger.info(
                     "Short opportunity detected - queuing for execution",
@@ -545,11 +564,17 @@ class ArbitrageBot:
                     )
                 else:
                     # Failed
-                     await self.risk_manager.record_failure(
-                        opportunity,
-                        is_partial=False,
-                        loss_usdc=0.0,
-                    )
+                    if result.fatal_error or self._execution_report_has_fill(result):
+                        await self.risk_manager.record_failure(
+                            opportunity,
+                            is_partial=False,
+                            loss_usdc=0.0,
+                        )
+                    else:
+                        logger.info(
+                            "NegRisk FOK attempt had zero fills; not counting as risk failure",
+                            event=opportunity.event.title[:50],
+                        )
 
             except asyncio.CancelledError:
                 break
@@ -618,11 +643,18 @@ class ArbitrageBot:
                 else:
                     is_partial = result.result == ExecutionResult.PARTIAL
                     loss = opportunity.trade_size_usdc * 0.05 if is_partial else 0
-                    await self.risk_manager.record_failure(
-                        opportunity,
-                        is_partial=is_partial,
-                        loss_usdc=loss,
-                    )
+                    if is_partial or result.fatal_error or self._execution_report_has_fill(result):
+                        await self.risk_manager.record_failure(
+                            opportunity,
+                            is_partial=is_partial,
+                            loss_usdc=loss,
+                        )
+                    else:
+                        logger.info(
+                            "Binary FOK attempt had zero fills; not counting as risk failure",
+                            market=opportunity.market.slug[:50],
+                            reason=result.error_message,
+                        )
                     
                     if is_partial:
                         # Feature 2: Circuit Breaker for Binary Markets too

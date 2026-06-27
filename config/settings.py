@@ -110,6 +110,22 @@ class Settings(BaseSettings):
         False,
         description="Submit both legs concurrently (True) or sequentially fragile-first (False)",
     )
+    pm_short_arb_enabled: bool = Field(
+        True,
+        description="Enable Polymarket short mint+sell arbitrage executor",
+    )
+    short_sell_balance_timeout: float = Field(
+        12.0,
+        ge=0.0,
+        le=120.0,
+        description="Seconds to wait after mint until CLOB reports sellable conditional token balances",
+    )
+    short_sell_balance_poll_interval: float = Field(
+        0.75,
+        ge=0.1,
+        le=10.0,
+        description="Polling interval for post-mint CLOB conditional token balances",
+    )
 
     # ═══ Disabled Azuro Reference Configuration ═══
     # Kept for legacy .env compatibility. The active cross-platform adapter is SX Bet.

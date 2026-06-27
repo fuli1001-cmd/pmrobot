@@ -92,6 +92,63 @@ async def test_short_arbitrage_skips_before_mint_when_sell_order_below_minimum()
 
 
 @pytest.mark.asyncio
+async def test_short_arbitrage_merges_and_stops_when_sellable_balance_unavailable():
+    executor = OrderExecutor.__new__(OrderExecutor)
+    executor.dry_run = False
+    executor.proxy_wallet = None
+    executor._account_state = AccountState()
+    executor._submit_order = AsyncMock()
+    executor._wait_for_sellable_short_balances = AsyncMock(
+        return_value=(False, {"yes": 0.0, "no": 0.0})
+    )
+
+    market = Market(
+        condition_id="condition",
+        token_id_yes="yes_token",
+        token_id_no="no_token",
+        question="Test market?",
+        slug="test-market",
+    )
+    opportunity = ShortArbitrageOpportunity(
+        market=market,
+        bid_price_yes=0.60,
+        bid_price_no=0.50,
+        trade_size_usdc=5.0,
+        total_revenue=1.10,
+        mint_cost=1.0,
+        estimated_gas_cost=0.0,
+        estimated_fee=0.0,
+    )
+
+    from core.ctf import MintResult
+
+    mint_report = types.SimpleNamespace(
+        result=MintResult.SUCCESS,
+        gas_cost_usd=0.0,
+        tx_hash="0xabc",
+        error_message=None,
+    )
+    merge_report = types.SimpleNamespace(
+        result=MintResult.SUCCESS,
+        tx_hash="0xmerge",
+        error_message=None,
+    )
+    ctf_contract = types.SimpleNamespace(
+        mint=AsyncMock(return_value=mint_report),
+        merge=AsyncMock(return_value=merge_report),
+    )
+
+    report = await executor.execute_short_arbitrage(opportunity, ctf_contract)
+
+    assert report.result == ExecutionResult.FAILED
+    assert report.fatal_error is True
+    assert "did not report sellable token balances" in report.error_message
+    ctf_contract.merge.assert_awaited_once_with("condition", 5.0)
+    executor._submit_order.assert_not_awaited()
+    assert executor.account_state.get_position("condition") is None
+
+
+@pytest.mark.asyncio
 async def test_short_arbitrage_failed_sells_leave_mergeable_inventory():
     executor = OrderExecutor.__new__(OrderExecutor)
     executor.dry_run = False
