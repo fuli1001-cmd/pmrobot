@@ -5,9 +5,18 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+import core.executor as executor_module
 from core.executor import ExecutionResult, OrderExecutor
 from models.market import Market
-from models.order import ArbitrageOpportunity, OrderStatus, ShortArbitrageOpportunity
+from models.order import (
+    ArbitrageOpportunity,
+    Order,
+    OrderBookLevel,
+    OrderSide,
+    OrderStatus,
+    OrderType,
+    ShortArbitrageOpportunity,
+)
 from models.position import AccountState
 
 
@@ -182,6 +191,46 @@ async def test_short_arbitrage_mint_failure_is_fatal_and_does_not_sell():
     assert report.fatal_error is True
     assert "Relayer mint failed" in report.error_message
     sell_order.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_emergency_exit_sells_book_chunks_from_high_to_low(monkeypatch):
+    executor = OrderExecutor.__new__(OrderExecutor)
+    monkeypatch.setattr(executor_module, "EMERGENCY_EXIT_SETTLEMENT_DELAY_SECONDS", 0.0)
+
+    filled_order = Order(
+        token_id="filled_token",
+        side=OrderSide.BUY,
+        price=0.35,
+        size=10.0,
+        order_type=OrderType.FOK,
+        status=OrderStatus.FILLED,
+        filled_size=10.0,
+        filled_avg_price=0.35,
+    )
+    executor._fetch_exit_bids = AsyncMock(
+        return_value=[
+            OrderBookLevel(price=0.34, size=4.0),
+            OrderBookLevel(price=0.33, size=3.0),
+            OrderBookLevel(price=0.32, size=3.0),
+        ]
+    )
+
+    submitted = []
+
+    async def fill_order(order):
+        submitted.append((order.price, order.size))
+        order.status = OrderStatus.FILLED
+        order.filled_size = order.size
+        order.filled_avg_price = order.price
+        return order
+
+    executor._submit_order = fill_order
+
+    exited = await executor._exit_filled_order(filled_order, context="test exit")
+
+    assert exited is True
+    assert submitted == [(0.34, 4.0), (0.32, 6.0)]
 
 
 @pytest.mark.asyncio

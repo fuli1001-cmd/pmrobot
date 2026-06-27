@@ -1,6 +1,7 @@
 """Order execution engine using CLOB API."""
 
 import asyncio
+import httpx
 from importlib import metadata
 import math
 import re
@@ -10,9 +11,17 @@ from enum import Enum
 from typing import List, Optional, Tuple
 
 from config.settings import get_settings
-from config.constants import POLYGON_CHAIN_ID
+from config.constants import CLOB_API_BASE_URL, POLYGON_CHAIN_ID
 from models.market import NegativeRiskArbitrageOpportunity, NegativeRiskStrategy
-from models.order import ArbitrageOpportunity, ShortArbitrageOpportunity, Order, OrderSide, OrderStatus, OrderType
+from models.order import (
+    ArbitrageOpportunity,
+    ShortArbitrageOpportunity,
+    Order,
+    OrderBookLevel,
+    OrderSide,
+    OrderStatus,
+    OrderType,
+)
 from models.position import AccountState
 from utils.logger import get_logger
 from utils.rate_limiter import RateLimiter
@@ -21,6 +30,8 @@ logger = get_logger(__name__)
 
 MIN_MARKETABLE_ORDER_USDC = 1.0
 MIN_POLYMARKET_CLIENT_VERSION = "0.1.0b9"
+EMERGENCY_EXIT_SETTLEMENT_DELAY_SECONDS = 3.0
+EMERGENCY_EXIT_FALLBACK_DISCOUNTS = (0.95, 0.90, 0.85, 0.80)
 
 
 def _version_tuple(version: str) -> Tuple[int, ...]:
@@ -505,42 +516,8 @@ class OrderExecutor:
         await asyncio.gather(*tasks)
 
     async def _submit_sell_exit(self, filled_order: Order) -> None:
-        """Submit a market sell to exit a position (with retry)."""
-        # Wait for Polygon settlement before selling (tokens need ~3-5s to be credited)
-        await asyncio.sleep(3.0)
-
-        max_retries = 3
-        for attempt in range(1, max_retries + 1):
-            # Hybrid discount: percentage-based for high prices, absolute for low prices
-            discount = 0.90 - 0.05 * (attempt - 1)  # 10%, 15%, 20% discount
-            pct_price = round(filled_order.filled_avg_price * discount, 2)
-            abs_price = round(filled_order.filled_avg_price - 0.01 * attempt, 2)
-            sell_price = min(pct_price, abs_price)  # Use the more aggressive price
-            sell_price = max(sell_price, 0.01)
-            try:
-                sell_size = math.floor(filled_order.filled_size * 100) / 100
-                if sell_size <= 0:
-                    logger.warning("Vector exit size too small", raw=filled_order.filled_size)
-                    return
-                exit_order = Order(
-                    token_id=filled_order.token_id,
-                    side=OrderSide.SELL,
-                    price=sell_price,
-                    size=sell_size,
-                    order_type=OrderType.FOK,
-                )
-                result = await self._submit_order(exit_order)
-                if result.is_filled:
-                    logger.info("Vector exit order filled", attempt=attempt)
-                    return
-            except Exception as e:
-                logger.error(
-                    "Emergency exit failed for order",
-                    error=repr(e),
-                    attempt=attempt,
-                )
-            if attempt < max_retries:
-                await asyncio.sleep(0.5 * attempt)
+        """Exit a filled vector leg using layered liquidation."""
+        await self._exit_filled_order(filled_order, context="Vector emergency exit")
 
     async def _submit_order(self, order: Order) -> Order:
         """
@@ -678,56 +655,228 @@ class OrderExecutor:
             size=filled_order.filled_size,
         )
 
-        # Wait for Polygon settlement before selling (tokens need ~3-5s to be credited)
-        await asyncio.sleep(3.0)
+        return await self._exit_filled_order(filled_order, context="Emergency exit")
 
-        # Retry up to 3 times with increasing price discount
-        max_retries = 3
-        for attempt in range(1, max_retries + 1):
-            # Hybrid discount: percentage-based for high prices, absolute for low prices
-            discount = 0.95 - 0.03 * (attempt - 1)  # 5%, 8%, 11% discount
+    async def _exit_filled_order(self, filled_order: Order, context: str) -> bool:
+        """Liquidate a filled leg, prioritising exposure reduction over price."""
+        remaining = math.floor(filled_order.filled_size * 100) / 100
+        if remaining <= 0:
+            logger.warning("Emergency exit size too small", raw=filled_order.filled_size)
+            return False
+
+        # Wait for Polygon settlement before selling (tokens need ~3-5s to be credited).
+        await asyncio.sleep(EMERGENCY_EXIT_SETTLEMENT_DELAY_SECONDS)
+
+        bids = await self._fetch_exit_bids(filled_order.token_id)
+        if bids:
+            remaining = await self._sell_exit_against_bids(
+                filled_order=filled_order,
+                bids=bids,
+                remaining=remaining,
+                context=context,
+            )
+
+        if remaining <= 0:
+            logger.info("Emergency liquidation successful", context=context)
+            return True
+
+        remaining = await self._sell_exit_with_fallback_ladder(
+            filled_order=filled_order,
+            remaining=remaining,
+            context=context,
+        )
+
+        if remaining <= 0:
+            logger.info("Emergency liquidation successful", context=context)
+            return True
+
+        logger.error(
+            "Emergency liquidation incomplete",
+            context=context,
+            token_id=filled_order.token_id[:8],
+            remaining=remaining,
+        )
+        return False
+
+    async def _fetch_exit_bids(self, token_id: str) -> List[OrderBookLevel]:
+        """Fetch current bids for emergency liquidation."""
+        try:
+            async with httpx.AsyncClient(timeout=3.0) as client:
+                response = await client.get(
+                    f"{CLOB_API_BASE_URL}/book",
+                    params={"token_id": token_id},
+                )
+                response.raise_for_status()
+                data = response.json()
+        except Exception as e:
+            logger.warning(
+                "Emergency exit book fetch failed",
+                token_id=token_id[:8],
+                error=repr(e),
+            )
+            return []
+
+        bids = []
+        for raw_bid in data.get("bids", []):
+            try:
+                price = float(raw_bid["price"])
+                size = float(raw_bid["size"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if price > 0 and size > 0:
+                bids.append(OrderBookLevel(price=price, size=size))
+
+        bids.sort(key=lambda level: level.price, reverse=True)
+        return bids
+
+    async def _sell_exit_against_bids(
+        self,
+        filled_order: Order,
+        bids: List[OrderBookLevel],
+        remaining: float,
+        context: str,
+    ) -> float:
+        """Sell chunks from highest bid downward, respecting CLOB minimum notional."""
+        chunk_size = 0.0
+        chunk_price: Optional[float] = None
+
+        for bid in bids:
+            if remaining <= 0:
+                break
+
+            available = min(bid.size, remaining - chunk_size)
+            available = math.floor(available * 100) / 100
+            if available <= 0:
+                continue
+
+            chunk_size = math.floor((chunk_size + available) * 100) / 100
+            chunk_price = bid.price
+
+            _, rounded_size, order_usdc = self._prepare_clob_order_values(
+                OrderSide.SELL,
+                chunk_price,
+                chunk_size,
+            )
+            if order_usdc < MIN_MARKETABLE_ORDER_USDC and rounded_size < remaining:
+                continue
+
+            filled = await self._submit_exit_order(
+                token_id=filled_order.token_id,
+                price=chunk_price,
+                size=rounded_size,
+                context=context,
+                source="book",
+            )
+            if filled:
+                remaining = math.floor((remaining - rounded_size) * 100) / 100
+            chunk_size = 0.0
+            chunk_price = None
+
+        if remaining > 0 and chunk_size > 0 and chunk_price is not None:
+            _, rounded_size, order_usdc = self._prepare_clob_order_values(
+                OrderSide.SELL,
+                chunk_price,
+                min(chunk_size, remaining),
+            )
+            if order_usdc >= MIN_MARKETABLE_ORDER_USDC or rounded_size >= remaining:
+                filled = await self._submit_exit_order(
+                    token_id=filled_order.token_id,
+                    price=chunk_price,
+                    size=rounded_size,
+                    context=context,
+                    source="book_tail",
+                )
+                if filled:
+                    remaining = math.floor((remaining - rounded_size) * 100) / 100
+
+        return remaining
+
+    async def _sell_exit_with_fallback_ladder(
+        self,
+        filled_order: Order,
+        remaining: float,
+        context: str,
+    ) -> float:
+        """Fallback to progressively more aggressive whole-position FOK exits."""
+        for attempt, discount in enumerate(EMERGENCY_EXIT_FALLBACK_DISCOUNTS, start=1):
             pct_price = round(filled_order.filled_avg_price * discount, 2)
             abs_price = round(filled_order.filled_avg_price - 0.01 * attempt, 2)
-            sell_price = min(pct_price, abs_price)  # Use the more aggressive price
-            sell_price = max(sell_price, 0.01)  # Floor at CLOB min tick
+            sell_price = max(min(pct_price, abs_price), 0.01)
 
-            try:
-                sell_size = math.floor(filled_order.filled_size * 100) / 100
-                if sell_size <= 0:
-                    logger.warning("Emergency exit size too small", raw=filled_order.filled_size)
-                    return False
-                exit_order = Order(
-                    token_id=filled_order.token_id,
-                    side=OrderSide.SELL,
-                    price=sell_price,
-                    size=sell_size,
-                    order_type=OrderType.FOK,
-                )
-                response = await self._submit_order(exit_order)
+            filled = await self._submit_exit_order(
+                token_id=filled_order.token_id,
+                price=sell_price,
+                size=remaining,
+                context=context,
+                source=f"fallback_{attempt}",
+            )
+            if filled:
+                return 0.0
+            if attempt < len(EMERGENCY_EXIT_FALLBACK_DISCOUNTS):
+                await asyncio.sleep(0.5 * attempt)
 
-                if response.is_filled:
-                    logger.info(
-                        "Emergency exit successful",
-                        order_id=response.order_id,
-                        attempt=attempt,
-                    )
-                    return True  # Success — stop retrying
-                else:
-                    logger.error(
-                        "Emergency exit rejected",
-                        reason=response.status.value,
-                        attempt=attempt,
-                    )
-            except Exception as e:
-                logger.error(
-                    "Emergency exit exception",
-                    error=repr(e),
-                    attempt=attempt,
-                )
+        return remaining
 
-            if attempt < max_retries:
-                await asyncio.sleep(1.0 * attempt)
+    async def _submit_exit_order(
+        self,
+        token_id: str,
+        price: float,
+        size: float,
+        context: str,
+        source: str,
+    ) -> bool:
+        """Submit one FOK sell chunk and return whether it filled."""
+        price, rounded_size, order_usdc = self._prepare_clob_order_values(
+            OrderSide.SELL,
+            price,
+            size,
+        )
+        if rounded_size <= 0:
+            logger.warning(
+                "Emergency liquidation chunk size too small",
+                context=context,
+                source=source,
+                raw=size,
+            )
+            return False
+        if order_usdc < MIN_MARKETABLE_ORDER_USDC:
+            logger.warning(
+                "Emergency liquidation chunk below CLOB minimum",
+                context=context,
+                source=source,
+                price=price,
+                size=rounded_size,
+                usdc=f"${order_usdc:.2f}",
+            )
+            return False
 
+        exit_order = Order(
+            token_id=token_id,
+            side=OrderSide.SELL,
+            price=price,
+            size=rounded_size,
+            order_type=OrderType.FOK,
+        )
+        response = await self._submit_order(exit_order)
+        if response.is_filled:
+            logger.info(
+                "Emergency liquidation chunk filled",
+                context=context,
+                source=source,
+                order_id=response.order_id,
+                price=price,
+                size=rounded_size,
+            )
+            return True
+
+        logger.error(
+            "Emergency liquidation chunk rejected",
+            context=context,
+            source=source,
+            reason=response.status.value,
+            price=price,
+            size=rounded_size,
+        )
         return False
 
     def _update_position(
