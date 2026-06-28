@@ -17,6 +17,7 @@ from models.order import (
     ArbitrageOpportunity,
     ShortArbitrageOpportunity,
     Order,
+    OrderBook,
     OrderBookLevel,
     OrderSide,
     OrderStatus,
@@ -290,6 +291,25 @@ class OrderExecutor:
 
         try:
             concurrent = getattr(self, '_concurrent', False)
+            preflight_quotes = None
+
+            if validate_before_execute:
+                preflight_result = await self._preflight_binary_arbitrage(
+                    opportunity,
+                    order_yes,
+                    order_no,
+                )
+                if preflight_result is None:
+                    execution_time = (time.time() - start_time) * 1000
+                    return ExecutionReport(
+                        result=ExecutionResult.SKIPPED,
+                        opportunity=opportunity,
+                        order_yes=order_yes,
+                        order_no=order_no,
+                        execution_time_ms=execution_time,
+                        error_message="Live CLOB preflight rejected binary opportunity",
+                    )
+                order_yes, order_no, preflight_quotes = preflight_result
 
             if concurrent:
                 # Concurrent execution: fire both legs simultaneously.
@@ -306,9 +326,22 @@ class OrderExecutor:
                 # USDC on that leg and it tends to move out from under us sooner.
                 # If the first leg FOK fails -> zero loss. If it fills and the second
                 # fails -> emergency exit still works, but this ordering reduces risk.
-                yes_fragility = (opportunity.levels_yes, opportunity.avg_price_yes)
-                no_fragility = (opportunity.levels_no, opportunity.avg_price_no)
-                if yes_fragility >= no_fragility:
+                if preflight_quotes:
+                    yes_fragility = (
+                        preflight_quotes["yes"]["depth_ratio"],
+                        -preflight_quotes["yes"]["levels_used"],
+                    )
+                    no_fragility = (
+                        preflight_quotes["no"]["depth_ratio"],
+                        -preflight_quotes["no"]["levels_used"],
+                    )
+                    yes_first = yes_fragility <= no_fragility
+                else:
+                    yes_fragility = (opportunity.levels_yes, opportunity.avg_price_yes)
+                    no_fragility = (opportunity.levels_no, opportunity.avg_price_no)
+                    yes_first = yes_fragility >= no_fragility
+
+                if yes_first:
                     first_order, second_order = order_yes, order_no
                     first_label, second_label = "yes", "no"
                 else:
@@ -400,6 +433,201 @@ class OrderExecutor:
                 error_message=repr(e),
                 execution_time_ms=execution_time,
             )
+
+    async def _preflight_binary_arbitrage(
+        self,
+        opportunity: ArbitrageOpportunity,
+        order_yes: Order,
+        order_no: Order,
+    ) -> Optional[Tuple[Order, Order, Dict[str, dict]]]:
+        """Re-read live CLOB books and reject stale binary opportunities."""
+        settings = get_settings()
+
+        book_yes, book_no = await asyncio.gather(
+            self._fetch_live_order_book(opportunity.market.token_id_yes),
+            self._fetch_live_order_book(opportunity.market.token_id_no),
+        )
+        if not book_yes or not book_no:
+            logger.warning(
+                "Binary preflight skipped: could not fetch live order books",
+                market=opportunity.market.slug[:50],
+            )
+            return None
+
+        target_size = min(
+            self._prepare_clob_order_values(
+                OrderSide.BUY,
+                order_yes.price,
+                order_yes.size,
+            )[1],
+            self._prepare_clob_order_values(
+                OrderSide.BUY,
+                order_no.price,
+                order_no.size,
+            )[1],
+        )
+        if target_size <= 0:
+            logger.warning(
+                "Binary preflight skipped: rounded token size is zero",
+                market=opportunity.market.slug[:50],
+                raw_size=order_yes.size,
+            )
+            return None
+
+        quote_yes = self._quote_buy_tokens(book_yes, target_size, order_yes.price)
+        quote_no = self._quote_buy_tokens(book_no, target_size, order_no.price)
+
+        if not quote_yes["is_complete"] or not quote_no["is_complete"]:
+            logger.warning(
+                "Binary preflight skipped: live book cannot fill both FOK legs",
+                market=opportunity.market.slug[:50],
+                yes_complete=quote_yes["is_complete"],
+                no_complete=quote_no["is_complete"],
+                yes_available=quote_yes["available_size_at_limit"],
+                no_available=quote_no["available_size_at_limit"],
+                size=target_size,
+            )
+            return None
+
+        depth_multiplier = max(settings.depth_safety_multiplier, 1.0)
+        if (
+            quote_yes["depth_ratio"] < depth_multiplier
+            or quote_no["depth_ratio"] < depth_multiplier
+        ):
+            logger.warning(
+                "Binary preflight skipped: live depth reserve too thin",
+                market=opportunity.market.slug[:50],
+                required_multiplier=depth_multiplier,
+                yes_depth_ratio=f"{quote_yes['depth_ratio']:.2f}",
+                no_depth_ratio=f"{quote_no['depth_ratio']:.2f}",
+                size=target_size,
+            )
+            return None
+
+        total_avg_cost = quote_yes["avg_price"] + quote_no["avg_price"]
+        net_profit_pct = 1.0 - total_avg_cost - opportunity.estimated_fee
+        if net_profit_pct < settings.profit_threshold:
+            logger.warning(
+                "Binary preflight skipped: live profit below threshold",
+                market=opportunity.market.slug[:50],
+                live_net_profit=f"{net_profit_pct:.2%}",
+                threshold=f"{settings.profit_threshold:.2%}",
+                yes_avg=quote_yes["avg_price"],
+                no_avg=quote_no["avg_price"],
+            )
+            return None
+
+        order_yes.price = quote_yes["max_price"]
+        order_yes.size = target_size
+        order_no.price = quote_no["max_price"]
+        order_no.size = target_size
+
+        logger.info(
+            "Binary preflight passed",
+            market=opportunity.market.slug[:50],
+            live_net_profit=f"{net_profit_pct:.2%}",
+            size=target_size,
+            yes_depth_ratio=f"{quote_yes['depth_ratio']:.2f}",
+            no_depth_ratio=f"{quote_no['depth_ratio']:.2f}",
+        )
+        return order_yes, order_no, {"yes": quote_yes, "no": quote_no}
+
+    async def _fetch_live_order_book(self, token_id: str) -> Optional[OrderBook]:
+        """Fetch and normalize a live CLOB book for execution preflight."""
+        try:
+            async with httpx.AsyncClient(timeout=3.0) as client:
+                response = await client.get(
+                    f"{CLOB_API_BASE_URL}/book",
+                    params={"token_id": token_id},
+                )
+                response.raise_for_status()
+                data = response.json()
+        except Exception as e:
+            logger.warning(
+                "Live CLOB book fetch failed",
+                token_id=token_id[:8],
+                error=repr(e),
+            )
+            return None
+
+        asks = self._parse_book_levels(data.get("asks", []), reverse=False)
+        bids = self._parse_book_levels(data.get("bids", []), reverse=True)
+        return OrderBook(
+            token_id=token_id,
+            bids=bids,
+            asks=asks,
+            timestamp=time.time(),
+        )
+
+    @staticmethod
+    def _parse_book_levels(raw_levels: list, reverse: bool) -> List[OrderBookLevel]:
+        levels = []
+        for raw_level in raw_levels:
+            try:
+                price = float(raw_level["price"])
+                size = float(raw_level["size"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if price > 0 and size > 0:
+                levels.append(OrderBookLevel(price=price, size=size))
+        levels.sort(key=lambda level: level.price, reverse=reverse)
+        return levels
+
+    @classmethod
+    def _quote_buy_tokens(
+        cls,
+        book: OrderBook,
+        raw_size: float,
+        raw_max_price: float,
+    ) -> dict:
+        max_price, size, order_usdc = cls._prepare_clob_order_values(
+            OrderSide.BUY,
+            raw_max_price,
+            raw_size,
+        )
+        if size <= 0 or order_usdc < MIN_MARKETABLE_ORDER_USDC:
+            return {
+                "is_complete": False,
+                "avg_price": None,
+                "max_price": max_price,
+                "size": size,
+                "order_usdc": order_usdc,
+                "levels_used": 0,
+                "available_size_at_limit": 0.0,
+                "depth_ratio": 0.0,
+            }
+
+        available_at_limit = sum(
+            level.size for level in book.asks if level.price <= max_price + 1e-9
+        )
+        remaining = size
+        total_cost = 0.0
+        levels_used = 0
+
+        for level in book.asks:
+            if level.price > max_price + 1e-9:
+                break
+            take_size = min(level.size, remaining)
+            if take_size <= 0:
+                continue
+            total_cost += take_size * level.price
+            remaining -= take_size
+            levels_used += 1
+            if remaining <= 1e-9:
+                break
+
+        is_complete = remaining <= 1e-9
+        avg_price = total_cost / size if is_complete and size > 0 else None
+        return {
+            "is_complete": is_complete,
+            "avg_price": avg_price,
+            "max_price": max_price,
+            "size": size,
+            "order_usdc": order_usdc,
+            "levels_used": levels_used,
+            "available_size_at_limit": available_at_limit,
+            "depth_ratio": available_at_limit / size if size > 0 else 0.0,
+        }
 
     async def execute_neg_risk_arbitrage(
         self,

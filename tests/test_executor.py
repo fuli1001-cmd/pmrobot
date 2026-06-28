@@ -11,6 +11,7 @@ from models.market import Market
 from models.order import (
     ArbitrageOpportunity,
     Order,
+    OrderBook,
     OrderBookLevel,
     OrderSide,
     OrderStatus,
@@ -50,12 +51,114 @@ async def test_concurrent_binary_both_failed_is_not_partial():
         estimated_fee=0.0,
     )
 
-    report = await executor.execute_arbitrage(opportunity)
+    report = await executor.execute_arbitrage(
+        opportunity,
+        validate_before_execute=False,
+    )
 
     assert report.result == ExecutionResult.FAILED
     assert report.order_yes.status == OrderStatus.FAILED
     assert report.order_no.status == OrderStatus.FAILED
     executor._emergency_exit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_binary_preflight_skips_without_opening_position_when_live_leg_unfillable():
+    executor = OrderExecutor.__new__(OrderExecutor)
+    executor.dry_run = False
+    executor._concurrent = False
+    executor._account_state = AccountState()
+    executor.proxy_wallet = None
+    executor._submit_order = AsyncMock()
+
+    market = Market(
+        condition_id="condition",
+        token_id_yes="yes_token",
+        token_id_no="no_token",
+        question="Test market?",
+        slug="test-market",
+    )
+    opportunity = ArbitrageOpportunity(
+        market=market,
+        avg_price_yes=0.51,
+        avg_price_no=0.39,
+        trade_size_usdc=4.0,
+        total_cost=0.90,
+        estimated_fee=0.0,
+    )
+
+    async def fetch_book(token_id):
+        if token_id == "yes_token":
+            return OrderBook(
+                token_id=token_id,
+                asks=[OrderBookLevel(price=0.51, size=40.0)],
+            )
+        return OrderBook(
+            token_id=token_id,
+            asks=[OrderBookLevel(price=0.39, size=2.0)],
+        )
+
+    executor._fetch_live_order_book = fetch_book
+
+    report = await executor.execute_arbitrage(opportunity)
+
+    assert report.result == ExecutionResult.SKIPPED
+    executor._submit_order.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_binary_preflight_executes_more_fragile_live_leg_first():
+    executor = OrderExecutor.__new__(OrderExecutor)
+    executor.dry_run = False
+    executor._concurrent = False
+    executor._account_state = AccountState()
+    executor.proxy_wallet = None
+    executor.get_account_balance = AsyncMock(return_value=100.0)
+
+    submitted = []
+
+    async def fill_order(order):
+        submitted.append(order.token_id)
+        order.status = OrderStatus.FILLED
+        order.filled_size = order.size
+        order.filled_avg_price = order.price
+        return order
+
+    executor._submit_order = fill_order
+
+    market = Market(
+        condition_id="condition",
+        token_id_yes="yes_token",
+        token_id_no="no_token",
+        question="Test market?",
+        slug="test-market",
+    )
+    opportunity = ArbitrageOpportunity(
+        market=market,
+        avg_price_yes=0.51,
+        avg_price_no=0.39,
+        trade_size_usdc=4.0,
+        total_cost=0.90,
+        estimated_fee=0.0,
+    )
+
+    async def fetch_book(token_id):
+        if token_id == "yes_token":
+            return OrderBook(
+                token_id=token_id,
+                asks=[OrderBookLevel(price=0.51, size=80.0)],
+            )
+        return OrderBook(
+            token_id=token_id,
+            asks=[OrderBookLevel(price=0.39, size=20.0)],
+        )
+
+    executor._fetch_live_order_book = fetch_book
+
+    report = await executor.execute_arbitrage(opportunity)
+
+    assert report.result == ExecutionResult.SUCCESS
+    assert submitted == ["no_token", "yes_token"]
 
 
 @pytest.mark.asyncio
