@@ -16,7 +16,12 @@ from config.settings import get_settings, Settings
 from config.constants import POLYGON_CHAIN_ID
 from core.scanner import MarketScanner
 from core.monitor import MarketMonitor, NegativeRiskArbitrageDetector, OrderBookManager, NegativeRiskMarketMonitor
-from core.executor import OrderExecutor, create_executor, ExecutionResult
+from core.executor import (
+    DRY_RUN_PREFLIGHT_PASSED,
+    OrderExecutor,
+    create_executor,
+    ExecutionResult,
+)
 from core.settler import PositionSettler, create_settler
 from core.ctf import CTFContract
 from core.risk import RiskManager, RiskConfig
@@ -627,7 +632,11 @@ class ArbitrageBot:
                         success=True,
                         extra_info=balance_info
                     )
-                elif result.result == ExecutionResult.SKIPPED and self.dry_run:
+                elif (
+                    result.result == ExecutionResult.SKIPPED
+                    and self.dry_run
+                    and result.error_message == DRY_RUN_PREFLIGHT_PASSED
+                ):
                     # Dry-run mode: record as simulated success
                     await self.risk_manager.record_success(
                         opportunity,
@@ -639,6 +648,12 @@ class ArbitrageBot:
                         market=opportunity.market.slug,
                         net_profit=f"{opportunity.net_profit_pct:.2%}",
                         profit_usdc=f"${opportunity.net_profit_usdc:.2f}",
+                    )
+                elif result.result == ExecutionResult.SKIPPED and self.dry_run:
+                    logger.info(
+                        "DRY RUN: Binary preflight rejected; not recording simulated arbitrage",
+                        market=opportunity.market.slug[:50],
+                        reason=result.error_message,
                     )
                 else:
                     is_partial = result.result == ExecutionResult.PARTIAL

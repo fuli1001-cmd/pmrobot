@@ -33,6 +33,9 @@ MIN_MARKETABLE_ORDER_USDC = 1.0
 MIN_POLYMARKET_CLIENT_VERSION = "0.1.0b9"
 EMERGENCY_EXIT_SETTLEMENT_DELAY_SECONDS = 3.0
 EMERGENCY_EXIT_FALLBACK_DISCOUNTS = (0.95, 0.90, 0.85, 0.80)
+LIVE_PREFLIGHT_REJECTED = "Live CLOB preflight rejected binary opportunity"
+DRY_RUN_PREFLIGHT_PASSED = "Dry run live preflight passed; order submission skipped"
+DRY_RUN_PREFLIGHT_REJECTED = "Dry run live preflight rejected binary opportunity"
 
 
 def _version_tuple(version: str) -> Tuple[int, ...]:
@@ -275,20 +278,6 @@ class OrderExecutor:
             order_type=OrderType.FOK,
         )
 
-        if self.dry_run:
-            logger.info(
-                "DRY RUN: Would execute arbitrage",
-                market=opportunity.market.slug,
-                profit=f"{opportunity.net_profit_pct:.4f}",
-            )
-            return ExecutionReport(
-                result=ExecutionResult.SKIPPED,
-                opportunity=opportunity,
-                order_yes=order_yes,
-                order_no=order_no,
-                execution_time_ms=0,
-            )
-
         try:
             concurrent = getattr(self, '_concurrent', False)
             preflight_quotes = None
@@ -301,15 +290,46 @@ class OrderExecutor:
                 )
                 if preflight_result is None:
                     execution_time = (time.time() - start_time) * 1000
+                    if self.dry_run:
+                        logger.info(
+                            "DRY RUN: Binary preflight_rejected; order submission skipped",
+                            market=opportunity.market.slug[:50],
+                            profit=f"{opportunity.net_profit_pct:.4f}",
+                            preflight_status="preflight_rejected",
+                        )
                     return ExecutionReport(
                         result=ExecutionResult.SKIPPED,
                         opportunity=opportunity,
                         order_yes=order_yes,
                         order_no=order_no,
                         execution_time_ms=execution_time,
-                        error_message="Live CLOB preflight rejected binary opportunity",
+                        error_message=(
+                            DRY_RUN_PREFLIGHT_REJECTED
+                            if self.dry_run
+                            else LIVE_PREFLIGHT_REJECTED
+                        ),
                     )
                 order_yes, order_no, preflight_quotes = preflight_result
+
+            if self.dry_run:
+                execution_time = (time.time() - start_time) * 1000
+                logger.info(
+                    "DRY RUN: Binary preflight_passed; order submission skipped",
+                    market=opportunity.market.slug[:50],
+                    profit=f"{opportunity.net_profit_pct:.4f}",
+                    yes_price=order_yes.price,
+                    no_price=order_no.price,
+                    size=order_yes.size,
+                    preflight_status="preflight_passed",
+                )
+                return ExecutionReport(
+                    result=ExecutionResult.SKIPPED,
+                    opportunity=opportunity,
+                    order_yes=order_yes,
+                    order_no=order_no,
+                    execution_time_ms=execution_time,
+                    error_message=DRY_RUN_PREFLIGHT_PASSED,
+                )
 
             if concurrent:
                 # Concurrent execution: fire both legs simultaneously.
