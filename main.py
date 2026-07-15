@@ -437,6 +437,8 @@ class ArbitrageBot:
             trade_size=self.settings.max_trade_size,
             max_slippage=self.settings.max_slippage,
             depth_safety_multiplier=self.settings.depth_safety_multiplier,
+            book_max_age_seconds=self.settings.binary_book_max_age_seconds,
+            book_max_skew_seconds=self.settings.binary_book_max_skew_seconds,
             on_opportunity=on_opportunity,
             on_short_opportunity=on_short_opportunity,
         )

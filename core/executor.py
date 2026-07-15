@@ -467,10 +467,12 @@ class OrderExecutor:
             self._fetch_live_order_book(opportunity.market.token_id_yes),
             self._fetch_live_order_book(opportunity.market.token_id_no),
         )
+        opportunity_age_ms = max((time.time() - opportunity.timestamp) * 1000, 0.0)
         if not book_yes or not book_no:
             logger.warning(
                 "Binary preflight skipped: could not fetch live order books",
                 market=opportunity.market.slug[:50],
+                opportunity_age_ms=f"{opportunity_age_ms:.0f}",
             )
             return None
 
@@ -491,6 +493,7 @@ class OrderExecutor:
                 "Binary preflight skipped: rounded token size is zero",
                 market=opportunity.market.slug[:50],
                 raw_size=order_yes.size,
+                opportunity_age_ms=f"{opportunity_age_ms:.0f}",
             )
             return None
 
@@ -506,6 +509,9 @@ class OrderExecutor:
                 yes_available=quote_yes["available_size_at_limit"],
                 no_available=quote_no["available_size_at_limit"],
                 size=target_size,
+                detector_yes_avg=f"{opportunity.avg_price_yes:.4f}",
+                detector_no_avg=f"{opportunity.avg_price_no:.4f}",
+                opportunity_age_ms=f"{opportunity_age_ms:.0f}",
             )
             return None
 
@@ -521,6 +527,7 @@ class OrderExecutor:
                 yes_depth_ratio=f"{quote_yes['depth_ratio']:.2f}",
                 no_depth_ratio=f"{quote_no['depth_ratio']:.2f}",
                 size=target_size,
+                opportunity_age_ms=f"{opportunity_age_ms:.0f}",
             )
             return None
 
@@ -534,6 +541,7 @@ class OrderExecutor:
                 threshold=f"{settings.profit_threshold:.2%}",
                 yes_avg=quote_yes["avg_price"],
                 no_avg=quote_no["avg_price"],
+                opportunity_age_ms=f"{opportunity_age_ms:.0f}",
             )
             return None
 
@@ -549,6 +557,7 @@ class OrderExecutor:
             size=target_size,
             yes_depth_ratio=f"{quote_yes['depth_ratio']:.2f}",
             no_depth_ratio=f"{quote_no['depth_ratio']:.2f}",
+            opportunity_age_ms=f"{opportunity_age_ms:.0f}",
         )
         return order_yes, order_no, {"yes": quote_yes, "no": quote_no}
 

@@ -75,6 +75,36 @@ class OrderBookManager:
         self._books[token_id] = book
         return book
 
+    def apply_price_change(
+        self,
+        token_id: str,
+        data: dict,
+        timestamp: Optional[float] = None,
+    ) -> Optional[OrderBook]:
+        """Apply one incremental CLOB price-level update to a full snapshot."""
+        book = self._books.get(token_id)
+        if book is None:
+            return None
+
+        side = str(data.get("side", "")).upper()
+        if side not in {"BUY", "SELL"}:
+            return None
+
+        try:
+            price = float(data["price"])
+            size = float(data["size"])
+        except (KeyError, TypeError, ValueError):
+            return None
+
+        levels = book.bids if side == "BUY" else book.asks
+        levels[:] = [level for level in levels if abs(level.price - price) > 1e-12]
+        if size > 0:
+            levels.append(OrderBookLevel(price=price, size=size))
+
+        levels.sort(key=lambda level: level.price, reverse=side == "BUY")
+        book.timestamp = timestamp if timestamp is not None else time.time()
+        return book
+
     def get(self, token_id: str) -> Optional[OrderBook]:
         """Get order book for a token."""
         return self._books.get(token_id)
@@ -703,6 +733,8 @@ class MarketMonitor:
         trade_size: float = 100.0,
         max_slippage: float = 0.002,
         depth_safety_multiplier: float = 1.5,
+        book_max_age_seconds: float = 2.0,
+        book_max_skew_seconds: float = 0.5,
         on_opportunity: Optional[Callable[[ArbitrageOpportunity], None]] = None,
         on_short_opportunity: Optional[Callable[[ShortArbitrageOpportunity], None]] = None,
     ):
@@ -715,6 +747,8 @@ class MarketMonitor:
             trade_size: Trade size in USDC
             max_slippage: Maximum allowed slippage
             depth_safety_multiplier: Required order book reserve multiple
+            book_max_age_seconds: Maximum age of either cached order book
+            book_max_skew_seconds: Maximum timestamp difference between paired books
             on_opportunity: Callback when long arbitrage opportunity is detected
             on_short_opportunity: Callback when short (Mint+Sell) opportunity is detected
         """
@@ -725,6 +759,8 @@ class MarketMonitor:
             self.token_to_market[m.token_id_no] = m
 
         self.profit_threshold = profit_threshold
+        self.book_max_age_seconds = book_max_age_seconds
+        self.book_max_skew_seconds = book_max_skew_seconds
         self.order_books = OrderBookManager()
         self.detector = ArbitrageDetector(
             profit_threshold=profit_threshold,
@@ -743,12 +779,20 @@ class MarketMonitor:
         # Debug counters
         self._message_count = 0
         self._book_update_count = 0
+        self._price_change_count = 0
+        self._stale_pair_skip_count = 0
+        self._last_stale_log: Dict[str, float] = {}
         self._last_log_time = time.time()
 
     async def start(self) -> None:
         """Start monitoring markets."""
         self._running = True
-        logger.info("Starting market monitor", num_markets=len(self.markets))
+        logger.info(
+            "Starting market monitor",
+            num_markets=len(self.markets),
+            book_max_age_seconds=self.book_max_age_seconds,
+            book_max_skew_seconds=self.book_max_skew_seconds,
+        )
 
         while self._running:
             try:
@@ -888,6 +932,8 @@ class MarketMonitor:
                     "WebSocket stats",
                     total_messages=self._message_count,
                     book_updates=self._book_update_count,
+                    price_changes=self._price_change_count,
+                    stale_pair_skips=self._stale_pair_skip_count,
                     markets_with_books=len(self.order_books._books),
                 )
                 self._last_log_time = now
@@ -917,10 +963,7 @@ class MarketMonitor:
         elif msg_type == "subscribed":
             logger.debug("Subscription confirmed")
         elif msg_type == "price_change":
-            # price_change events don't carry full order book depth data,
-            # so they cannot support depth penetration calculations.
-            # Ignore them; we rely on 'book' channel updates instead.
-            pass
+            await self._handle_price_change(data)
         elif "asset_id" in data and ("bids" in data or "asks" in data):
             # Initial snapshot format (no type field, just raw book data)
             self._book_update_count += 1
@@ -940,11 +983,72 @@ class MarketMonitor:
         if not market:
             return
 
-        # Get both order books
+        await self._detect_market(market)
+
+    async def _handle_price_change(self, data: dict) -> None:
+        """Apply a complete incremental update batch before running detection."""
+        received_at = time.time()
+        affected_markets: Dict[str, Market] = {}
+
+        for change in data.get("price_changes", []):
+            if not isinstance(change, dict):
+                continue
+
+            token_id = change.get("asset_id")
+            if not token_id:
+                continue
+
+            book = self.order_books.apply_price_change(
+                token_id,
+                change,
+                timestamp=received_at,
+            )
+            if book is None:
+                logger.debug(
+                    "Price change ignored before full book snapshot",
+                    token_id=token_id[:20],
+                )
+                continue
+
+            self._price_change_count += 1
+            market = self.token_to_market.get(token_id)
+            if market:
+                affected_markets[market.condition_id or market.slug] = market
+
+        for market in affected_markets.values():
+            await self._detect_market(market)
+
+    async def _detect_market(self, market: Market) -> None:
+        """Detect opportunities only from a fresh, synchronized book pair."""
         book_yes = self.order_books.get(market.token_id_yes)
         book_no = self.order_books.get(market.token_id_no)
 
         if not book_yes or not book_no:
+            return
+
+        now = time.time()
+        yes_age = max(now - book_yes.timestamp, 0.0)
+        no_age = max(now - book_no.timestamp, 0.0)
+        pair_skew = abs(book_yes.timestamp - book_no.timestamp)
+        if (
+            yes_age > self.book_max_age_seconds
+            or no_age > self.book_max_age_seconds
+            or pair_skew > self.book_max_skew_seconds
+        ):
+            self._stale_pair_skip_count += 1
+            market_id = market.condition_id or market.slug
+            last_log = self._last_stale_log.get(market_id, 0.0)
+            if now - last_log >= 60.0:
+                logger.debug(
+                    "Binary detection skipped: stale or unsynchronized books",
+                    market=market.slug[:50],
+                    yes_age_ms=f"{yes_age * 1000:.0f}",
+                    no_age_ms=f"{no_age * 1000:.0f}",
+                    pair_skew_ms=f"{pair_skew * 1000:.0f}",
+                    max_age_ms=f"{self.book_max_age_seconds * 1000:.0f}",
+                    max_skew_ms=f"{self.book_max_skew_seconds * 1000:.0f}",
+                )
+                self._last_stale_log[market_id] = now
             return
 
         # Check for long arbitrage (Buy-Yes + Buy-No < $1)
@@ -958,6 +1062,11 @@ class MarketMonitor:
                 net_profit=f"{opportunity.net_profit_pct:.2%}",
                 profit_usdc=f"${opportunity.net_profit_usdc:.2f}",
                 threshold=f"{self.profit_threshold:.2%}",
+                yes_avg=f"{opportunity.avg_price_yes:.4f}",
+                no_avg=f"{opportunity.avg_price_no:.4f}",
+                yes_book_age_ms=f"{yes_age * 1000:.0f}",
+                no_book_age_ms=f"{no_age * 1000:.0f}",
+                pair_skew_ms=f"{pair_skew * 1000:.0f}",
             )
             
             if self.on_opportunity:

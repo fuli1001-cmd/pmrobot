@@ -5,7 +5,7 @@ import time
 
 from models.market import Market, FeeCategory
 from models.order import OrderBook, OrderBookLevel, ArbitrageOpportunity
-from core.monitor import OrderBookManager, ArbitrageDetector
+from core.monitor import OrderBookManager, ArbitrageDetector, MarketMonitor
 
 
 class TestOrderBookManager:
@@ -50,6 +50,147 @@ class TestOrderBookManager:
 
         assert yes_book is not None
         assert no_book is not None
+
+    def test_apply_price_change_updates_and_removes_levels(self, manager):
+        manager.update(
+            "token_1",
+            {
+                "bids": [{"price": "0.44", "size": "10"}],
+                "asks": [
+                    {"price": "0.46", "size": "20"},
+                    {"price": "0.47", "size": "30"},
+                ],
+            },
+        )
+
+        manager.apply_price_change(
+            "token_1",
+            {"side": "SELL", "price": "0.46", "size": "25"},
+            timestamp=100.0,
+        )
+        manager.apply_price_change(
+            "token_1",
+            {"side": "SELL", "price": "0.47", "size": "0"},
+            timestamp=100.0,
+        )
+        manager.apply_price_change(
+            "token_1",
+            {"side": "BUY", "price": "0.45", "size": "12"},
+            timestamp=100.0,
+        )
+
+        book = manager.get("token_1")
+        assert [(level.price, level.size) for level in book.asks] == [(0.46, 25.0)]
+        assert [(level.price, level.size) for level in book.bids] == [
+            (0.45, 12.0),
+            (0.44, 10.0),
+        ]
+        assert book.timestamp == 100.0
+
+    def test_apply_price_change_requires_full_snapshot(self, manager):
+        result = manager.apply_price_change(
+            "missing",
+            {"side": "SELL", "price": "0.46", "size": "25"},
+        )
+
+        assert result is None
+        assert manager.get("missing") is None
+
+
+class TestMarketMonitor:
+    @pytest.fixture
+    def sample_market(self):
+        return Market(
+            condition_id="0x123",
+            token_id_yes="yes_token",
+            token_id_no="no_token",
+            question="Test Market?",
+            slug="test-market",
+            fee_category=FeeCategory.FREE,
+        )
+
+    @pytest.mark.asyncio
+    async def test_price_change_batch_is_applied_before_detection(self, sample_market):
+        opportunities = []
+        monitor = MarketMonitor(
+            markets=[sample_market],
+            profit_threshold=0.03,
+            trade_size=3.0,
+            depth_safety_multiplier=1.0,
+            on_opportunity=opportunities.append,
+        )
+        monitor.order_books.update(
+            "yes_token",
+            {"bids": [], "asks": [{"price": "0.55", "size": "100"}]},
+        )
+        monitor.order_books.update(
+            "no_token",
+            {"bids": [], "asks": [{"price": "0.55", "size": "100"}]},
+        )
+
+        await monitor._process_single_message(
+            {
+                "event_type": "price_change",
+                "price_changes": [
+                    {
+                        "asset_id": "yes_token",
+                        "side": "SELL",
+                        "price": "0.55",
+                        "size": "0",
+                    },
+                    {
+                        "asset_id": "yes_token",
+                        "side": "SELL",
+                        "price": "0.45",
+                        "size": "100",
+                    },
+                    {
+                        "asset_id": "no_token",
+                        "side": "SELL",
+                        "price": "0.55",
+                        "size": "0",
+                    },
+                    {
+                        "asset_id": "no_token",
+                        "side": "SELL",
+                        "price": "0.45",
+                        "size": "100",
+                    },
+                ],
+            }
+        )
+
+        assert len(opportunities) == 1
+        assert opportunities[0].avg_price_yes == pytest.approx(0.45)
+        assert opportunities[0].avg_price_no == pytest.approx(0.45)
+        assert monitor._price_change_count == 4
+
+    @pytest.mark.asyncio
+    async def test_stale_pair_is_not_detected(self, sample_market):
+        opportunities = []
+        monitor = MarketMonitor(
+            markets=[sample_market],
+            profit_threshold=0.03,
+            trade_size=3.0,
+            depth_safety_multiplier=1.0,
+            book_max_age_seconds=2.0,
+            book_max_skew_seconds=0.5,
+            on_opportunity=opportunities.append,
+        )
+        monitor.order_books.update(
+            "yes_token",
+            {"bids": [], "asks": [{"price": "0.45", "size": "100"}]},
+        )
+        no_book = monitor.order_books.update(
+            "no_token",
+            {"bids": [], "asks": [{"price": "0.45", "size": "100"}]},
+        )
+        no_book.timestamp -= 3.0
+
+        await monitor._detect_market(sample_market)
+
+        assert opportunities == []
+        assert monitor._stale_pair_skip_count == 1
 
 
 class TestOrderBook:
@@ -243,9 +384,9 @@ class TestArbitrageOpportunity:
             timestamp=time.time(),
         )
 
-        assert opportunity.gross_profit_pct == 0.10
-        assert opportunity.net_profit_pct == 0.10
-        assert opportunity.net_profit_usdc == 10.0
+        assert opportunity.gross_profit_pct == pytest.approx(0.10)
+        assert opportunity.net_profit_pct == pytest.approx(0.10)
+        assert opportunity.net_profit_usdc == pytest.approx(10.0)
 
     def test_is_profitable_with_threshold(self, sample_market):
         """Test profitability check with threshold."""

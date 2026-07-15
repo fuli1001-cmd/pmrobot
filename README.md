@@ -514,6 +514,8 @@ curl https://polymarket.com/api/geoblock
 | 最大下单金额 | `MAX_TRADE_SIZE` | 100.0 | 1~10000 | 实际下单金额上限，最终金额会按订单簿深度动态下调 |
 | 深度安全倍数 | `DEPTH_SAFETY_MULTIPLIER` | 1.5 | 1~10 | 要求每条腿具备的订单簿冗余倍数，越大越保守 |
 | 最大滑点 | `MAX_SLIPPAGE` | 0.002 (0.2%) | 0.01%~5% | 加权均价偏差上限 |
+| Binary 盘口最大年龄 | `BINARY_BOOK_MAX_AGE_SECONDS` | 2.0 秒 | 0.1~60 | 超时盘口不参与机会检测 |
+| Binary 双侧最大时间差 | `BINARY_BOOK_MAX_SKEW_SECONDS` | 0.5 秒 | 0.01~10 | YES/NO 更新时间差超过该值时跳过检测 |
 | 合并间隔 | `MERGE_INTERVAL` | 600 (10min) | 60~3600 | Settler 自动合并周期 |
 | 刷新间隔 | `MARKET_REFRESH_INTERVAL` | 1800 (30min) | 0~86400 | 全量市场 + 跨平台扫描间隔 |
 

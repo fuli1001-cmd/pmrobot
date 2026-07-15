@@ -72,6 +72,18 @@ class Settings(BaseSettings):
         le=10.0,
         description="Required order book reserve multiple before taking a trade",
     )
+    binary_book_max_age_seconds: float = Field(
+        2.0,
+        ge=0.1,
+        le=60.0,
+        description="Maximum age of either Binary WebSocket order book",
+    )
+    binary_book_max_skew_seconds: float = Field(
+        0.5,
+        ge=0.01,
+        le=10.0,
+        description="Maximum timestamp difference between Binary Yes/No books",
+    )
     max_slippage: float = Field(
         0.002, ge=0.0001, le=0.05, description="Maximum allowed slippage (0.2%)"
     )
