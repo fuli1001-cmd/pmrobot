@@ -21,6 +21,16 @@ from utils.logger import get_logger
 logger = get_logger(__name__)
 
 
+def _market_subscription(token_ids: List[str], initial: bool) -> dict:
+    """Build a current Polymarket market-channel subscription message."""
+    subscription = {"assets_ids": token_ids}
+    if initial:
+        subscription.update(type="market", custom_feature_enabled=True)
+    else:
+        subscription.update(operation="subscribe", custom_feature_enabled=True)
+    return subscription
+
+
 def _is_transient_ws_error(error: Exception) -> bool:
     """Return True for reconnectable websocket/network errors."""
     error_text = repr(error)
@@ -774,12 +784,14 @@ class MarketMonitor:
         self._ws: Optional[websockets.WebSocketClientProtocol] = None
         self._running = False
         self._reconnect_delay = 1.0
-        self._heartbeat_interval = 30.0  # Ping every 30 seconds
+        self._heartbeat_interval = 10.0
         
         # Debug counters
         self._message_count = 0
         self._book_update_count = 0
         self._price_change_count = 0
+        self._price_change_ignored_count = 0
+        self._tokens_awaiting_snapshot: Set[str] = set()
         self._stale_pair_skip_count = 0
         self._last_stale_log: Dict[str, float] = {}
         self._last_log_time = time.time()
@@ -843,11 +855,7 @@ class MarketMonitor:
                 count += 1
 
         if new_tokens_to_sub and self._ws:
-            subscribe_msg = {
-                "type": "subscribe",
-                "channel": "book",
-                "assets_ids": new_tokens_to_sub,
-            }
+            subscribe_msg = _market_subscription(new_tokens_to_sub, initial=False)
             await self._ws.send(json.dumps(subscribe_msg))
             logger.info(
                 "Subscribed to new Binary tokens",
@@ -863,17 +871,14 @@ class MarketMonitor:
 
             # I4: Discard stale order-book state from previous connection
             self.order_books = OrderBookManager()
+            self._tokens_awaiting_snapshot.clear()
 
             # Subscribe to all token order books
             token_ids = []
             for market in self.markets.values():
                 token_ids.extend([market.token_id_yes, market.token_id_no])
 
-            subscribe_msg = {
-                "type": "subscribe",
-                "channel": "book",
-                "assets_ids": token_ids,
-            }
+            subscribe_msg = _market_subscription(token_ids, initial=True)
             await ws.send(json.dumps(subscribe_msg))
             logger.info("Subscribed to order books", num_tokens=len(token_ids))
 
@@ -888,7 +893,7 @@ class MarketMonitor:
         while self._running:
             try:
                 await asyncio.sleep(self._heartbeat_interval)
-                await ws.ping()
+                await ws.send("PING")
                 logger.debug("Heartbeat ping sent")
             except Exception:
                 break  # Connection closed
@@ -905,6 +910,8 @@ class MarketMonitor:
         try:
             # Skip empty messages (e.g. during reconnection)
             if not message or message.isspace():
+                return
+            if message.strip().upper() == "PONG":
                 return
 
             data = json.loads(message)
@@ -933,6 +940,8 @@ class MarketMonitor:
                     total_messages=self._message_count,
                     book_updates=self._book_update_count,
                     price_changes=self._price_change_count,
+                    price_changes_ignored_before_snapshot=self._price_change_ignored_count,
+                    tokens_awaiting_snapshot=len(self._tokens_awaiting_snapshot),
                     stale_pair_skips=self._stale_pair_skip_count,
                     markets_with_books=len(self.order_books._books),
                 )
@@ -977,6 +986,7 @@ class MarketMonitor:
 
         # Update order book
         self.order_books.update(token_id, data)
+        self._tokens_awaiting_snapshot.discard(token_id)
 
         # Find market for this token
         market = self.token_to_market.get(token_id)
@@ -1004,10 +1014,8 @@ class MarketMonitor:
                 timestamp=received_at,
             )
             if book is None:
-                logger.debug(
-                    "Price change ignored before full book snapshot",
-                    token_id=token_id[:20],
-                )
+                self._price_change_ignored_count += 1
+                self._tokens_awaiting_snapshot.add(token_id)
                 continue
 
             self._price_change_count += 1
@@ -1132,7 +1140,7 @@ class NegativeRiskMarketMonitor:
         self._ws: Optional[websockets.WebSocketClientProtocol] = None
         self._running = False
         self._reconnect_delay = 1.0
-        self._heartbeat_interval = 30.0  # Ping every 30 seconds
+        self._heartbeat_interval = 10.0
         
         # Track which events have been checked recently to avoid duplicate checks
         self._last_check_time: Dict[str, float] = {}
@@ -1194,7 +1202,7 @@ class NegativeRiskMarketMonitor:
             # Subscribe to all tokens
             all_tokens = list(self.token_to_event.keys())
             logger.info("NegRisk: About to subscribe", num_tokens=len(all_tokens))
-            await self._subscribe(all_tokens)
+            await self._subscribe(all_tokens, initial=True)
             logger.info("NegRisk: Waiting for messages...")
 
             # Run message handler and heartbeat concurrently
@@ -1208,7 +1216,7 @@ class NegativeRiskMarketMonitor:
         while self._running:
             try:
                 await asyncio.sleep(self._heartbeat_interval)
-                await ws.ping()
+                await ws.send("PING")
                 logger.debug("NegRisk: Heartbeat ping sent")
             except Exception:
                 break  # Connection closed
@@ -1244,7 +1252,7 @@ class NegativeRiskMarketMonitor:
         else:
             logger.debug("Monitor update called but no new events found")
 
-    async def _subscribe(self, token_ids: List[str]) -> None:
+    async def _subscribe(self, token_ids: List[str], initial: bool = False) -> None:
         """Subscribe to order books for given tokens in batches."""
         # Polymarket WebSocket has limits on subscription message size
         # Split into batches of 2000 tokens max
@@ -1262,11 +1270,10 @@ class NegativeRiskMarketMonitor:
             batch = token_ids[i:i + BATCH_SIZE]
             batch_num = (i // BATCH_SIZE) + 1
             
-            subscription = {
-                "type": "subscribe",
-                "channel": "book",
-                "assets_ids": batch,  # Fixed: was "asset_ids", Polymarket expects "assets_ids"
-            }
+            subscription = _market_subscription(
+                batch,
+                initial=initial and batch_num == 1,
+            )
             subscription_json = json.dumps(subscription)
             
             logger.info(
@@ -1291,6 +1298,8 @@ class NegativeRiskMarketMonitor:
         try:
             # Skip empty messages
             if not message or message.isspace():
+                return
+            if message.strip().upper() == "PONG":
                 return
                 
             data = json.loads(message)

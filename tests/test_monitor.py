@@ -5,7 +5,25 @@ import time
 
 from models.market import Market, FeeCategory
 from models.order import OrderBook, OrderBookLevel, ArbitrageOpportunity
-from core.monitor import OrderBookManager, ArbitrageDetector, MarketMonitor
+from core.monitor import (
+    ArbitrageDetector,
+    MarketMonitor,
+    OrderBookManager,
+    _market_subscription,
+)
+
+
+def test_market_subscription_formats():
+    assert _market_subscription(["token_1"], initial=True) == {
+        "assets_ids": ["token_1"],
+        "type": "market",
+        "custom_feature_enabled": True,
+    }
+    assert _market_subscription(["token_2"], initial=False) == {
+        "assets_ids": ["token_2"],
+        "operation": "subscribe",
+        "custom_feature_enabled": True,
+    }
 
 
 class TestOrderBookManager:
@@ -191,6 +209,37 @@ class TestMarketMonitor:
 
         assert opportunities == []
         assert monitor._stale_pair_skip_count == 1
+
+    @pytest.mark.asyncio
+    async def test_price_change_before_snapshot_is_aggregated(self, sample_market):
+        monitor = MarketMonitor(markets=[sample_market])
+
+        await monitor._process_single_message(
+            {
+                "event_type": "price_change",
+                "price_changes": [
+                    {
+                        "asset_id": "yes_token",
+                        "side": "SELL",
+                        "price": "0.45",
+                        "size": "100",
+                    }
+                ],
+            }
+        )
+
+        assert monitor._price_change_ignored_count == 1
+        assert monitor._tokens_awaiting_snapshot == {"yes_token"}
+
+        await monitor._handle_book_update(
+            {
+                "asset_id": "yes_token",
+                "bids": [],
+                "asks": [{"price": "0.45", "size": "100"}],
+            }
+        )
+
+        assert monitor._tokens_awaiting_snapshot == set()
 
 
 class TestOrderBook:
