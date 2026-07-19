@@ -126,6 +126,23 @@ class Settings(BaseSettings):
         True,
         description="Enable Polymarket short mint+sell arbitrage executor",
     )
+    pm_max_binary_markets: int = Field(
+        500,
+        ge=1,
+        le=5000,
+        description="Maximum active Binary markets kept in WebSocket monitoring",
+    )
+    pm_max_neg_risk_events: int = Field(
+        25,
+        ge=1,
+        le=500,
+        description="Maximum active Negative Risk events kept in WebSocket monitoring",
+    )
+    pm_min_market_liquidity: float = Field(
+        100.0,
+        ge=0.0,
+        description="Minimum reported market or event liquidity in USDC",
+    )
     short_sell_balance_timeout: float = Field(
         12.0,
         ge=0.0,

@@ -7,12 +7,19 @@ import pytest
 
 import core.executor as executor_module
 from core.executor import (
+    DRY_RUN_NEG_RISK_PREFLIGHT_PASSED,
+    DRY_RUN_NEG_RISK_PREFLIGHT_REJECTED,
     DRY_RUN_PREFLIGHT_PASSED,
     DRY_RUN_PREFLIGHT_REJECTED,
     ExecutionResult,
     OrderExecutor,
 )
-from models.market import Market
+from models.market import (
+    Market,
+    NegativeRiskArbitrageOpportunity,
+    NegativeRiskEvent,
+    NegativeRiskStrategy,
+)
 from models.order import (
     ArbitrageOpportunity,
     Order,
@@ -256,6 +263,93 @@ async def test_dry_run_binary_rejects_when_live_preflight_fails():
     assert report.result == ExecutionResult.SKIPPED
     assert report.error_message == DRY_RUN_PREFLIGHT_REJECTED
     executor._submit_order.assert_not_awaited()
+
+
+def _neg_risk_opportunity() -> NegativeRiskArbitrageOpportunity:
+    outcomes = [
+        Market(
+            condition_id=f"condition_{index}",
+            token_id_yes=f"yes_{index}",
+            token_id_no=f"no_{index}",
+            question=f"Outcome {index}?",
+            slug=f"outcome-{index}",
+        )
+        for index in range(3)
+    ]
+    event = NegativeRiskEvent(
+        event_id="event_1",
+        title="Test NegRisk event",
+        slug="test-neg-risk",
+        outcomes=outcomes,
+    )
+    return NegativeRiskArbitrageOpportunity(
+        event=event,
+        strategy=NegativeRiskStrategy.BUY_ALL_YES,
+        outcome_prices={outcome.condition_id: 0.20 for outcome in outcomes},
+        trade_size_usdc=3.0,
+        token_size=5.0,
+        total_cost=0.60,
+        expected_payout=1.0,
+    )
+
+
+@pytest.mark.asyncio
+async def test_dry_run_neg_risk_runs_live_preflight_and_preserves_equal_token_size():
+    executor = OrderExecutor.__new__(OrderExecutor)
+    executor.dry_run = True
+    executor._account_state = AccountState()
+    opportunity = _neg_risk_opportunity()
+
+    async def fetch_books(token_ids):
+        return {
+            token_id: OrderBook(
+                token_id=token_id,
+                asks=[OrderBookLevel(price=0.20, size=100.0)],
+            )
+            for token_id in token_ids
+        }
+
+    executor._fetch_live_order_books = fetch_books
+    original_preflight = executor._preflight_neg_risk_arbitrage
+    captured_sizes = []
+
+    async def capture_preflight(preflight_opportunity, orders):
+        prepared = await original_preflight(preflight_opportunity, orders)
+        if prepared:
+            captured_sizes.extend(order.size for order in prepared)
+        return prepared
+
+    executor._preflight_neg_risk_arbitrage = capture_preflight
+
+    report = await executor.execute_neg_risk_arbitrage(opportunity)
+
+    assert report.result == ExecutionResult.SKIPPED
+    assert report.error_message == DRY_RUN_NEG_RISK_PREFLIGHT_PASSED
+    assert captured_sizes == [5.0, 5.0, 5.0]
+
+
+@pytest.mark.asyncio
+async def test_dry_run_neg_risk_rejects_incomplete_live_vector():
+    executor = OrderExecutor.__new__(OrderExecutor)
+    executor.dry_run = True
+    executor._account_state = AccountState()
+    opportunity = _neg_risk_opportunity()
+
+    async def fetch_books(token_ids):
+        return {
+            token_id: OrderBook(
+                token_id=token_id,
+                asks=[OrderBookLevel(price=0.20, size=100.0)],
+            )
+            for token_id in token_ids[:-1]
+        }
+
+    executor._fetch_live_order_books = fetch_books
+
+    report = await executor.execute_neg_risk_arbitrage(opportunity)
+
+    assert report.result == ExecutionResult.SKIPPED
+    assert report.error_message == DRY_RUN_NEG_RISK_PREFLIGHT_REJECTED
 
 
 @pytest.mark.asyncio

@@ -5,10 +5,12 @@ import json
 import time
 from typing import Callable, Dict, List, Optional, Set
 
+import httpx
 import websockets
 from websockets.exceptions import ConnectionClosed
 
 from config.constants import (
+    CLOB_API_BASE_URL,
     CLOB_WS_URL, 
     get_profit_threshold,
     ESTIMATED_MINT_GAS_COST_USD,
@@ -20,15 +22,41 @@ from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
+WS_SUBSCRIPTION_SHARD_SIZE = 500
+WS_SNAPSHOT_BACKFILL_DELAY_SECONDS = 3.0
+WS_MIN_SNAPSHOT_COVERAGE = 0.95
+
 
 def _market_subscription(token_ids: List[str], initial: bool) -> dict:
     """Build a current Polymarket market-channel subscription message."""
-    subscription = {"assets_ids": token_ids}
+    subscription = {"assets_ids": token_ids, "initial_dump": True}
     if initial:
         subscription.update(type="market", custom_feature_enabled=True)
     else:
         subscription.update(operation="subscribe", custom_feature_enabled=True)
     return subscription
+
+
+def _token_shards(token_ids: List[str], shard_size: int = WS_SUBSCRIPTION_SHARD_SIZE) -> List[List[str]]:
+    """Split de-duplicated token IDs into stable WebSocket shards."""
+    unique_tokens = list(dict.fromkeys(token_ids))
+    return [unique_tokens[i:i + shard_size] for i in range(0, len(unique_tokens), shard_size)]
+
+
+async def _fetch_order_book_snapshots(token_ids: List[str]) -> List[dict]:
+    """Fetch full CLOB books in batches for WebSocket snapshot backfill."""
+    snapshots: List[dict] = []
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        for batch in _token_shards(token_ids):
+            response = await client.post(
+                f"{CLOB_API_BASE_URL}/books",
+                json=[{"token_id": token_id} for token_id in batch],
+            )
+            response.raise_for_status()
+            payload = response.json()
+            if isinstance(payload, list):
+                snapshots.extend(item for item in payload if isinstance(item, dict))
+    return snapshots
 
 
 def _is_transient_ws_error(error: Exception) -> bool:
@@ -122,6 +150,18 @@ class OrderBookManager:
     def get_pair(self, yes_token_id: str, no_token_id: str) -> tuple:
         """Get order books for a Yes/No pair."""
         return self.get(yes_token_id), self.get(no_token_id)
+
+    def remove_many(self, token_ids: Set[str]) -> None:
+        """Remove books whose subscriptions are no longer active."""
+        for token_id in token_ids:
+            self._books.pop(token_id, None)
+
+    def coverage(self, token_ids: Set[str]) -> float:
+        """Return the fraction of expected tokens with a full snapshot."""
+        if not token_ids:
+            return 1.0
+        available = sum(token_id in self._books for token_id in token_ids)
+        return available / len(token_ids)
 
 
 class ArbitrageDetector:
@@ -384,7 +424,7 @@ class NegativeRiskArbitrageDetector:
 
         Args:
             profit_threshold: Minimum profit threshold (e.g., 0.008 = 0.8%)
-            trade_size: Trade size in USDC per outcome
+            trade_size: Maximum total USDC budget across all outcome legs
             max_slippage: Maximum allowed slippage
             cooldown_seconds: Seconds to wait before re-detecting same event
         """
@@ -394,35 +434,36 @@ class NegativeRiskArbitrageDetector:
         self.cooldown_seconds = cooldown_seconds
         self._check_count = 0
         self._last_opportunity: dict[str, float] = {}  # event_id -> timestamp
-        self._min_trade_size = 10.0  # Floor: don't bother below $10
 
-    def _effective_trade_size(
+    def _effective_token_size(
         self,
         event: NegativeRiskEvent,
         order_books: "OrderBookManager",
         side: str = "yes",
     ) -> float:
-        """
-        Return the maximum trade size supported by the shallowest leg.
+        """Return an equal token quantity within the configured total budget."""
+        if not event.outcomes:
+            return 0.0
 
-        Clamps self.trade_size down to avoid exceeding available depth.
-        """
-        n = len(event.outcomes)
-        if n == 0:
-            return self.trade_size
-        per_leg = self.trade_size / n
-        min_depth = float("inf")
+        books: List[OrderBook] = []
+        best_price_sum = 0.0
         for outcome in event.outcomes:
             token_id = outcome.token_id_yes if side == "yes" else outcome.token_id_no
             book = order_books.get(token_id)
-            if book:
-                depth = book.get_available_depth(side="ask")
-                min_depth = min(min_depth, depth)
-            else:
-                return self._min_trade_size  # Missing book → fall back to min
-        # Scale back so the smallest leg still fits; don't go below floor
-        capped = min(self.trade_size, min_depth * n * 0.8)  # 80% of shallowest leg
-        return max(capped, self._min_trade_size)
+            if not book or not book.asks or not book.best_ask:
+                return 0.0
+            books.append(book)
+            best_price_sum += book.best_ask
+
+        if best_price_sum <= 0:
+            return 0.0
+
+        budget_limited_size = self.trade_size / best_price_sum
+        depth_limited_size = min(
+            sum(level.size for level in book.asks[:5]) * 0.8
+            for book in books
+        )
+        return max(min(budget_limited_size, depth_limited_size), 0.0)
 
     def detect(
         self,
@@ -461,8 +502,11 @@ class NegativeRiskArbitrageDetector:
                 check_num=self._check_count,
             )
 
-        # Use dynamic threshold based on outcome count
-        effective_threshold = get_profit_threshold(event.outcome_count)
+        # Dynamic thresholds may tighten the configured floor, never lower it.
+        effective_threshold = max(
+            self.profit_threshold,
+            get_profit_threshold(event.outcome_count),
+        )
 
         # Quick sum calculation for debug logging (before full detection)
         sum_yes = 0.0
@@ -481,12 +525,10 @@ class NegativeRiskArbitrageDetector:
             else:
                 missing_books += 1
         
-        # CRITICAL FIX: Skip events with too much missing data
-        # If more than 30% of tokens have no liquidity, this is not a real opportunity
         total_tokens = event.outcome_count * 2  # Yes + No for each outcome
         missing_ratio = missing_books / total_tokens
         
-        if missing_ratio > 0.3:
+        if missing_books:
             if self._check_count % 500 == 1:
                 logger.debug(
                     "Skipping event due to insufficient liquidity",
@@ -495,7 +537,7 @@ class NegativeRiskArbitrageDetector:
                     missing_books=missing_books,
                     total_tokens=total_tokens,
                 )
-            return None  # Not enough liquidity for real arbitrage
+            return None
         
         # Log sample for visibility (only for events with sufficient data)
         if self._check_count % 500 == 1:
@@ -548,7 +590,9 @@ class NegativeRiskArbitrageDetector:
         Condition: sum(Yes prices) < 1 - threshold - fees
         Profit: 1 - sum(Yes prices)
         """
-        effective_size = self._effective_trade_size(event, order_books, side="yes")
+        token_size = self._effective_token_size(event, order_books, side="yes")
+        if token_size <= 0:
+            return None
         outcome_prices = {}
         total_yes_cost = 0.0
 
@@ -558,12 +602,17 @@ class NegativeRiskArbitrageDetector:
                 return None
 
             # Get best ask price for Yes
-            avg_price = book_yes.calculate_average_buy_price(effective_size / len(event.outcomes))
+            avg_price = book_yes.calculate_average_buy_price_for_tokens(token_size)
             if avg_price is None:
+                return None
+            if avg_price * token_size < 1.0:
                 return None
 
             outcome_prices[outcome.condition_id] = avg_price
             total_yes_cost += avg_price
+
+        if total_yes_cost * token_size > self.trade_size + 1e-9:
+            return None
 
         # Calculate profit
         expected_payout = 1.0  # Only one Yes will be worth 1
@@ -587,7 +636,8 @@ class NegativeRiskArbitrageDetector:
             event=event,
             strategy=NegativeRiskStrategy.BUY_ALL_YES,
             outcome_prices=outcome_prices,
-            trade_size_usdc=effective_size,
+            trade_size_usdc=total_yes_cost * token_size,
+            token_size=token_size,
             total_cost=total_yes_cost,
             expected_payout=expected_payout,
             estimated_fee=0.0,  # Assume fee-free for now
@@ -605,7 +655,9 @@ class NegativeRiskArbitrageDetector:
         Condition: sum(No prices) < N-1 - threshold - fees
         Profit: (N-1) - sum(No prices)
         """
-        effective_size = self._effective_trade_size(event, order_books, side="no")
+        token_size = self._effective_token_size(event, order_books, side="no")
+        if token_size <= 0:
+            return None
         outcome_prices = {}
         total_no_cost = 0.0
         n = event.outcome_count
@@ -616,12 +668,17 @@ class NegativeRiskArbitrageDetector:
                 return None
 
             # Get best ask price for No
-            avg_price = book_no.calculate_average_buy_price(effective_size / n)
+            avg_price = book_no.calculate_average_buy_price_for_tokens(token_size)
             if avg_price is None:
+                return None
+            if avg_price * token_size < 1.0:
                 return None
 
             outcome_prices[outcome.condition_id] = avg_price
             total_no_cost += avg_price
+
+        if total_no_cost * token_size > self.trade_size + 1e-9:
+            return None
 
         # Calculate profit
         # When one outcome wins, that No = 0, all other (N-1) No = 1
@@ -646,7 +703,8 @@ class NegativeRiskArbitrageDetector:
             event=event,
             strategy=NegativeRiskStrategy.BUY_ALL_NO,
             outcome_prices=outcome_prices,
-            trade_size_usdc=effective_size,
+            trade_size_usdc=total_no_cost * token_size,
+            token_size=token_size,
             total_cost=total_no_cost,
             expected_payout=expected_payout,
             estimated_fee=0.0,
@@ -672,7 +730,9 @@ class NegativeRiskArbitrageDetector:
         total_yes_cost = 0.0
         total_no_cost = 0.0
         n = event.outcome_count
-        effective_size = self._effective_trade_size(event, order_books, side="no")
+        token_size = self._effective_token_size(event, order_books, side="no")
+        if token_size <= 0:
+            return None
 
         for outcome in event.outcomes:
             book_yes = order_books.get(outcome.token_id_yes)
@@ -688,12 +748,17 @@ class NegativeRiskArbitrageDetector:
             total_yes_cost += yes_price
             
             # Get No price (for buying)
-            no_avg_price = book_no.calculate_average_buy_price(effective_size / n)
+            no_avg_price = book_no.calculate_average_buy_price_for_tokens(token_size)
             if no_avg_price is None:
+                return None
+            if no_avg_price * token_size < 1.0:
                 return None
             
             outcome_no_prices[outcome.condition_id] = no_avg_price
             total_no_cost += no_avg_price
+
+        if total_no_cost * token_size > self.trade_size + 1e-9:
+            return None
 
         # Check if sum(Yes) > 1 (market is overpriced)
         if total_yes_cost <= 1.0:
@@ -723,7 +788,8 @@ class NegativeRiskArbitrageDetector:
             event=event,
             strategy=NegativeRiskStrategy.SHORT_REBALANCE,
             outcome_prices=outcome_no_prices,
-            trade_size_usdc=effective_size,
+            trade_size_usdc=total_no_cost * token_size,
+            token_size=token_size,
             total_cost=total_no_cost,
             expected_payout=expected_payout,
             estimated_fee=0.0,
@@ -781,9 +847,10 @@ class MarketMonitor:
         self.on_opportunity = on_opportunity
         self.on_short_opportunity = on_short_opportunity
 
-        self._ws: Optional[websockets.WebSocketClientProtocol] = None
+        self._connections: Set[websockets.WebSocketClientProtocol] = set()
+        self._subscriptions_changed = asyncio.Event()
+        self._subscription_revision = 0
         self._running = False
-        self._reconnect_delay = 1.0
         self._heartbeat_interval = 10.0
         
         # Debug counters
@@ -792,6 +859,7 @@ class MarketMonitor:
         self._price_change_count = 0
         self._price_change_ignored_count = 0
         self._tokens_awaiting_snapshot: Set[str] = set()
+        self._snapshot_gate_open = False
         self._stale_pair_skip_count = 0
         self._last_stale_log: Dict[str, float] = {}
         self._last_log_time = time.time()
@@ -807,85 +875,200 @@ class MarketMonitor:
         )
 
         while self._running:
+            revision = self._subscription_revision
+            shards = _token_shards(list(self.token_to_market))
+            self._subscriptions_changed.clear()
+            logger.info(
+                "Starting Binary WebSocket shards",
+                shards=len(shards),
+                tokens=len(self.token_to_market),
+                shard_size=WS_SUBSCRIPTION_SHARD_SIZE,
+            )
+            workers = [
+                asyncio.create_task(self._run_shard(index, token_ids, revision))
+                for index, token_ids in enumerate(shards, start=1)
+            ]
+            changed = asyncio.create_task(self._subscriptions_changed.wait())
             try:
-                await self._connect_and_subscribe()
+                await asyncio.wait([*workers, changed], return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                for task in [*workers, changed]:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*workers, changed, return_exceptions=True)
+
+    async def stop(self) -> None:
+        """Stop monitoring markets."""
+        self._running = False
+        self._subscriptions_changed.set()
+        connections = list(self._connections)
+        if connections:
+            await asyncio.gather(
+                *(connection.close() for connection in connections),
+                return_exceptions=True,
+            )
+
+    async def update_markets(self, new_markets: list) -> None:
+        """
+        Replace the active Binary universe and restart changed shards.
+        """
+        old_market_ids = set(self.markets)
+        old_tokens = set(self.token_to_market)
+        self.markets = {market.condition_id: market for market in new_markets}
+        self.token_to_market = {}
+        for market in new_markets:
+            self.token_to_market[market.token_id_yes] = market
+            self.token_to_market[market.token_id_no] = market
+
+        new_tokens = set(self.token_to_market)
+        removed_tokens = old_tokens - new_tokens
+        self.order_books.remove_many(removed_tokens)
+        self._tokens_awaiting_snapshot.intersection_update(new_tokens)
+
+        if old_tokens != new_tokens:
+            self._snapshot_gate_open = False
+            self._subscription_revision += 1
+            self._subscriptions_changed.set()
+        logger.info(
+            "Binary market universe refreshed",
+            added=len(set(self.markets) - old_market_ids),
+            removed=len(old_market_ids - set(self.markets)),
+            markets=len(self.markets),
+            tokens=len(new_tokens),
+        )
+
+    async def _run_shard(
+        self,
+        shard_id: int,
+        token_ids: List[str],
+        revision: int,
+    ) -> None:
+        reconnect_delay = 1.0
+        while self._running and revision == self._subscription_revision:
+            try:
+                await self._connect_shard(shard_id, token_ids)
             except ConnectionClosed as e:
                 log_fn = logger.info if e.code == 1006 else logger.warning
                 log_fn(
-                    "WebSocket connection closed",
+                    "Binary WebSocket shard closed",
+                    shard=shard_id,
                     code=e.code,
                     reason=e.reason,
                 )
             except Exception as e:
                 error_text = repr(e)
                 if _is_transient_ws_error(e):
-                    logger.info("WebSocket transient disconnect", error=error_text)
+                    logger.info(
+                        "Binary WebSocket shard transient disconnect",
+                        shard=shard_id,
+                        error=error_text,
+                    )
                 else:
-                    logger.error("WebSocket error", error=error_text)
+                    logger.error(
+                        "Binary WebSocket shard error",
+                        shard=shard_id,
+                        error=error_text,
+                    )
 
-            if self._running:
-                logger.info(
-                    "Reconnecting in seconds",
-                    delay=self._reconnect_delay,
-                )
-                await asyncio.sleep(self._reconnect_delay)
-                self._reconnect_delay = min(self._reconnect_delay * 2, 60.0)
+            if self._running and revision == self._subscription_revision:
+                await asyncio.sleep(reconnect_delay)
+                reconnect_delay = min(reconnect_delay * 2, 60.0)
 
-    async def stop(self) -> None:
-        """Stop monitoring markets."""
-        self._running = False
-        if self._ws:
-            await self._ws.close()
-
-    async def update_markets(self, new_markets: list) -> None:
-        """
-        Dynamically add new Binary markets to the monitoring set.
-
-        Subscribes the WebSocket to any newly-added tokens so the
-        ArbitrageDetector will start evaluating them immediately.
-        """
-        new_tokens_to_sub = []
-        count = 0
-        for market in new_markets:
-            if market.condition_id not in self.markets:
-                self.markets[market.condition_id] = market
-                self.token_to_market[market.token_id_yes] = market
-                self.token_to_market[market.token_id_no] = market
-                new_tokens_to_sub.extend([market.token_id_yes, market.token_id_no])
-                count += 1
-
-        if new_tokens_to_sub and self._ws:
-            subscribe_msg = _market_subscription(new_tokens_to_sub, initial=False)
-            await self._ws.send(json.dumps(subscribe_msg))
-            logger.info(
-                "Subscribed to new Binary tokens",
-                new_markets=count,
-                new_tokens=len(new_tokens_to_sub),
-            )
-
-    async def _connect_and_subscribe(self) -> None:
-        """Connect to WebSocket and subscribe to markets."""
+    async def _connect_shard(self, shard_id: int, token_ids: List[str]) -> None:
+        """Connect one bounded market-channel shard."""
         async with websockets.connect(CLOB_WS_URL) as ws:
-            self._ws = ws
-            self._reconnect_delay = 1.0  # Reset on successful connection
+            self._connections.add(ws)
+            token_set = set(token_ids)
+            self.order_books.remove_many(token_set)
+            self._tokens_awaiting_snapshot.update(token_set)
+            self._snapshot_gate_open = False
+            try:
+                await ws.send(json.dumps(_market_subscription(token_ids, initial=True)))
+                logger.info(
+                    "Subscribed Binary WebSocket shard",
+                    shard=shard_id,
+                    num_tokens=len(token_ids),
+                )
+                tasks = [
+                    asyncio.create_task(self._process_messages(ws)),
+                    asyncio.create_task(self._heartbeat(ws)),
+                    asyncio.create_task(
+                        self._backfill_missing_snapshots(token_ids, "Binary", shard_id)
+                    ),
+                ]
+                try:
+                    await asyncio.gather(*tasks)
+                finally:
+                    for task in tasks:
+                        if not task.done():
+                            task.cancel()
+                    await asyncio.gather(*tasks, return_exceptions=True)
+            finally:
+                self._connections.discard(ws)
 
-            # I4: Discard stale order-book state from previous connection
-            self.order_books = OrderBookManager()
-            self._tokens_awaiting_snapshot.clear()
+    async def _backfill_missing_snapshots(
+        self,
+        token_ids: List[str],
+        monitor_name: str,
+        shard_id: int,
+    ) -> None:
+        """Backfill snapshots that did not arrive promptly over WebSocket."""
+        await asyncio.sleep(WS_SNAPSHOT_BACKFILL_DELAY_SECONDS)
+        missing = [token_id for token_id in token_ids if not self.order_books.get(token_id)]
+        if not missing:
+            return
+        try:
+            snapshots = await _fetch_order_book_snapshots(missing)
+        except Exception as e:
+            logger.warning(
+                "Order book snapshot backfill failed",
+                monitor=monitor_name,
+                shard=shard_id,
+                missing=len(missing),
+                error=repr(e),
+            )
+            return
 
-            # Subscribe to all token order books
-            token_ids = []
-            for market in self.markets.values():
-                token_ids.extend([market.token_id_yes, market.token_id_no])
+        restored_markets: Dict[str, Market] = {}
+        expected = set(token_ids)
+        restored = 0
+        for snapshot in snapshots:
+            token_id = str(snapshot.get("asset_id", ""))
+            if not token_id or token_id not in expected:
+                continue
+            if self.order_books.get(token_id):
+                continue
+            self.order_books.update(token_id, snapshot)
+            restored += 1
+            self._tokens_awaiting_snapshot.discard(token_id)
+            market = self.token_to_market.get(token_id)
+            if market:
+                restored_markets[market.condition_id or market.slug] = market
 
-            subscribe_msg = _market_subscription(token_ids, initial=True)
-            await ws.send(json.dumps(subscribe_msg))
-            logger.info("Subscribed to order books", num_tokens=len(token_ids))
+        logger.info(
+            "Order book snapshot backfill complete",
+            monitor=monitor_name,
+            shard=shard_id,
+            requested=len(missing),
+            restored=restored,
+            coverage=f"{self._snapshot_coverage():.2%}",
+        )
+        self._refresh_snapshot_gate()
+        for market in restored_markets.values():
+            await self._detect_market(market)
 
-            # Run message handler and heartbeat concurrently
-            await asyncio.gather(
-                self._process_messages(ws),
-                self._heartbeat(ws),
+    def _snapshot_coverage(self) -> float:
+        return self.order_books.coverage(set(self.token_to_market))
+
+    def _refresh_snapshot_gate(self) -> None:
+        coverage = self._snapshot_coverage()
+        was_open = self._snapshot_gate_open
+        self._snapshot_gate_open = coverage >= WS_MIN_SNAPSHOT_COVERAGE
+        if self._snapshot_gate_open and not was_open:
+            logger.info(
+                "Binary snapshot health gate opened",
+                coverage=f"{coverage:.2%}",
+                required=f"{WS_MIN_SNAPSHOT_COVERAGE:.2%}",
             )
 
     async def _heartbeat(self, ws: websockets.WebSocketClientProtocol) -> None:
@@ -944,6 +1127,9 @@ class MarketMonitor:
                     tokens_awaiting_snapshot=len(self._tokens_awaiting_snapshot),
                     stale_pair_skips=self._stale_pair_skip_count,
                     markets_with_books=len(self.order_books._books),
+                    expected_tokens=len(self.token_to_market),
+                    snapshot_coverage=f"{self._snapshot_coverage():.2%}",
+                    snapshot_gate_open=self._snapshot_gate_open,
                 )
                 self._last_log_time = now
 
@@ -981,12 +1167,14 @@ class MarketMonitor:
     async def _handle_book_update(self, data: dict) -> None:
         """Handle order book update."""
         token_id = data.get("asset_id")
-        if not token_id:
+        if not token_id or token_id not in self.token_to_market:
             return
 
         # Update order book
         self.order_books.update(token_id, data)
         self._tokens_awaiting_snapshot.discard(token_id)
+        if not self._snapshot_gate_open:
+            self._refresh_snapshot_gate()
 
         # Find market for this token
         market = self.token_to_market.get(token_id)
@@ -1015,7 +1203,8 @@ class MarketMonitor:
             )
             if book is None:
                 self._price_change_ignored_count += 1
-                self._tokens_awaiting_snapshot.add(token_id)
+                if token_id in self.token_to_market:
+                    self._tokens_awaiting_snapshot.add(token_id)
                 continue
 
             self._price_change_count += 1
@@ -1028,6 +1217,8 @@ class MarketMonitor:
 
     async def _detect_market(self, market: Market) -> None:
         """Detect opportunities only from a fresh, synchronized book pair."""
+        if self._running and not self._snapshot_gate_open:
+            return
         book_yes = self.order_books.get(market.token_id_yes)
         book_no = self.order_books.get(market.token_id_no)
 
@@ -1108,6 +1299,8 @@ class NegativeRiskMarketMonitor:
         profit_threshold: float = 0.008,
         trade_size: float = 100.0,
         max_slippage: float = 0.002,
+        book_max_age_seconds: float = 30.0,
+        book_max_skew_seconds: float = 5.0,
         on_opportunity: Optional[Callable[[NegativeRiskArbitrageOpportunity], None]] = None,
     ):
         """
@@ -1129,6 +1322,8 @@ class NegativeRiskMarketMonitor:
                 self.token_to_event[token_id] = event
 
         self.profit_threshold = profit_threshold
+        self.book_max_age_seconds = book_max_age_seconds
+        self.book_max_skew_seconds = book_max_skew_seconds
         self.order_books = OrderBookManager()
         self.detector = NegativeRiskArbitrageDetector(
             profit_threshold=profit_threshold,
@@ -1137,9 +1332,10 @@ class NegativeRiskMarketMonitor:
         )
         self.on_opportunity = on_opportunity
 
-        self._ws: Optional[websockets.WebSocketClientProtocol] = None
+        self._connections: Set[websockets.WebSocketClientProtocol] = set()
+        self._subscriptions_changed = asyncio.Event()
+        self._subscription_revision = 0
         self._running = False
-        self._reconnect_delay = 1.0
         self._heartbeat_interval = 10.0
         
         # Track which events have been checked recently to avoid duplicate checks
@@ -1149,6 +1345,11 @@ class NegativeRiskMarketMonitor:
         # Debug counters
         self._message_count = 0
         self._book_update_count = 0
+        self._price_change_count = 0
+        self._price_change_ignored_count = 0
+        self._tokens_awaiting_snapshot: Set[str] = set()
+        self._snapshot_gate_open = False
+        self._stale_event_skip_count = 0
         self._last_log_time = time.time()
 
     async def start(self) -> None:
@@ -1161,54 +1362,38 @@ class NegativeRiskMarketMonitor:
         )
 
         while self._running:
+            revision = self._subscription_revision
+            shards = _token_shards(list(self.token_to_event))
+            self._subscriptions_changed.clear()
+            logger.info(
+                "Starting NegRisk WebSocket shards",
+                shards=len(shards),
+                tokens=len(self.token_to_event),
+                shard_size=WS_SUBSCRIPTION_SHARD_SIZE,
+            )
+            workers = [
+                asyncio.create_task(self._run_shard(index, token_ids, revision))
+                for index, token_ids in enumerate(shards, start=1)
+            ]
+            changed = asyncio.create_task(self._subscriptions_changed.wait())
             try:
-                await self._connect_and_monitor()
-            except ConnectionClosed as e:
-                log_fn = logger.info if e.code == 1006 else logger.warning
-                log_fn(
-                    "NegRisk WebSocket connection closed",
-                    code=e.code,
-                    reason=e.reason,
-                )
-            except Exception as e:
-                error_text = repr(e)
-                if _is_transient_ws_error(e):
-                    logger.info("Negative Risk monitor transient disconnect", error=error_text)
-                else:
-                    logger.error("Negative Risk monitor error", error=error_text)
-
-            if self._running:
-                await asyncio.sleep(self._reconnect_delay)
-                self._reconnect_delay = min(self._reconnect_delay * 2, 60)
+                await asyncio.wait([*workers, changed], return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                for task in [*workers, changed]:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*workers, changed, return_exceptions=True)
 
     async def stop(self) -> None:
         """Stop monitoring."""
         logger.info("Stopping Negative Risk monitor")
         self._running = False
-        if self._ws:
-            await self._ws.close()
-
-    async def _connect_and_monitor(self) -> None:
-        """Connect to WebSocket and start monitoring."""
-        logger.info("NegRisk: Connecting to WebSocket", url=CLOB_WS_URL)
-        async with websockets.connect(CLOB_WS_URL) as ws:
-            self._ws = ws
-            self._reconnect_delay = 1.0
-            logger.info("NegRisk: WebSocket connected successfully")
-
-            # I4: Discard stale order-book state from previous connection
-            self.order_books = OrderBookManager()
-
-            # Subscribe to all tokens
-            all_tokens = list(self.token_to_event.keys())
-            logger.info("NegRisk: About to subscribe", num_tokens=len(all_tokens))
-            await self._subscribe(all_tokens, initial=True)
-            logger.info("NegRisk: Waiting for messages...")
-
-            # Run message handler and heartbeat concurrently
+        self._subscriptions_changed.set()
+        connections = list(self._connections)
+        if connections:
             await asyncio.gather(
-                self._process_messages(ws),
-                self._heartbeat(ws),
+                *(connection.close() for connection in connections),
+                return_exceptions=True,
             )
 
     async def _heartbeat(self, ws: websockets.WebSocketClientProtocol) -> None:
@@ -1228,68 +1413,157 @@ class NegativeRiskMarketMonitor:
 
     async def update_events(self, new_events: List[NegativeRiskEvent]) -> None:
         """
-        Dynamically update the monitored events list.
-        Adds new events to the monitoring set and subscribes to them.
+        Replace the active event universe and restart changed shards.
         """
-        new_tokens_to_sub = []
-        count = 0
-        
+        old_event_ids = set(self.events)
+        old_tokens = set(self.token_to_event)
+        self.events = {event.event_id: event for event in new_events}
+        self.token_to_event = {}
         for event in new_events:
-            if event.event_id not in self.events:
-                self.events[event.event_id] = event
-                # Add tokens
-                for token_id in event.get_all_token_ids():
-                    self.token_to_event[token_id] = event
-                    new_tokens_to_sub.append(token_id)
-                count += 1
-        
-        if new_tokens_to_sub:
-            logger.info("Monitor found new events", new_events=count, new_tokens=len(new_tokens_to_sub))
-            # If connected, subscribe immediately
-            # websockets >=14: ClientConnection has no .closed; use .close_code
-            if self._ws and getattr(self._ws, 'close_code', None) is None:
-                await self._subscribe(new_tokens_to_sub)
-        else:
-            logger.debug("Monitor update called but no new events found")
+            for token_id in event.get_all_token_ids():
+                self.token_to_event[token_id] = event
 
-    async def _subscribe(self, token_ids: List[str], initial: bool = False) -> None:
-        """Subscribe to order books for given tokens in batches."""
-        # Polymarket WebSocket has limits on subscription message size
-        # Split into batches of 2000 tokens max
-        BATCH_SIZE = 2000
-        total_batches = (len(token_ids) + BATCH_SIZE - 1) // BATCH_SIZE
-        
+        new_tokens = set(self.token_to_event)
+        removed_tokens = old_tokens - new_tokens
+        self.order_books.remove_many(removed_tokens)
+        self._tokens_awaiting_snapshot.intersection_update(new_tokens)
+        if old_tokens != new_tokens:
+            self._snapshot_gate_open = False
+            self._subscription_revision += 1
+            self._subscriptions_changed.set()
         logger.info(
-            "NegRisk: Subscribing in batches",
-            total_tokens=len(token_ids),
-            batch_size=BATCH_SIZE,
-            num_batches=total_batches,
+            "NegRisk event universe refreshed",
+            added=len(set(self.events) - old_event_ids),
+            removed=len(old_event_ids - set(self.events)),
+            events=len(self.events),
+            tokens=len(new_tokens),
         )
-        
-        for i in range(0, len(token_ids), BATCH_SIZE):
-            batch = token_ids[i:i + BATCH_SIZE]
-            batch_num = (i // BATCH_SIZE) + 1
-            
-            subscription = _market_subscription(
-                batch,
-                initial=initial and batch_num == 1,
+
+    async def _run_shard(
+        self,
+        shard_id: int,
+        token_ids: List[str],
+        revision: int,
+    ) -> None:
+        reconnect_delay = 1.0
+        while self._running and revision == self._subscription_revision:
+            try:
+                await self._connect_shard(shard_id, token_ids)
+            except ConnectionClosed as e:
+                log_fn = logger.info if e.code == 1006 else logger.warning
+                log_fn(
+                    "NegRisk WebSocket shard closed",
+                    shard=shard_id,
+                    code=e.code,
+                    reason=e.reason,
+                )
+            except Exception as e:
+                logger.warning(
+                    "NegRisk WebSocket shard error",
+                    shard=shard_id,
+                    error=repr(e),
+                )
+            if self._running and revision == self._subscription_revision:
+                await asyncio.sleep(reconnect_delay)
+                reconnect_delay = min(reconnect_delay * 2, 60.0)
+
+    async def _connect_shard(self, shard_id: int, token_ids: List[str]) -> None:
+        async with websockets.connect(CLOB_WS_URL) as ws:
+            self._connections.add(ws)
+            token_set = set(token_ids)
+            self.order_books.remove_many(token_set)
+            self._tokens_awaiting_snapshot.update(token_set)
+            self._snapshot_gate_open = False
+            try:
+                await ws.send(json.dumps(_market_subscription(token_ids, initial=True)))
+                logger.info(
+                    "Subscribed NegRisk WebSocket shard",
+                    shard=shard_id,
+                    num_tokens=len(token_ids),
+                )
+                tasks = [
+                    asyncio.create_task(self._process_messages(ws)),
+                    asyncio.create_task(self._heartbeat(ws)),
+                    asyncio.create_task(self._refresh_shard_snapshots(token_ids, shard_id)),
+                ]
+                try:
+                    await asyncio.gather(*tasks)
+                finally:
+                    for task in tasks:
+                        if not task.done():
+                            task.cancel()
+                    await asyncio.gather(*tasks, return_exceptions=True)
+            finally:
+                self._connections.discard(ws)
+
+    async def _refresh_shard_snapshots(
+        self,
+        token_ids: List[str],
+        shard_id: int,
+    ) -> None:
+        await asyncio.sleep(WS_SNAPSHOT_BACKFILL_DELAY_SECONDS)
+        first_refresh = True
+        while self._running:
+            requested = (
+                [token_id for token_id in token_ids if not self.order_books.get(token_id)]
+                if first_refresh
+                else token_ids
             )
-            subscription_json = json.dumps(subscription)
-            
+            if requested:
+                try:
+                    snapshots = await _fetch_order_book_snapshots(requested)
+                except Exception as e:
+                    logger.warning(
+                        "NegRisk snapshot refresh failed",
+                        shard=shard_id,
+                        requested=len(requested),
+                        error=repr(e),
+                    )
+                else:
+                    restored_events: Dict[str, NegativeRiskEvent] = {}
+                    expected = set(token_ids)
+                    restored = 0
+                    for snapshot in snapshots:
+                        token_id = str(snapshot.get("asset_id", ""))
+                        if not token_id or token_id not in expected:
+                            continue
+                        if first_refresh and self.order_books.get(token_id):
+                            continue
+                        self.order_books.update(token_id, snapshot)
+                        restored += 1
+                        self._tokens_awaiting_snapshot.discard(token_id)
+                        event = self.token_to_event.get(token_id)
+                        if event:
+                            restored_events[event.event_id] = event
+
+                    self._refresh_snapshot_gate()
+                    log_fn = logger.info if first_refresh else logger.debug
+                    log_fn(
+                        "NegRisk snapshot refresh complete",
+                        shard=shard_id,
+                        requested=len(requested),
+                        restored=restored,
+                        coverage=f"{self._snapshot_coverage():.2%}",
+                    )
+                    for event in restored_events.values():
+                        await self._detect_event(event)
+
+            first_refresh = False
+            await asyncio.sleep(self.book_max_age_seconds / 2)
+
+    def _snapshot_coverage(self) -> float:
+        return self.order_books.coverage(set(self.token_to_event))
+
+    def _refresh_snapshot_gate(self) -> None:
+        coverage = self._snapshot_coverage()
+        was_open = self._snapshot_gate_open
+        self._snapshot_gate_open = coverage >= WS_MIN_SNAPSHOT_COVERAGE
+        if self._snapshot_gate_open and not was_open:
             logger.info(
-                "NegRisk: Sending subscription batch",
-                batch=f"{batch_num}/{total_batches}",
-                num_tokens=len(batch),
-                msg_size_bytes=len(subscription_json),
+                "NegRisk snapshot health gate opened",
+                coverage=f"{coverage:.2%}",
+                required=f"{WS_MIN_SNAPSHOT_COVERAGE:.2%}",
             )
-            
-            await self._ws.send(subscription_json)
-            
-            # Small delay between batches to avoid overwhelming the server
-            if i + BATCH_SIZE < len(token_ids):
-                await asyncio.sleep(0.1)
-        
-        logger.info("NegRisk: All subscription batches sent successfully", total_tokens=len(token_ids))
 
     async def _handle_message(self, message: str) -> None:
         """Handle incoming WebSocket message."""
@@ -1327,7 +1601,16 @@ class NegativeRiskMarketMonitor:
                     "NegRisk WebSocket stats",
                     total_messages=self._message_count,
                     book_updates=self._book_update_count,
-                    tokens_with_books=len([t for t in self.token_to_event.keys() if self.order_books.get(t)]),
+                    price_changes=self._price_change_count,
+                    price_changes_ignored_before_snapshot=self._price_change_ignored_count,
+                    tokens_with_books=len(
+                        [token for token in self.token_to_event if self.order_books.get(token)]
+                    ),
+                    expected_tokens=len(self.token_to_event),
+                    tokens_awaiting_snapshot=len(self._tokens_awaiting_snapshot),
+                    snapshot_coverage=f"{self._snapshot_coverage():.2%}",
+                    snapshot_gate_open=self._snapshot_gate_open,
+                    stale_event_skips=self._stale_event_skip_count,
                 )
                 self._last_log_time = now
 
@@ -1360,20 +1643,44 @@ class NegativeRiskMarketMonitor:
             await self._handle_book_update(data)
 
     async def _handle_price_change(self, data: dict) -> None:
-        """Handle price_change event."""
-        price_changes = data.get("price_changes", [])
-        for change in price_changes:
-            if "asset_id" in change:
-                await self._handle_book_update(change)
+        """Apply a complete incremental batch before checking affected events."""
+        received_at = time.time()
+        affected_events: Dict[str, NegativeRiskEvent] = {}
+        for change in data.get("price_changes", []):
+            if not isinstance(change, dict):
+                continue
+            token_id = change.get("asset_id")
+            if not token_id:
+                continue
+            book = self.order_books.apply_price_change(
+                token_id,
+                change,
+                timestamp=received_at,
+            )
+            if book is None:
+                self._price_change_ignored_count += 1
+                if token_id in self.token_to_event:
+                    self._tokens_awaiting_snapshot.add(token_id)
+                continue
+            self._price_change_count += 1
+            event = self.token_to_event.get(token_id)
+            if event:
+                affected_events[event.event_id] = event
+
+        for event in affected_events.values():
+            await self._detect_event(event)
 
     async def _handle_book_update(self, data: dict) -> None:
         """Handle order book update."""
         token_id = data.get("asset_id")
-        if not token_id:
+        if not token_id or token_id not in self.token_to_event:
             return
 
         # Update order book
         self.order_books.update(token_id, data)
+        self._tokens_awaiting_snapshot.discard(token_id)
+        if not self._snapshot_gate_open:
+            self._refresh_snapshot_gate()
 
         # Find event for this token
         event = self.token_to_event.get(token_id)
@@ -1382,26 +1689,33 @@ class NegativeRiskMarketMonitor:
                 logger.debug("NegRisk: Token not mapped to event", token_id=token_id)
             return
 
-        # Rate limit: avoid checking same event too frequently
+        await self._detect_event(event)
+
+    async def _detect_event(self, event: NegativeRiskEvent) -> None:
+        """Detect only when every event leg is complete, fresh, and synchronized."""
+        if self._running and not self._snapshot_gate_open:
+            return
+
+        books = [self.order_books.get(token_id) for token_id in event.get_all_token_ids()]
+        if not books or any(book is None for book in books):
+            return
+
         now = time.time()
         last_check = self._last_check_time.get(event.event_id, 0)
-        
-        # Debug log for first few updates to check flow
-        self._handle_update_count = getattr(self, '_handle_update_count', 0) + 1
-        if self._handle_update_count <= 5:
-            logger.debug(
-                "NegRisk: Handling update", 
-                token=token_id, 
-                event_id=event.event_id,
-                time_diff=now-last_check
-            )
-
         if now - last_check < self._min_check_interval:
             return
-        
-        self._last_check_time[event.event_id] = now
 
-        # Check for arbitrage
+        timestamps = [book.timestamp for book in books if book is not None]
+        max_age = max(now - timestamp for timestamp in timestamps)
+        max_skew = max(timestamps) - min(timestamps)
+        if (
+            max_age > self.book_max_age_seconds
+            or max_skew > self.book_max_skew_seconds
+        ):
+            self._stale_event_skip_count += 1
+            return
+
+        self._last_check_time[event.event_id] = now
         opportunity = self.detector.detect(event, self.order_books)
 
         if opportunity:

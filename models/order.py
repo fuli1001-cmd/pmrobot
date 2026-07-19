@@ -138,6 +138,29 @@ class OrderBook:
         
         return total_cost / total_tokens if total_tokens > 0 else None
 
+    def calculate_average_buy_price_for_tokens(
+        self,
+        token_amount: float,
+    ) -> Optional[float]:
+        """Calculate the weighted average ask for an exact token quantity."""
+        if token_amount <= 0 or not self.asks:
+            return None
+
+        remaining = token_amount
+        total_cost = 0.0
+        for level in self.asks:
+            take = min(level.size, remaining)
+            if take <= 0:
+                continue
+            total_cost += take * level.price
+            remaining -= take
+            if remaining <= 1e-9:
+                break
+
+        if remaining > 1e-9:
+            return None
+        return total_cost / token_amount
+
     def calculate_depth_penetration(
         self,
         amount_usdc: float,
@@ -541,4 +564,3 @@ class ShortArbitrageOpportunity:
             True if opportunity is profitable after threshold
         """
         return self.net_profit_pct > threshold
-

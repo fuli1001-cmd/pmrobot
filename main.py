@@ -17,6 +17,7 @@ from config.constants import POLYGON_CHAIN_ID
 from core.scanner import MarketScanner
 from core.monitor import MarketMonitor, NegativeRiskArbitrageDetector, OrderBookManager, NegativeRiskMarketMonitor
 from core.executor import (
+    DRY_RUN_NEG_RISK_PREFLIGHT_PASSED,
     DRY_RUN_PREFLIGHT_PASSED,
     OrderExecutor,
     create_executor,
@@ -337,12 +338,25 @@ class ArbitrageBot:
         async with MarketScanner(rate_limit=self.settings.api_rate_limit) as scanner:
             markets = await scanner.fetch_all_markets(
                 fee_free_only=True,
-                max_markets=1000,  # Scan more markets
+                max_markets=2000,
             )
 
-        # Filter for minimum liquidity
-        min_liquidity = self.settings.max_trade_size * 2
-        tradeable = [m for m in markets if m.liquidity >= min_liquidity]
+        min_liquidity = max(
+            self.settings.pm_min_market_liquidity,
+            self.settings.max_trade_size * self.settings.depth_safety_multiplier,
+        )
+        eligible = [
+            market for market in markets
+            if market.active
+            and not market.closed
+            and market.enable_order_book
+            and market.liquidity >= min_liquidity
+        ]
+        tradeable = sorted(
+            eligible,
+            key=lambda market: (market.liquidity, market.volume_24h),
+            reverse=True,
+        )[:self.settings.pm_max_binary_markets]
 
         logger.info(
             "Market scan complete",
@@ -363,9 +377,21 @@ class ArbitrageBot:
                 max_events=100,
             )
 
-        # Filter for minimum liquidity
-        min_liquidity = self.settings.max_trade_size * 2
-        tradeable = [e for e in events if e.liquidity >= min_liquidity]
+        min_liquidity = max(
+            self.settings.pm_min_market_liquidity,
+            self.settings.max_trade_size * self.settings.depth_safety_multiplier,
+        )
+        eligible = [
+            event for event in events
+            if event.is_tradeable
+            and event.outcome_count <= int(self.settings.max_trade_size)
+            and event.liquidity >= min_liquidity
+        ]
+        tradeable = sorted(
+            eligible,
+            key=lambda event: (event.liquidity, event.volume_24h),
+            reverse=True,
+        )[:self.settings.pm_max_neg_risk_events]
 
         logger.info(
             "Negative Risk scan complete",
@@ -448,8 +474,7 @@ class ArbitrageBot:
     async def _run_neg_risk_monitor(self, events: list) -> None:
         """Run the Negative Risk event monitor."""
         if not events:
-            logger.info("No Negative Risk events to monitor")
-            return
+            logger.info("No initial Negative Risk events; waiting for refresh")
 
         def on_neg_risk_opportunity(opp: NegativeRiskArbitrageOpportunity):
             """Callback when Negative Risk opportunity is detected."""
@@ -458,7 +483,7 @@ class ArbitrageBot:
             if self.risk_manager.can_trade():
                 logger.info(
                     "NegRisk opportunity detected - queuing for execution",
-                    event=opp.event.title[:50],
+                    event_title=opp.event.title[:50],
                     strategy=opp.strategy.value,
                     net_profit_pct=f"{opp.net_profit_pct:.2%}",
                     profit_usdc=f"${opp.net_profit_usdc:.2f}",
@@ -471,7 +496,7 @@ class ArbitrageBot:
             else:
                 logger.warning(
                     "NegRisk opportunity detected but rejected by risk manager",
-                    event=opp.event.title[:50],
+                    event_title=opp.event.title[:50],
                     net_profit_pct=f"{opp.net_profit_pct:.2%}",
                     reason="circuit breaker triggered",
                 )
@@ -506,7 +531,7 @@ class ArbitrageBot:
                 # Execute Negative Risk arbitrage
                 logger.info(
                     "Executing NegRisk arbitrage",
-                    event=opportunity.event.title[:50],
+                    event_title=opportunity.event.title[:50],
                     strategy=opportunity.strategy.value,
                     net_profit=f"{opportunity.net_profit_pct:.2%}",
                     trade_size=f"${opportunity.trade_size_usdc:.2f}",
@@ -556,19 +581,25 @@ class ArbitrageBot:
                     asyncio.create_task(self.stop())
                     return
                 elif result.result == ExecutionResult.SKIPPED and self.dry_run:
-                    # Dry-run mode: record as simulated success
-                    await self.risk_manager.record_success(
-                        opportunity,
-                        opportunity.net_profit_usdc,
-                        is_simulated=True,
-                    )
-                    logger.info(
-                        "DRY RUN: Simulated NegRisk arbitrage",
-                        event=opportunity.event.title[:50],
-                        strategy=opportunity.strategy.value,
-                        net_profit=f"{opportunity.net_profit_pct:.2%}",
-                        profit_usdc=f"${opportunity.net_profit_usdc:.2f}",
-                    )
+                    if result.error_message == DRY_RUN_NEG_RISK_PREFLIGHT_PASSED:
+                        await self.risk_manager.record_success(
+                            opportunity,
+                            opportunity.net_profit_usdc,
+                            is_simulated=True,
+                        )
+                        logger.info(
+                            "DRY RUN: Simulated NegRisk arbitrage",
+                            event_title=opportunity.event.title[:50],
+                            strategy=opportunity.strategy.value,
+                            net_profit=f"{opportunity.net_profit_pct:.2%}",
+                            profit_usdc=f"${opportunity.net_profit_usdc:.2f}",
+                        )
+                    else:
+                        logger.info(
+                            "DRY RUN: NegRisk preflight rejected; not recording simulated arbitrage",
+                            event_title=opportunity.event.title[:50],
+                            reason=result.error_message,
+                        )
                 else:
                     # Failed
                     if result.fatal_error or self._execution_report_has_fill(result):
@@ -580,7 +611,7 @@ class ArbitrageBot:
                     else:
                         logger.info(
                             "NegRisk FOK attempt had zero fills; not counting as risk failure",
-                            event=opportunity.event.title[:50],
+                            event_title=opportunity.event.title[:50],
                         )
 
             except asyncio.CancelledError:
@@ -842,7 +873,10 @@ class ArbitrageBot:
 
                 logger.info("Refreshing markets...")
 
-                min_liquidity = self.settings.max_trade_size * 2
+                min_liquidity = max(
+                    self.settings.pm_min_market_liquidity,
+                    self.settings.max_trade_size * self.settings.depth_safety_multiplier,
+                )
 
                 async with MarketScanner(rate_limit=self.settings.api_rate_limit) as scanner:
                     # Fetch fee-free markets (sports ⊂ fee-free, so this
@@ -858,30 +892,48 @@ class ArbitrageBot:
                     )
 
                 # --- Binary markets ---
-                tradeable_binary = [
-                    m for m in all_markets
-                    if m.liquidity >= min_liquidity
-                ]
-                if tradeable_binary and self.monitor and hasattr(self.monitor, 'update_markets'):
+                tradeable_binary = sorted(
+                    (
+                        market for market in all_markets
+                        if market.active
+                        and not market.closed
+                        and market.enable_order_book
+                        and market.liquidity >= min_liquidity
+                    ),
+                    key=lambda market: (market.liquidity, market.volume_24h),
+                    reverse=True,
+                )[:self.settings.pm_max_binary_markets]
+                if self.monitor and hasattr(self.monitor, 'update_markets'):
                     await self.monitor.update_markets(tradeable_binary)
 
                 # --- Negative Risk events ---
-                tradeable_events = [e for e in new_events if e.liquidity >= min_liquidity]
+                tradeable_events = sorted(
+                    (
+                        event for event in new_events
+                        if event.is_tradeable
+                        and event.outcome_count <= int(self.settings.max_trade_size)
+                        and event.liquidity >= min_liquidity
+                    ),
+                    key=lambda event: (event.liquidity, event.volume_24h),
+                    reverse=True,
+                )[:self.settings.pm_max_neg_risk_events]
 
-                if tradeable_events and self.neg_risk_monitor and hasattr(self.neg_risk_monitor, 'update_events'):
+                if self.neg_risk_monitor and hasattr(self.neg_risk_monitor, 'update_events'):
                     await self.neg_risk_monitor.update_events(tradeable_events)
 
                 # Update local cache of events
                 current_ids = {e.event_id for e in self._neg_risk_events}
-                new_count = 0
-                for event in tradeable_events:
-                    if event.event_id not in current_ids:
-                        self._neg_risk_events.append(event)
-                        current_ids.add(event.event_id)
-                        new_count += 1
+                refreshed_ids = {e.event_id for e in tradeable_events}
+                new_count = len(refreshed_ids - current_ids)
+                removed_count = len(current_ids - refreshed_ids)
+                self._neg_risk_events = tradeable_events
 
-                if new_count > 0:
-                    logger.info("Bot state updated with new events", count=new_count)
+                if new_count > 0 or removed_count > 0:
+                    logger.info(
+                        "Bot state updated with refreshed events",
+                        added=new_count,
+                        removed=removed_count,
+                    )
                 else:
                     logger.debug("Refresher: No new events found")
 

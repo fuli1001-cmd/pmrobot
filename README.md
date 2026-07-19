@@ -518,6 +518,9 @@ curl https://polymarket.com/api/geoblock
 | Binary 双侧最大时间差 | `BINARY_BOOK_MAX_SKEW_SECONDS` | 0.5 秒 | 0.01~10 | YES/NO 更新时间差超过该值时跳过检测 |
 | 合并间隔 | `MERGE_INTERVAL` | 600 (10min) | 60~3600 | Settler 自动合并周期 |
 | 刷新间隔 | `MARKET_REFRESH_INTERVAL` | 1800 (30min) | 0~86400 | 全量市场 + 跨平台扫描间隔 |
+| Binary 市场上限 | `PM_MAX_BINARY_MARKETS` | 500 | 1~5000 | 按流动性排序后保留的活跃 Binary 市场数 |
+| NegRisk 事件上限 | `PM_MAX_NEG_RISK_EVENTS` | 25 | 1~500 | 按流动性排序后保留的可执行事件数 |
+| 最低市场流动性 | `PM_MIN_MARKET_LIQUIDITY` | 100.0 | >=0 | 进入 WebSocket 监控的最低报告流动性 |
 
 ### 下单金额逻辑说明
 

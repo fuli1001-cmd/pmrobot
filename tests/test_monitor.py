@@ -3,27 +3,38 @@
 import pytest
 import time
 
-from models.market import Market, FeeCategory
+from models.market import Market, FeeCategory, NegativeRiskEvent
 from models.order import OrderBook, OrderBookLevel, ArbitrageOpportunity
 from core.monitor import (
     ArbitrageDetector,
     MarketMonitor,
+    NegativeRiskArbitrageDetector,
+    NegativeRiskMarketMonitor,
     OrderBookManager,
     _market_subscription,
+    _token_shards,
 )
 
 
 def test_market_subscription_formats():
     assert _market_subscription(["token_1"], initial=True) == {
         "assets_ids": ["token_1"],
+        "initial_dump": True,
         "type": "market",
         "custom_feature_enabled": True,
     }
     assert _market_subscription(["token_2"], initial=False) == {
         "assets_ids": ["token_2"],
+        "initial_dump": True,
         "operation": "subscribe",
         "custom_feature_enabled": True,
     }
+
+
+def test_token_shards_are_bounded_and_deduplicated():
+    shards = _token_shards(["a", "b", "a", "c"], shard_size=2)
+
+    assert shards == [["a", "b"], ["c"]]
 
 
 class TestOrderBookManager:
@@ -240,6 +251,105 @@ class TestMarketMonitor:
         )
 
         assert monitor._tokens_awaiting_snapshot == set()
+
+    @pytest.mark.asyncio
+    async def test_market_refresh_replaces_removed_subscriptions(self, sample_market):
+        replacement = Market(
+            condition_id="0x456",
+            token_id_yes="new_yes",
+            token_id_no="new_no",
+            question="Replacement?",
+            slug="replacement",
+        )
+        monitor = MarketMonitor(markets=[sample_market])
+        monitor.order_books.update("yes_token", {"bids": [], "asks": []})
+
+        await monitor.update_markets([replacement])
+
+        assert set(monitor.markets) == {"0x456"}
+        assert set(monitor.token_to_market) == {"new_yes", "new_no"}
+        assert monitor.order_books.get("yes_token") is None
+        assert monitor._subscription_revision == 1
+
+
+class TestNegativeRiskMonitor:
+    @staticmethod
+    def _event() -> NegativeRiskEvent:
+        outcomes = [
+            Market(
+                condition_id=f"condition_{index}",
+                token_id_yes=f"yes_{index}",
+                token_id_no=f"no_{index}",
+                question=f"Outcome {index}?",
+                slug=f"outcome-{index}",
+            )
+            for index in range(3)
+        ]
+        return NegativeRiskEvent(
+            event_id="event_1",
+            title="Test event",
+            slug="test-event",
+            outcomes=outcomes,
+        )
+
+    @pytest.mark.asyncio
+    async def test_price_change_preserves_full_snapshot_levels(self):
+        event = self._event()
+        monitor = NegativeRiskMarketMonitor(events=[event])
+        monitor.order_books.update(
+            "yes_0",
+            {
+                "bids": [{"price": "0.20", "size": "10"}],
+                "asks": [
+                    {"price": "0.30", "size": "10"},
+                    {"price": "0.31", "size": "20"},
+                ],
+            },
+        )
+
+        await monitor._handle_price_change(
+            {
+                "price_changes": [
+                    {
+                        "asset_id": "yes_0",
+                        "side": "SELL",
+                        "price": "0.30",
+                        "size": "15",
+                    }
+                ]
+            }
+        )
+
+        book = monitor.order_books.get("yes_0")
+        assert [(level.price, level.size) for level in book.asks] == [
+            (0.30, 15.0),
+            (0.31, 20.0),
+        ]
+        assert [(level.price, level.size) for level in book.bids] == [(0.20, 10.0)]
+
+    def test_detector_uses_equal_tokens_without_exceeding_budget(self):
+        event = self._event()
+        books = OrderBookManager()
+        for outcome in event.outcomes:
+            books.update(
+                outcome.token_id_yes,
+                {"bids": [], "asks": [{"price": "0.30", "size": "100"}]},
+            )
+            books.update(
+                outcome.token_id_no,
+                {"bids": [], "asks": [{"price": "0.70", "size": "100"}]},
+            )
+
+        detector = NegativeRiskArbitrageDetector(
+            profit_threshold=0.03,
+            trade_size=3.0,
+        )
+        opportunity = detector.detect(event, books)
+
+        assert opportunity is not None
+        assert opportunity.token_size == pytest.approx(3.0 / 0.9)
+        assert opportunity.trade_size_usdc == pytest.approx(3.0)
+        assert opportunity.trade_size_usdc <= detector.trade_size
 
 
 class TestOrderBook:

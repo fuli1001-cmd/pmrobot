@@ -207,6 +207,7 @@ class NegativeRiskArbitrageOpportunity:
     
     # Trade parameters
     trade_size_usdc: float = 100.0
+    token_size: float = 0.0  # Equal shares bought on every outcome leg
     
     # Calculated values
     total_cost: float = 0.0  # Sum of all prices
@@ -241,9 +242,10 @@ class NegativeRiskArbitrageOpportunity:
     @property
     def net_profit_usdc(self) -> float:
         """Estimated profit in USDC."""
+        if self.token_size > 0:
+            return self.net_profit * self.token_size
         return self.net_profit * self.trade_size_usdc
     
     def is_profitable(self, threshold: float = 0.008) -> bool:
         """Check if opportunity exceeds profit threshold."""
         return self.net_profit_pct >= threshold
-

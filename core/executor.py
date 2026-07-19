@@ -36,6 +36,13 @@ EMERGENCY_EXIT_FALLBACK_DISCOUNTS = (0.95, 0.90, 0.85, 0.80)
 LIVE_PREFLIGHT_REJECTED = "Live CLOB preflight rejected binary opportunity"
 DRY_RUN_PREFLIGHT_PASSED = "Dry run live preflight passed; order submission skipped"
 DRY_RUN_PREFLIGHT_REJECTED = "Dry run live preflight rejected binary opportunity"
+DRY_RUN_NEG_RISK_PREFLIGHT_PASSED = (
+    "Dry run live preflight passed; NegRisk order submission skipped"
+)
+DRY_RUN_NEG_RISK_PREFLIGHT_REJECTED = (
+    "Dry run live preflight rejected NegRisk opportunity"
+)
+LIVE_NEG_RISK_PREFLIGHT_REJECTED = "Live CLOB preflight rejected NegRisk opportunity"
 
 
 def _version_tuple(version: str) -> Tuple[int, ...]:
@@ -669,7 +676,11 @@ class OrderExecutor:
         """
         start_time = time.time()
         
-        # Build orders for all legs
+        token_size = opportunity.token_size
+        if token_size <= 0 and opportunity.total_cost > 0:
+            token_size = opportunity.trade_size_usdc / opportunity.total_cost
+
+        # Build equal-token orders so every resolution has the modeled payout.
         orders: List[Order] = []
         for condition_id, price in opportunity.outcome_prices.items():
             # Find the token ID for this condition based on strategy
@@ -695,22 +706,66 @@ class OrderExecutor:
                 token_id=token_id,
                 side=OrderSide.BUY,
                 price=price,
-                size=opportunity.trade_size_usdc / len(opportunity.outcome_prices) / price,
+                size=token_size,
                 order_type=OrderType.FOK,
             ))
 
-        if self.dry_run:
-            logger.info(
-                "DRY RUN: Would execute NegRisk arbitrage",
-                event=opportunity.event.title[:40],
-                strategy=opportunity.strategy.value,
-                legs=len(orders),
-                net_profit=f"{opportunity.net_profit_pct:.2%}",
+        if len(orders) != len(opportunity.outcome_prices) or not orders:
+            logger.warning(
+                "NegRisk preflight_rejected: incomplete order vector",
+                event_title=opportunity.event.title[:40],
+                expected_legs=len(opportunity.outcome_prices),
+                actual_legs=len(orders),
             )
             return ExecutionReport(
                 result=ExecutionResult.SKIPPED,
-                opportunity=opportunity,  # This might need casting or generic type update
-                execution_time_ms=0,
+                opportunity=opportunity,
+                error_message=(
+                    DRY_RUN_NEG_RISK_PREFLIGHT_REJECTED
+                    if self.dry_run
+                    else LIVE_NEG_RISK_PREFLIGHT_REJECTED
+                ),
+            )
+
+        preflight_orders = await self._preflight_neg_risk_arbitrage(
+            opportunity,
+            orders,
+        )
+        if preflight_orders is None:
+            logger.info(
+                "DRY RUN: NegRisk preflight_rejected; order submission skipped"
+                if self.dry_run
+                else "NegRisk preflight_rejected; order submission skipped",
+                event_title=opportunity.event.title[:40],
+                preflight_status="preflight_rejected",
+            )
+            return ExecutionReport(
+                result=ExecutionResult.SKIPPED,
+                opportunity=opportunity,
+                error_message=(
+                    DRY_RUN_NEG_RISK_PREFLIGHT_REJECTED
+                    if self.dry_run
+                    else LIVE_NEG_RISK_PREFLIGHT_REJECTED
+                ),
+                execution_time_ms=(time.time() - start_time) * 1000,
+            )
+
+        orders = preflight_orders
+
+        if self.dry_run:
+            logger.info(
+                "DRY RUN: NegRisk preflight_passed; order submission skipped",
+                event_title=opportunity.event.title[:40],
+                strategy=opportunity.strategy.value,
+                legs=len(orders),
+                net_profit=f"{opportunity.net_profit_pct:.2%}",
+                preflight_status="preflight_passed",
+            )
+            return ExecutionReport(
+                result=ExecutionResult.SKIPPED,
+                opportunity=opportunity,
+                execution_time_ms=(time.time() - start_time) * 1000,
+                error_message=DRY_RUN_NEG_RISK_PREFLIGHT_PASSED,
             )
 
         # Execute vector
@@ -750,6 +805,137 @@ class OrderExecutor:
                 opportunity=opportunity,
                 execution_time_ms=execution_time,
             )
+
+    async def _preflight_neg_risk_arbitrage(
+        self,
+        opportunity: NegativeRiskArbitrageOpportunity,
+        orders: List[Order],
+    ) -> Optional[List[Order]]:
+        """Re-read every NegRisk leg and validate the complete FOK vector."""
+        settings = get_settings()
+        books = await self._fetch_live_order_books([order.token_id for order in orders])
+        if len(books) != len(orders):
+            logger.warning(
+                "NegRisk preflight skipped: could not fetch every live book",
+                event_title=opportunity.event.title[:40],
+                expected_legs=len(orders),
+                books_received=len(books),
+            )
+            return None
+
+        prepared_sizes = [
+            self._prepare_clob_order_values(OrderSide.BUY, order.price, order.size)[1]
+            for order in orders
+        ]
+        target_size = min(prepared_sizes, default=0.0)
+        if target_size <= 0:
+            logger.warning(
+                "NegRisk preflight skipped: rounded token size is zero",
+                event_title=opportunity.event.title[:40],
+            )
+            return None
+
+        quotes = []
+        for order in orders:
+            book = books.get(order.token_id)
+            if not book:
+                return None
+            quotes.append(self._quote_buy_tokens(book, target_size, order.price))
+
+        incomplete = [index for index, quote in enumerate(quotes) if not quote["is_complete"]]
+        if incomplete:
+            logger.warning(
+                "NegRisk preflight skipped: live book cannot fill every FOK leg",
+                event_title=opportunity.event.title[:40],
+                incomplete_legs=len(incomplete),
+                legs=len(orders),
+                size=target_size,
+            )
+            return None
+
+        depth_multiplier = max(settings.depth_safety_multiplier, 1.0)
+        min_depth_ratio = min(quote["depth_ratio"] for quote in quotes)
+        if min_depth_ratio < depth_multiplier:
+            logger.warning(
+                "NegRisk preflight skipped: live depth reserve too thin",
+                event_title=opportunity.event.title[:40],
+                required_multiplier=depth_multiplier,
+                min_depth_ratio=f"{min_depth_ratio:.2f}",
+                size=target_size,
+            )
+            return None
+
+        total_avg_cost = sum(quote["avg_price"] for quote in quotes)
+        live_notional = target_size * total_avg_cost
+        if live_notional > settings.max_trade_size + 1e-9:
+            logger.warning(
+                "NegRisk preflight skipped: live notional exceeds configured maximum",
+                event_title=opportunity.event.title[:40],
+                live_notional=f"${live_notional:.2f}",
+                configured_max=f"${settings.max_trade_size:.2f}",
+            )
+            return None
+        expected_payout = opportunity.expected_payout
+        net_profit_pct = (
+            (expected_payout - total_avg_cost - opportunity.estimated_fee)
+            / total_avg_cost
+            if total_avg_cost > 0
+            else 0.0
+        )
+        if net_profit_pct < settings.profit_threshold:
+            logger.warning(
+                "NegRisk preflight skipped: live profit below threshold",
+                event_title=opportunity.event.title[:40],
+                live_net_profit=f"{net_profit_pct:.2%}",
+                threshold=f"{settings.profit_threshold:.2%}",
+            )
+            return None
+
+        for order, quote in zip(orders, quotes):
+            order.price = quote["max_price"]
+            order.size = target_size
+
+        logger.info(
+            "NegRisk preflight passed",
+            event_title=opportunity.event.title[:40],
+            legs=len(orders),
+            live_net_profit=f"{net_profit_pct:.2%}",
+            min_depth_ratio=f"{min_depth_ratio:.2f}",
+            size=target_size,
+        )
+        return orders
+
+    async def _fetch_live_order_books(
+        self,
+        token_ids: List[str],
+    ) -> Dict[str, OrderBook]:
+        """Fetch up to 500 live CLOB books per public batch request."""
+        books: Dict[str, OrderBook] = {}
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                for start in range(0, len(token_ids), 500):
+                    batch = token_ids[start:start + 500]
+                    response = await client.post(
+                        f"{CLOB_API_BASE_URL}/books",
+                        json=[{"token_id": token_id} for token_id in batch],
+                    )
+                    response.raise_for_status()
+                    payload = response.json()
+                    if not isinstance(payload, list):
+                        continue
+                    for data in payload:
+                        token_id = str(data.get("asset_id", ""))
+                        if not token_id:
+                            continue
+                        books[token_id] = OrderBook(
+                            token_id=token_id,
+                            bids=self._parse_book_levels(data.get("bids", []), reverse=True),
+                            asks=self._parse_book_levels(data.get("asks", []), reverse=False),
+                            timestamp=time.time(),
+                        )
+        except Exception as e:
+            logger.warning("Live CLOB batch book fetch failed", error=repr(e))
+        return books
 
     async def _execute_vector(self, orders: List[Order]) -> List[Order]:
         """Execute a list of orders concurrently."""
