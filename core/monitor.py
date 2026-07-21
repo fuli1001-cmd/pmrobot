@@ -22,9 +22,13 @@ from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-WS_SUBSCRIPTION_SHARD_SIZE = 500
+WS_SUBSCRIPTION_SHARD_SIZE = 250
+WS_MAX_MESSAGE_BYTES = 8 * 1024 * 1024
+WS_MAX_QUEUE_MESSAGES = 4
 WS_SNAPSHOT_BACKFILL_DELAY_SECONDS = 3.0
+WS_SNAPSHOT_STARTUP_TIMEOUT_SECONDS = 15.0
 WS_MIN_SNAPSHOT_COVERAGE = 0.95
+REST_BOOK_BATCH_SIZE = 500
 
 
 def _market_subscription(token_ids: List[str], initial: bool) -> dict:
@@ -47,7 +51,7 @@ async def _fetch_order_book_snapshots(token_ids: List[str]) -> List[dict]:
     """Fetch full CLOB books in batches for WebSocket snapshot backfill."""
     snapshots: List[dict] = []
     async with httpx.AsyncClient(timeout=10.0) as client:
-        for batch in _token_shards(token_ids):
+        for batch in _token_shards(token_ids, shard_size=REST_BOOK_BATCH_SIZE):
             response = await client.post(
                 f"{CLOB_API_BASE_URL}/books",
                 json=[{"token_id": token_id} for token_id in batch],
@@ -889,13 +893,21 @@ class MarketMonitor:
                 for index, token_ids in enumerate(shards, start=1)
             ]
             changed = asyncio.create_task(self._subscriptions_changed.wait())
+            watchdog = (
+                asyncio.create_task(self._snapshot_health_watchdog(revision))
+                if shards
+                else None
+            )
             try:
                 await asyncio.wait([*workers, changed], return_when=asyncio.FIRST_COMPLETED)
             finally:
-                for task in [*workers, changed]:
+                tasks = [*workers, changed]
+                if watchdog:
+                    tasks.append(watchdog)
+                for task in tasks:
                     if not task.done():
                         task.cancel()
-                await asyncio.gather(*workers, changed, return_exceptions=True)
+                await asyncio.gather(*tasks, return_exceptions=True)
 
     async def stop(self) -> None:
         """Stop monitoring markets."""
@@ -948,12 +960,14 @@ class MarketMonitor:
             try:
                 await self._connect_shard(shard_id, token_ids)
             except ConnectionClosed as e:
-                log_fn = logger.info if e.code == 1006 else logger.warning
-                log_fn(
+                logger.warning(
                     "Binary WebSocket shard closed",
                     shard=shard_id,
                     code=e.code,
                     reason=e.reason,
+                    error=repr(e),
+                    close_received=repr(getattr(e, "rcvd", None)),
+                    close_sent=repr(getattr(e, "sent", None)),
                 )
             except Exception as e:
                 error_text = repr(e)
@@ -976,7 +990,11 @@ class MarketMonitor:
 
     async def _connect_shard(self, shard_id: int, token_ids: List[str]) -> None:
         """Connect one bounded market-channel shard."""
-        async with websockets.connect(CLOB_WS_URL) as ws:
+        async with websockets.connect(
+            CLOB_WS_URL,
+            max_size=WS_MAX_MESSAGE_BYTES,
+            max_queue=WS_MAX_QUEUE_MESSAGES,
+        ) as ws:
             self._connections.add(ws)
             token_set = set(token_ids)
             self.order_books.remove_many(token_set)
@@ -1005,6 +1023,29 @@ class MarketMonitor:
                     await asyncio.gather(*tasks, return_exceptions=True)
             finally:
                 self._connections.discard(ws)
+
+    async def _snapshot_health_watchdog(self, revision: int) -> None:
+        """Report an actionable startup failure when snapshots never converge."""
+        await asyncio.sleep(WS_SNAPSHOT_STARTUP_TIMEOUT_SECONDS)
+        if (
+            not self._running
+            or revision != self._subscription_revision
+            or self._snapshot_gate_open
+        ):
+            return
+
+        expected = set(self.token_to_market)
+        available = sum(self.order_books.get(token_id) is not None for token_id in expected)
+        logger.error(
+            "Binary snapshot health gate did not open before startup timeout",
+            timeout_seconds=WS_SNAPSHOT_STARTUP_TIMEOUT_SECONDS,
+            coverage=f"{self._snapshot_coverage():.2%}",
+            required=f"{WS_MIN_SNAPSHOT_COVERAGE:.2%}",
+            expected_tokens=len(expected),
+            tokens_with_books=available,
+            tokens_awaiting_snapshot=len(self._tokens_awaiting_snapshot),
+            active_connections=len(self._connections),
+        )
 
     async def _backfill_missing_snapshots(
         self,
@@ -1376,13 +1417,21 @@ class NegativeRiskMarketMonitor:
                 for index, token_ids in enumerate(shards, start=1)
             ]
             changed = asyncio.create_task(self._subscriptions_changed.wait())
+            watchdog = (
+                asyncio.create_task(self._snapshot_health_watchdog(revision))
+                if shards
+                else None
+            )
             try:
                 await asyncio.wait([*workers, changed], return_when=asyncio.FIRST_COMPLETED)
             finally:
-                for task in [*workers, changed]:
+                tasks = [*workers, changed]
+                if watchdog:
+                    tasks.append(watchdog)
+                for task in tasks:
                     if not task.done():
                         task.cancel()
-                await asyncio.gather(*workers, changed, return_exceptions=True)
+                await asyncio.gather(*tasks, return_exceptions=True)
 
     async def stop(self) -> None:
         """Stop monitoring."""
@@ -1450,12 +1499,14 @@ class NegativeRiskMarketMonitor:
             try:
                 await self._connect_shard(shard_id, token_ids)
             except ConnectionClosed as e:
-                log_fn = logger.info if e.code == 1006 else logger.warning
-                log_fn(
+                logger.warning(
                     "NegRisk WebSocket shard closed",
                     shard=shard_id,
                     code=e.code,
                     reason=e.reason,
+                    error=repr(e),
+                    close_received=repr(getattr(e, "rcvd", None)),
+                    close_sent=repr(getattr(e, "sent", None)),
                 )
             except Exception as e:
                 logger.warning(
@@ -1468,7 +1519,11 @@ class NegativeRiskMarketMonitor:
                 reconnect_delay = min(reconnect_delay * 2, 60.0)
 
     async def _connect_shard(self, shard_id: int, token_ids: List[str]) -> None:
-        async with websockets.connect(CLOB_WS_URL) as ws:
+        async with websockets.connect(
+            CLOB_WS_URL,
+            max_size=WS_MAX_MESSAGE_BYTES,
+            max_queue=WS_MAX_QUEUE_MESSAGES,
+        ) as ws:
             self._connections.add(ws)
             token_set = set(token_ids)
             self.order_books.remove_many(token_set)
@@ -1495,6 +1550,29 @@ class NegativeRiskMarketMonitor:
                     await asyncio.gather(*tasks, return_exceptions=True)
             finally:
                 self._connections.discard(ws)
+
+    async def _snapshot_health_watchdog(self, revision: int) -> None:
+        """Report an actionable startup failure when event books stay incomplete."""
+        await asyncio.sleep(WS_SNAPSHOT_STARTUP_TIMEOUT_SECONDS)
+        if (
+            not self._running
+            or revision != self._subscription_revision
+            or self._snapshot_gate_open
+        ):
+            return
+
+        expected = set(self.token_to_event)
+        available = sum(self.order_books.get(token_id) is not None for token_id in expected)
+        logger.error(
+            "NegRisk snapshot health gate did not open before startup timeout",
+            timeout_seconds=WS_SNAPSHOT_STARTUP_TIMEOUT_SECONDS,
+            coverage=f"{self._snapshot_coverage():.2%}",
+            required=f"{WS_MIN_SNAPSHOT_COVERAGE:.2%}",
+            expected_tokens=len(expected),
+            tokens_with_books=available,
+            tokens_awaiting_snapshot=len(self._tokens_awaiting_snapshot),
+            active_connections=len(self._connections),
+        )
 
     async def _refresh_shard_snapshots(
         self,

@@ -2,7 +2,9 @@
 
 import pytest
 import time
+from unittest.mock import AsyncMock, MagicMock, patch
 
+from config.constants import CLOB_WS_URL
 from models.market import Market, FeeCategory, NegativeRiskEvent
 from models.order import OrderBook, OrderBookLevel, ArbitrageOpportunity
 from core.monitor import (
@@ -11,6 +13,9 @@ from core.monitor import (
     NegativeRiskArbitrageDetector,
     NegativeRiskMarketMonitor,
     OrderBookManager,
+    WS_MAX_MESSAGE_BYTES,
+    WS_MAX_QUEUE_MESSAGES,
+    WS_SUBSCRIPTION_SHARD_SIZE,
     _market_subscription,
     _token_shards,
 )
@@ -35,6 +40,15 @@ def test_token_shards_are_bounded_and_deduplicated():
     shards = _token_shards(["a", "b", "a", "c"], shard_size=2)
 
     assert shards == [["a", "b"], ["c"]]
+
+
+def test_default_token_shards_limit_snapshot_burst_size():
+    tokens = [str(index) for index in range(501)]
+
+    shards = _token_shards(tokens)
+
+    assert WS_SUBSCRIPTION_SHARD_SIZE == 250
+    assert [len(shard) for shard in shards] == [250, 250, 1]
 
 
 class TestOrderBookManager:
@@ -270,6 +284,42 @@ class TestMarketMonitor:
         assert set(monitor.token_to_market) == {"new_yes", "new_no"}
         assert monitor.order_books.get("yes_token") is None
         assert monitor._subscription_revision == 1
+
+    @pytest.mark.asyncio
+    async def test_websocket_connection_accepts_large_initial_snapshot(self, sample_market):
+        monitor = MarketMonitor(markets=[sample_market])
+        monitor._process_messages = AsyncMock()
+        monitor._heartbeat = AsyncMock()
+        monitor._backfill_missing_snapshots = AsyncMock()
+        websocket = MagicMock()
+        websocket.send = AsyncMock()
+
+        with patch("core.monitor.websockets.connect") as connect:
+            connect.return_value.__aenter__ = AsyncMock(return_value=websocket)
+            connect.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            await monitor._connect_shard(1, ["yes_token", "no_token"])
+
+        connect.assert_called_once_with(
+            CLOB_WS_URL,
+            max_size=WS_MAX_MESSAGE_BYTES,
+            max_queue=WS_MAX_QUEUE_MESSAGES,
+        )
+        assert WS_MAX_MESSAGE_BYTES == 8 * 1024 * 1024
+        assert WS_MAX_QUEUE_MESSAGES == 4
+
+    @pytest.mark.asyncio
+    async def test_snapshot_watchdog_reports_unhealthy_startup(self, sample_market):
+        monitor = MarketMonitor(markets=[sample_market])
+        monitor._running = True
+
+        with patch("core.monitor.asyncio.sleep", new=AsyncMock()):
+            with patch("core.monitor.logger.error") as log_error:
+                await monitor._snapshot_health_watchdog(revision=0)
+
+        log_error.assert_called_once()
+        assert log_error.call_args.kwargs["expected_tokens"] == 2
+        assert log_error.call_args.kwargs["coverage"] == "0.00%"
 
 
 class TestNegativeRiskMonitor:

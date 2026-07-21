@@ -7,10 +7,15 @@ strategies and Polymarket/SX Bet cross-platform strategies.
 
 import argparse
 import asyncio
+import os
 import signal
+import subprocess
 import sys
 import traceback
+import uuid
 from typing import Optional
+
+import structlog
 
 from config.settings import get_settings, Settings
 from config.constants import POLYGON_CHAIN_ID
@@ -31,6 +36,7 @@ from models.order import ArbitrageOpportunity, ShortArbitrageOpportunity
 from utils.logger import setup_logging, get_logger
 from utils.notifier import create_notifier
 from utils.geoblock import GeoblockCheckError, check_polymarket_geoblock
+from utils.process_lock import AlreadyRunningError, SingleInstanceLock
 
 # Cross-platform imports (lazy-loaded when enabled)
 from exchanges.base import BaseExchange
@@ -43,6 +49,21 @@ from exchanges.sxbet_ws import SxBetWebSocket
 from models.cross_models import CrossPlatformOpportunity, CrossExecutionReport
 
 logger = get_logger(__name__)
+
+
+def _git_revision() -> str:
+    """Return a short source revision for correlating multi-day logs."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        return result.stdout.strip() or "unknown"
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
 
 
 class ArbitrageBot:
@@ -340,6 +361,13 @@ class ArbitrageBot:
                 fee_free_only=True,
                 max_markets=2000,
             )
+            scan_complete = scanner.last_market_scan_complete
+
+        if not scan_complete:
+            logger.warning(
+                "Initial market scan incomplete; starting with partial universe",
+                markets_received=len(markets),
+            )
 
         min_liquidity = max(
             self.settings.pm_min_market_liquidity,
@@ -375,6 +403,13 @@ class ArbitrageBot:
             events = await scanner.fetch_negative_risk_events(
                 min_outcomes=3,  # At least 3 outcomes for meaningful arbitrage
                 max_events=100,
+            )
+            scan_complete = scanner.last_negative_risk_scan_complete
+
+        if not scan_complete:
+            logger.warning(
+                "Initial Negative Risk scan incomplete; starting with partial universe",
+                events_received=len(events),
             )
 
         min_liquidity = max(
@@ -885,11 +920,13 @@ class ArbitrageBot:
                         fee_free_only=True,
                         max_markets=2000,
                     )
+                    market_scan_complete = scanner.last_market_scan_complete
                     # Negative Risk events (separate endpoint)
                     new_events = await scanner.fetch_negative_risk_events(
                         min_outcomes=3,
                         max_events=100,
                     )
+                    neg_risk_scan_complete = scanner.last_negative_risk_scan_complete
 
                 # --- Binary markets ---
                 tradeable_binary = sorted(
@@ -903,8 +940,18 @@ class ArbitrageBot:
                     key=lambda market: (market.liquidity, market.volume_24h),
                     reverse=True,
                 )[:self.settings.pm_max_binary_markets]
-                if self.monitor and hasattr(self.monitor, 'update_markets'):
+                if (
+                    market_scan_complete
+                    and self.monitor
+                    and hasattr(self.monitor, 'update_markets')
+                ):
                     await self.monitor.update_markets(tradeable_binary)
+                elif not market_scan_complete:
+                    logger.warning(
+                        "Binary market refresh incomplete; retaining current universe",
+                        partial_markets=len(all_markets),
+                        current_markets=len(self.monitor.markets) if self.monitor else 0,
+                    )
 
                 # --- Negative Risk events ---
                 tradeable_events = sorted(
@@ -918,7 +965,11 @@ class ArbitrageBot:
                     reverse=True,
                 )[:self.settings.pm_max_neg_risk_events]
 
-                if self.neg_risk_monitor and hasattr(self.neg_risk_monitor, 'update_events'):
+                if (
+                    neg_risk_scan_complete
+                    and self.neg_risk_monitor
+                    and hasattr(self.neg_risk_monitor, 'update_events')
+                ):
                     await self.neg_risk_monitor.update_events(tradeable_events)
 
                 # Update local cache of events
@@ -926,7 +977,16 @@ class ArbitrageBot:
                 refreshed_ids = {e.event_id for e in tradeable_events}
                 new_count = len(refreshed_ids - current_ids)
                 removed_count = len(current_ids - refreshed_ids)
-                self._neg_risk_events = tradeable_events
+                if neg_risk_scan_complete:
+                    self._neg_risk_events = tradeable_events
+                else:
+                    logger.warning(
+                        "NegRisk event refresh incomplete; retaining current universe",
+                        partial_events=len(new_events),
+                        current_events=len(self._neg_risk_events),
+                    )
+                    new_count = 0
+                    removed_count = 0
 
                 if new_count > 0 or removed_count > 0:
                     logger.info(
@@ -1197,7 +1257,6 @@ async def main() -> None:
     args = parse_args()
 
     # Setup logging
-    import os
     os.makedirs("logs", exist_ok=True)
 
     # Load settings first so LOG_LEVEL from .env is available as a fallback
@@ -1210,44 +1269,59 @@ async def main() -> None:
         log_file=os.path.join("logs", "pmrobot.log"),
     )
 
-    # Override settings from args
-    if args.env:
-        settings.env = args.env
-
-    # Create and run bot
-    dry_run = args.dry_run or settings.dry_run
-    bot = ArbitrageBot(settings, dry_run=dry_run)
-
-    # Handle signals
-    stop_event = asyncio.Event()
-
-    def signal_handler():
-        logger.info("Shutdown signal received")
-        asyncio.create_task(bot.stop())
-        stop_event.set()
-
-    # Generic approach that works better across platforms in asyncio
+    instance_lock = SingleInstanceLock(os.path.join("logs", "pmrobot.lock"))
     try:
+        instance_lock.acquire()
+    except AlreadyRunningError as exc:
+        logger.critical("Another pmrobot instance is already running", error=str(exc))
+        return
+
+    run_id = uuid.uuid4().hex[:8]
+    revision = _git_revision()
+    structlog.contextvars.bind_contextvars(
+        pid=os.getpid(),
+        run_id=run_id,
+        revision=revision,
+    )
+    logger.info("Runtime identity established")
+
+    bot: Optional[ArbitrageBot] = None
+    try:
+        if args.env:
+            settings.env = args.env
+
+        dry_run = args.dry_run or settings.dry_run
+        bot = ArbitrageBot(settings, dry_run=dry_run)
+
+        def signal_handler():
+            logger.info("Shutdown signal received")
+            asyncio.create_task(bot.stop())
+
         if sys.platform != "win32":
             loop = asyncio.get_event_loop()
             for sig in (signal.SIGTERM, signal.SIGINT):
                 loop.add_signal_handler(sig, signal_handler)
-        
+
         await bot.start()
     except (KeyboardInterrupt, SystemExit):
         logger.info("Keyboard interrupt received, stopping...")
-        await bot.notifier.send_alert("Bot Stopped", "Keyboard Interrupt")
+        if bot:
+            await bot.notifier.send_alert("Bot Stopped", "Keyboard Interrupt")
     except Exception as e:
         logger.critical("Bot crashed with unhandled exception", error=repr(e), exc_info=True)
         # Attempt to notify about crash
-        try:
-             await bot.notifier.send_alert("⚠️ Bot Crashed", f"Unhandled Exception:\n{repr(e)}")
-        except Exception as notify_err:
-             logger.error("Failed to send crash notification", error=repr(notify_err))
+        if bot:
+            try:
+                await bot.notifier.send_alert("⚠️ Bot Crashed", f"Unhandled Exception:\n{repr(e)}")
+            except Exception as notify_err:
+                logger.error("Failed to send crash notification", error=repr(notify_err))
         raise
     finally:
-        await bot.stop()
+        if bot:
+            await bot.stop()
         logger.info("Bot exited")
+        structlog.contextvars.clear_contextvars()
+        instance_lock.release()
 
 
 if __name__ == "__main__":

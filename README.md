@@ -278,7 +278,7 @@ SX Bet 要求 taker 使用 EIP-712 structured data 签名。本系统实现了�
 | 模块 | 文件 | 职责 |
 |------|------|------|
 | **Scanner** | `core/scanner.py` | 启动时通过 Gamma API 扫描全量市场，过滤出流动性足够的 Binary 市场和 NegRisk 事件组 |
-| **Monitor** | `core/monitor.py` | 通过 WebSocket 实时接收订单簿更新，内置 `ArbitrageDetector` 和 `NegativeRiskArbitrageDetector` 进行实时套利检测 |
+| **Monitor** | `core/monitor.py` | 通过分片 WebSocket 实时接收订单簿更新，使用快照健康门后再运行套利检测 |
 | **Executor** | `core/executor.py` | 接收套利机会队列，通过 CLOB API 并发提交 FOK 订单；处理部分成交时的紧急平仓。支持 Long Arb（买入）和 Short Arb（Mint+卖出） |
 | **Settler** | `core/settler.py` | 定期扫描 Polymarket 持仓，对可合并的头寸调用 CTF 合约的 `mergePositions`，将代币对换回 USDC |
 | **Risk** | `core/risk.py` | 交易统计、市场冷却期、熔断器（连续失败自动暂停） |
@@ -644,7 +644,7 @@ python main.py --dry-run --log-level DEBUG 2>&1 | findstr "opportunity"
 |----------|------|----------|
 | **滑点风险** | 从检测到下单存在延迟 | PM: FOK 订单 + 滑点上限; SX: desiredOdds + oddsSlippage |
 | **部分成交** | 多腿交易只有部分腿成交 | PM 平台内: 自动紧急平仓; 跨平台: TODO（初期小资金） |
-| **API 故障** | API 或 RPC 不稳定 | WebSocket 自动重连 + 指数退避 |
+| **API 故障** | API 或 RPC 不稳定 | WebSocket 自动重连；分页刷新不完整时保留原市场集合 |
 | **Gas 消耗** | PM Settler merge + Short Arb mint | Gas 成本已纳入利润计算；支持 Relayer 免 Gas |
 | **跨链风险** | PM (Polygon) 和 SX (SX Network) 在不同链 | 目前需手动再平衡资金 |
 | **资金安全** | 私钥泄露 = 资金损失 | 环境变量存储，独立钱包，.gitignore 排除 .env |
@@ -656,6 +656,7 @@ python main.py --dry-run --log-level DEBUG 2>&1 | findstr "opportunity"
 3. 从小金额开始（推荐 PM $300 + SX $200）
 4. 定期检查日志中的异常告警
 5. 确保 `.env` 文件不被提交到版本控制
+6. 同一项目目录只运行一个实例；程序会使用 `logs/pmrobot.lock` 拒绝重复启动
 
 ### 已知限制
 

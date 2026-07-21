@@ -130,6 +130,42 @@ class TestMarketScanner:
         retry_kwargs = scanner._client.get.await_args_list[1].kwargs
         assert retry_kwargs["headers"]["Accept-Encoding"] == "identity"
 
+    @pytest.mark.asyncio
+    async def test_fetch_all_markets_marks_partial_scan_incomplete(self, scanner):
+        full_page = [SAMPLE_MARKET_RESPONSE[0] for _ in range(100)]
+        scanner._get_json = AsyncMock(
+            side_effect=[full_page, httpx.ReadTimeout("page timeout")]
+        )
+
+        markets = await scanner.fetch_all_markets(max_markets=200)
+
+        assert len(markets) == 100
+        assert scanner.last_market_scan_complete is False
+        assert scanner._get_json.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_fetch_all_markets_uses_raw_page_size_for_pagination(self, scanner):
+        invalid = {"enableOrderBook": False}
+        mixed_page = [SAMPLE_MARKET_RESPONSE[0] for _ in range(50)] + [
+            invalid for _ in range(50)
+        ]
+        scanner._get_json = AsyncMock(side_effect=[mixed_page, []])
+
+        markets = await scanner.fetch_all_markets(max_markets=200)
+
+        assert len(markets) == 50
+        assert scanner.last_market_scan_complete is True
+        assert scanner._get_json.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_negative_risk_scan_marks_request_failure_incomplete(self, scanner):
+        scanner._get_json = AsyncMock(side_effect=httpx.ReadTimeout("events timeout"))
+
+        events = await scanner.fetch_negative_risk_events(max_events=10)
+
+        assert events == []
+        assert scanner.last_negative_risk_scan_complete is False
+
 
 class TestMarket:
     """Test cases for Market model."""

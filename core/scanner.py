@@ -36,6 +36,10 @@ class MarketScanner:
         self.base_url = GAMMA_API_BASE_URL
         self.rate_limiter = RateLimiter(rate_limit)
         self._client: Optional[httpx.AsyncClient] = None
+        self.last_market_scan_complete = True
+        self.last_negative_risk_scan_complete = True
+        self._last_market_page_failed = False
+        self._last_market_page_size = 0
 
     async def __aenter__(self):
         """Async context manager entry."""
@@ -94,8 +98,11 @@ class MarketScanner:
             "offset": str(offset),
         }
 
+        self._last_market_page_failed = False
+        self._last_market_page_size = 0
         try:
             data = await self._get_json("/markets", params)
+            self._last_market_page_size = len(data)
 
             markets = []
             for item in data:
@@ -112,6 +119,7 @@ class MarketScanner:
             return markets
 
         except httpx.HTTPError as e:
+            self._last_market_page_failed = True
             logger.error("Failed to fetch markets", error=repr(e))
             return []
 
@@ -130,6 +138,7 @@ class MarketScanner:
         Returns:
             List of all active markets
         """
+        self.last_market_scan_complete = True
         all_markets = []
         offset = 0
         limit = 100
@@ -141,17 +150,25 @@ class MarketScanner:
                 fee_free_only=fee_free_only,
             )
 
-            if not markets:
+            if self._last_market_page_failed:
+                self.last_market_scan_complete = False
+                break
+
+            if self._last_market_page_size == 0:
                 break
 
             all_markets.extend(markets)
             offset += limit
 
-            if len(markets) < limit:
+            if self._last_market_page_size < limit:
                 # No more markets
                 break
 
-        logger.info("Fetched all markets", total=len(all_markets))
+        logger.info(
+            "Fetched all markets",
+            total=len(all_markets),
+            complete=self.last_market_scan_complete,
+        )
         return all_markets[:max_markets]
 
     async def fetch_market_by_slug(self, slug: str) -> Optional[Market]:
@@ -411,6 +428,7 @@ class MarketScanner:
         """
         await self.rate_limiter.acquire()
         
+        self.last_negative_risk_scan_complete = True
         events = []
         offset = 0
         limit = 50
@@ -442,6 +460,7 @@ class MarketScanner:
                     break
                     
             except httpx.HTTPError as e:
+                self.last_negative_risk_scan_complete = False
                 logger.error("Failed to fetch events", error=repr(e))
                 break
         
@@ -449,6 +468,7 @@ class MarketScanner:
             "Fetched Negative Risk events",
             total=len(events),
             min_outcomes=min_outcomes,
+            complete=self.last_negative_risk_scan_complete,
         )
         return events[:max_events]
     
